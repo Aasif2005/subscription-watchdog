@@ -46,7 +46,7 @@ adb emu sms send 5556 "Rs 649.00 debited from A/c XX1234 on 05-09-26 to NETFLIX 
 adb emu sms send 5556 "Rs.199.00 will be debited from your A/c XX1234 on <tomorrow dd-mm-yyyy> towards Spotify AutoPay mandate"
 ```
 
-Release builds only accept bank sender IDs like `VM-HDFCBK`.
+Release builds ignore SMS from regular 10-digit phone numbers, so a forwarded or spoofed message cannot create a subscription.
 
 ## Privacy
 
