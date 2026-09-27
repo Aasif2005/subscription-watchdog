@@ -1,0 +1,251 @@
+package com.aasif.watchdog.core.engine
+
+import com.aasif.watchdog.core.merchant.KnownMerchant
+import com.aasif.watchdog.core.merchant.MerchantCatalog
+import com.aasif.watchdog.core.model.Charge
+import com.aasif.watchdog.core.model.Confidence
+import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.PaymentEvent
+import com.aasif.watchdog.core.model.PaymentEvent.Debit
+import com.aasif.watchdog.core.model.PaymentEvent.MandateCreated
+import com.aasif.watchdog.core.model.PaymentEvent.MandateRevoked
+import com.aasif.watchdog.core.model.PaymentEvent.PreDebitNotice
+import com.aasif.watchdog.core.model.RenewalSource
+import com.aasif.watchdog.core.model.Subscription
+import com.aasif.watchdog.core.model.SubscriptionStatus
+import java.math.BigDecimal
+import java.time.LocalDate
+import java.time.temporal.ChronoUnit
+
+/**
+ * Turns parsed payment events into subscriptions with a predicted next renewal.
+ *
+ * The renewal date comes from the strongest signal available:
+ *  1. a pre-debit notice (the bank states the exact date, ~24h ahead),
+ *  2. the mandate's start date and frequency,
+ *  3. the gaps between past debits,
+ *  4. for trials without a stated date, the catalog's typical trial length.
+ */
+class SubscriptionEngine(
+    private val catalog: Map<String, KnownMerchant> = MerchantCatalog.byId,
+) {
+    /** One plan with one merchant: its debit series plus any mandate / notices matched to it. */
+    private data class Plan(
+        val merchantId: String,
+        val merchantName: String,
+        val series: RecurringSeries?,
+        val mandate: MandateCreated?,
+        val notices: List<PreDebitNotice>,
+    ) {
+        val amount: BigDecimal? get() = series?.latestAmount ?: mandate?.amount ?: notices.lastOrNull()?.amount
+    }
+
+    fun build(events: List<PaymentEvent>, today: LocalDate): List<Subscription> =
+        events.filter { it.merchantId != UNKNOWN_ID }
+            .groupBy { it.merchantId }
+            .flatMap { (merchantId, merchantEvents) -> plansFor(merchantId, merchantEvents) }
+            .let { plans -> plans.map { toSubscription(it, plans, events, today) } }
+            .sortedWith(compareBy<Subscription> { !it.isLive }.thenBy { it.nextRenewal ?: LocalDate.MAX })
+
+    private fun plansFor(merchantId: String, events: List<PaymentEvent>): List<Plan> {
+        val name = events.last().merchantName
+        val series = RecurrenceDetector.detect(events.filterIsInstance<Debit>(), merchantId in catalog)
+        val mandates = events.filterIsInstance<MandateCreated>().sortedBy { it.receivedOn }
+        val notices = events.filterIsInstance<PreDebitNotice>()
+
+        if (series.isEmpty()) {
+            // No usable history: a mandate on its own is still a subscription (new plan or trial).
+            // A lone notice is too, since the bank only sends them for registered mandates.
+            val mandate = mandates.lastOrNull()
+            if (mandate == null && notices.isEmpty()) return emptyList()
+            return listOf(Plan(merchantId, name, null, mandate, notices))
+        }
+
+        // Match the latest mandate and each notice to the series with the closest amount.
+        fun closest(amount: BigDecimal?): RecurringSeries =
+            if (amount == null) series.maxBy { it.debits.last().date }
+            else series.minBy { (it.latestAmount - amount).abs() }
+
+        val latestMandate = mandates.lastOrNull()
+        val mandateSeries = latestMandate?.let { closest(it.amount) }
+        val noticesBySeries = notices.groupBy { closest(it.amount) }
+        return series.map { s ->
+            Plan(merchantId, name, s, latestMandate.takeIf { mandateSeries === s }, noticesBySeries[s].orEmpty())
+        }
+    }
+
+    private fun toSubscription(plan: Plan, all: List<Plan>, events: List<PaymentEvent>, today: LocalDate): Subscription {
+        val known = catalog[plan.merchantId]
+        val charges = plan.series?.debits?.map { Charge(it.date, it.amount) }.orEmpty()
+        val lastCharge = charges.maxOfOrNull { it.date }
+        val frequency = plan.mandate?.frequency?.takeIf { it.hasSchedule }
+            ?: plan.series?.frequency
+            ?: Frequency.MONTHLY
+        val samePlanCount = all.count { it.merchantId == plan.merchantId }
+        val key = if (samePlanCount == 1) plan.merchantId
+        else "${plan.merchantId}#${plan.amount?.setScale(0, java.math.RoundingMode.HALF_UP) ?: 0}"
+
+        val prediction = predict(plan, frequency, lastCharge, known, events, today)
+        return Subscription(
+            key = key,
+            merchantId = plan.merchantId,
+            name = known?.name ?: plan.merchantName,
+            category = known?.category ?: "Other",
+            amount = plan.amount ?: BigDecimal.ZERO,
+            frequency = frequency,
+            nextRenewal = prediction.next,
+            renewalSource = prediction.source,
+            confidence = prediction.confidence,
+            status = prediction.status,
+            charges = charges,
+            cancelUrl = known?.cancelUrl,
+        )
+    }
+
+    private data class Prediction(
+        val next: LocalDate?,
+        val source: RenewalSource,
+        val confidence: Confidence,
+        val status: SubscriptionStatus,
+    )
+
+    private fun predict(
+        plan: Plan,
+        frequency: Frequency,
+        lastCharge: LocalDate?,
+        known: KnownMerchant?,
+        events: List<PaymentEvent>,
+        today: LocalDate,
+    ): Prediction {
+        val mandate = plan.mandate
+        val lastActivity = listOfNotNull(lastCharge, mandate?.receivedOn).maxOrNull()
+
+        // Cancelled: a revocation newer than the latest mandate or charge.
+        val revokedOn = events.filterIsInstance<MandateRevoked>()
+            .filter { it.merchantId == plan.merchantId }
+            .maxOfOrNull { it.receivedOn }
+        if (revokedOn != null && (lastActivity == null || !revokedOn.isBefore(lastActivity))) {
+            return Prediction(null, RenewalSource.MANDATE, Confidence.HIGH, SubscriptionStatus.CANCELLED)
+        }
+        if (mandate?.validTill?.isBefore(today) == true) {
+            return Prediction(null, RenewalSource.MANDATE, Confidence.HIGH, SubscriptionStatus.LAPSED)
+        }
+
+        // Don't predict a second charge on the day we already saw one.
+        val from = if (lastCharge != null && !lastCharge.isBefore(today)) lastCharge.plusDays(1) else today
+
+        // 1. The bank told us the exact date.
+        plan.notices.map { it.debitDate }.filter { !it.isBefore(from) }.minOrNull()?.let { date ->
+            val status = if (lastCharge == null && isTrialMandate(mandate, known)) SubscriptionStatus.TRIAL else SubscriptionStatus.ACTIVE
+            return Prediction(date, RenewalSource.PRE_DEBIT_NOTICE, Confidence.HIGH, status)
+        }
+
+        // 2. The mandate states when debits start and how often they repeat.
+        if (mandate?.startDate != null) {
+            val start = mandate.startDate
+            if (lastCharge == null && start.isAfter(today)) {
+                val status = if (isTrialMandate(mandate, known)) SubscriptionStatus.TRIAL else SubscriptionStatus.ACTIVE
+                return Prediction(start, RenewalSource.MANDATE, Confidence.HIGH, status)
+            }
+            if (frequency.hasSchedule && mandate.frequency?.hasSchedule == true) {
+                return Prediction(frequency.nextOnOrAfter(start, from), RenewalSource.MANDATE, Confidence.HIGH, SubscriptionStatus.ACTIVE)
+            }
+        }
+
+        // 3. Extrapolate from past charges.
+        val series = plan.series
+        if (series != null && lastCharge != null) {
+            val lapseAfter = lastCharge.plusDays(2L * frequency.approxDays + Frequency.toleranceDays(frequency))
+            if (today.isAfter(lapseAfter) && mandate == null) {
+                return Prediction(null, RenewalSource.PAYMENT_HISTORY, series.confidence, SubscriptionStatus.LAPSED)
+            }
+            val next = frequency.nextOnOrAfter(billingAnchor(series.debits.map { it.date }), from)
+            return Prediction(next, RenewalSource.PAYMENT_HISTORY, series.confidence, SubscriptionStatus.ACTIVE)
+        }
+
+        // 4. A mandate with no date and no history: most likely a free trial.
+        if (mandate != null) {
+            known?.trialDays?.let { days ->
+                val trialEnd = mandate.receivedOn.plusDays(days.toLong())
+                if (!trialEnd.isBefore(today)) {
+                    return Prediction(trialEnd, RenewalSource.TRIAL_ESTIMATE, Confidence.LOW, SubscriptionStatus.TRIAL)
+                }
+            }
+            if (frequency.hasSchedule && mandate.frequency?.hasSchedule == true) {
+                val next = frequency.nextOnOrAfter(mandate.receivedOn, from)
+                return Prediction(next, RenewalSource.MANDATE, Confidence.LOW, SubscriptionStatus.ACTIVE)
+            }
+            return Prediction(null, RenewalSource.MANDATE, Confidence.LOW, SubscriptionStatus.ACTIVE)
+        }
+
+        return Prediction(null, RenewalSource.PAYMENT_HISTORY, Confidence.LOW, SubscriptionStatus.ACTIVE)
+    }
+
+    /**
+     * A trial mandate is one set up with a token amount (₹1-2 verification) or whose first real
+     * debit is at least a few days away, or one for a service known to offer trials.
+     */
+    private fun isTrialMandate(mandate: MandateCreated?, known: KnownMerchant?): Boolean {
+        if (mandate == null) return false
+        if (mandate.amount != null && mandate.amount <= BigDecimal(2)) return true
+        val start = mandate.startDate
+        if (start != null) return ChronoUnit.DAYS.between(mandate.receivedOn, start) >= TRIAL_MIN_DAYS
+        return known?.trialDays != null
+    }
+
+    /**
+     * The charge whose day of month the plan really bills on. After a 31 Jan charge the bank
+     * debits on 28 Feb, so anchoring on 28 Feb would wrongly predict 28 Mar instead of 31 Mar.
+     */
+    private fun billingAnchor(dates: List<LocalDate>): LocalDate {
+        val recent = dates.sorted().takeLast(3)
+        val billingDay = recent.maxOf { it.dayOfMonth }
+        return recent.last { it.dayOfMonth == billingDay }
+    }
+
+    /** A subscription the user added by hand, e.g. a trial the SMS scan couldn't see. */
+    fun manual(
+        key: String,
+        name: String,
+        amount: BigDecimal,
+        frequency: Frequency,
+        firstCharge: LocalDate,
+        isTrial: Boolean,
+        today: LocalDate,
+    ): Subscription {
+        val next = if (frequency.hasSchedule) frequency.nextOnOrAfter(firstCharge, today) else null
+        return Subscription(
+            key = key,
+            merchantId = key,
+            name = name,
+            category = "Added by you",
+            amount = amount,
+            frequency = frequency,
+            nextRenewal = next,
+            renewalSource = RenewalSource.MANUAL,
+            confidence = Confidence.HIGH,
+            status = if (isTrial && !firstCharge.isBefore(today)) SubscriptionStatus.TRIAL else SubscriptionStatus.ACTIVE,
+            charges = emptyList(),
+            cancelUrl = null,
+        )
+    }
+
+    companion object {
+        private const val UNKNOWN_ID = "u:unknown"
+        private const val TRIAL_MIN_DAYS = 5
+    }
+}
+
+/** Live subscriptions renewing within [leadDays] of [today] (inclusive), soonest first. */
+fun List<Subscription>.dueForReminder(today: LocalDate, leadDays: Int): List<Subscription> =
+    filter { it.isLive && it.nextRenewal != null }
+        .filter { ChronoUnit.DAYS.between(today, it.nextRenewal) in 0..leadDays.toLong() }
+        .sortedBy { it.nextRenewal }
+
+fun List<Subscription>.monthlyTotal(): BigDecimal =
+    filter { it.status == SubscriptionStatus.ACTIVE }.fold(BigDecimal.ZERO) { acc, s -> acc + s.monthlyCost }
+
+/** What cancelled plans would have cost over a year; the basis for the savings report. */
+fun List<Subscription>.yearlySavings(): BigDecimal =
+    filter { it.status == SubscriptionStatus.CANCELLED }
+        .fold(BigDecimal.ZERO) { acc, s -> acc + s.monthlyCost.multiply(BigDecimal(12)) }
