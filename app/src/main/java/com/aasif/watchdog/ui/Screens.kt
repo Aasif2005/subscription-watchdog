@@ -110,10 +110,12 @@ fun OnboardingScreen(onResult: (smsGranted: Boolean) -> Unit) {
 fun DashboardScreen(
     subscriptions: List<Subscription>?,
     hasSmsAccess: Boolean,
+    hasNotificationAccess: Boolean,
     onOpen: (String) -> Unit,
     onAdd: () -> Unit,
     onRescan: () -> Unit,
     onGrantAccess: () -> Unit,
+    onGrantNotificationAccess: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -144,6 +146,20 @@ fun DashboardScreen(
                             "SMS access is off, so only subscriptions you add are shown. Tap to turn on automatic detection.",
                             Modifier.padding(16.dp),
                         )
+                    }
+                }
+            }
+            if (!hasNotificationAccess) {
+                item {
+                    Card(Modifier.fillMaxWidth().clickable(onClick = onGrantNotificationAccess)) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Catch AutoPay alerts from UPI apps", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Some banks send the renewal notice only in GPay, PhonePe or Paytm, not by SMS. " +
+                                    "Allow notification access so those are caught too. Only payment apps are read, on this phone.",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
                     }
                 }
             }

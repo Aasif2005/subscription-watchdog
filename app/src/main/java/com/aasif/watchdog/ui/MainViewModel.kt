@@ -12,6 +12,7 @@ import androidx.lifecycle.viewModelScope
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
+import com.aasif.watchdog.data.notification.PaymentNotificationListener
 import com.aasif.watchdog.work.Workers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -44,6 +45,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun hasSmsAccess() =
         ContextCompat.checkSelfPermission(app, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
+
+    fun hasNotificationAccess() = PaymentNotificationListener.isEnabled(app)
 
     fun open(target: Screen) {
         screen = target

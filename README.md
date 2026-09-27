@@ -1,6 +1,6 @@
 # Subscription Watchdog
 
-Android app that reads bank / UPI payment SMS **on the device** to find every recurring charge (UPI AutoPay, card e-mandates, OTT and app subscriptions, free trials that turn paid), shows what they cost per month, and warns before each renewal.
+Android app that reads bank / UPI payment SMS (and, if allowed, payment alerts from UPI and bank app notifications) **on the device** to find every recurring charge (UPI AutoPay, card e-mandates, OTT and app subscriptions, free trials that turn paid), shows what they cost per month, and warns before each renewal.
 
 ## How the renewal date is found
 
@@ -48,16 +48,29 @@ adb emu sms send 5556 "Rs.199.00 will be debited from your A/c XX1234 on <tomorr
 
 Release builds ignore SMS from regular 10-digit phone numbers, so a forwarded or spoofed message cannot create a subscription.
 
+To test the notification path, grant access and post as the shell (debug builds accept it):
+
+```sh
+adb shell cmd notification allow_listener com.aasif.watchdog/com.aasif.watchdog.data.notification.PaymentNotificationListener
+adb shell cmd notification post -S bigtext -t "'UPI AutoPay reminder'" t1 "'Rs 149 will be debited on <dd-mm-yy> towards YouTube Premium AutoPay mandate'"
+```
+
+## Notification alerts
+
+Some banks send the AutoPay pre-debit notice only inside the UPI app. With notification access, `PaymentNotificationListener` reads notifications from an allowlist of UPI and bank apps (GPay, PhonePe, Paytm, BHIM, CRED, major banks) and runs them through the same parser. Notifications from every other app are dropped without being read. UPI apps also push marketing ("set up AutoPay, get ₹50 cashback"), so notifications that look promotional are skipped (`SmsClassifier.isPromotional`). An alert and the SMS for the same charge don't double-count: identical debits are merged, and the earliest pre-debit date wins.
+
 ## Privacy
 
 - SMS are parsed on the device. Only the merchant, amount, dates and frequency are stored; the SMS text is never kept.
 - Cloud backup and device-to-device transfer are disabled (`data_extraction_rules.xml`).
+- Notification access is optional. Only allowlisted payment apps are read, and like SMS, only the extracted fields are stored.
 - There is no network permission.
 
 ## Before publishing to Play Store
 
 - `READ_SMS` / `RECEIVE_SMS` are restricted permissions. Submit the **Permissions Declaration Form** under the "SMS-based money management" exception, with a demo video.
-- Publish a privacy policy that states SMS are processed on-device only.
+- Publish a privacy policy that states SMS and notifications are processed on-device only.
+- Notification access needs a prominent in-app disclosure before the user is sent to Settings (Play User Data policy). The dashboard card explains it; review the wording against the policy.
 - Replace the placeholder launcher icon with an adaptive icon.
 
 ## Roadmap (premium)

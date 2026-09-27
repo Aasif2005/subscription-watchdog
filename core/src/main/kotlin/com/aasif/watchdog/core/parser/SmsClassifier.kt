@@ -18,6 +18,7 @@ object SmsClassifier {
     private val failedWord = rx("""\b(failed|declined|unsuccessful|insufficient|reversed|refund(ed)?|could\s+not\s+be)\b""")
     private val otpWord = rx("""\b(otp|one\s+time\s+password|verification\s+code)\b""")
     private val creditWord = rx("""\bcredited\b""")
+    private val promoWord = rx("""\b(cashback|offers?|rewards?|coupons?|discount|scratch\s+card|win|refer|invite|hurry|limited\s+time)\b|%\s*off|save\s+up\s+to|\bget\s+(rs\.?|inr|₹)""")
 
     fun classify(body: String): SmsKind {
         val recurring = recurringWord.containsMatchIn(body)
@@ -35,4 +36,10 @@ object SmsClassifier {
     }
 
     fun isRecurring(body: String): Boolean = recurringWord.containsMatchIn(body)
+
+    /**
+     * UPI app notifications mix marketing ("Set up AutoPay for Netflix, get ₹50 cashback") with
+     * real alerts, and a promo would otherwise read as a new mandate.
+     */
+    fun isPromotional(body: String): Boolean = promoWord.containsMatchIn(body)
 }
