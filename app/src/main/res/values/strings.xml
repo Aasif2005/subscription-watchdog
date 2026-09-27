@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Subscription Watchdog</string>
+    <string name="channel_renewals">Upcoming renewals</string>
+    <string name="channel_renewals_desc">Warns you a few days before a subscription or autopay renews.</string>
+</resources>
