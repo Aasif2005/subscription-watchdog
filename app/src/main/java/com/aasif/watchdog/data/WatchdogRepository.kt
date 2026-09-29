@@ -8,14 +8,18 @@ import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.core.engine.SubscriptionEngine
 import com.aasif.watchdog.core.engine.isLikelyDuplicateOf
 import com.aasif.watchdog.core.gmail.GmailQueryBuilder
+import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
+import com.aasif.watchdog.core.model.RenewalSource
 import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.core.parser.SmsParser
 import com.aasif.watchdog.data.db.EventEntity
 import com.aasif.watchdog.data.db.ManualSubscriptionEntity
+import com.aasif.watchdog.data.db.UserFactEntity
 import com.aasif.watchdog.data.db.UserMarkEntity
 import com.aasif.watchdog.data.db.WatchdogDao
 import com.aasif.watchdog.data.db.toEntity
@@ -69,6 +73,19 @@ class WatchdogRepository(
         get() = prefs.getBoolean(KEY_GMAIL_ENABLED, false)
         set(value) = prefs.edit { putBoolean(KEY_GMAIL_ENABLED, value) }
 
+    /** Local record of which Google account is connected, for the profile page. Never sent anywhere. */
+    val gmailAccountEmail: String? get() = prefs.getString(KEY_GMAIL_ACCOUNT, null)
+
+    fun rememberGmailAccount(email: String?) {
+        if (email != null) prefs.edit { putString(KEY_GMAIL_ACCOUNT, email) }
+    }
+
+    /** True once a sync has come back needing the scope approved again — the case the dashboard's
+     *  import card used to go silent on, since [gmailImportEnabled] alone can't tell them apart. */
+    var gmailNeedsConsent: Boolean
+        get() = prefs.getBoolean(KEY_GMAIL_NEEDS_CONSENT, false)
+        set(value) = prefs.edit { putBoolean(KEY_GMAIL_NEEDS_CONSENT, value) }
+
     /** Parses new inbox SMS since the last scan. The first scan looks back [FIRST_SCAN_DAYS]. */
     suspend fun scanInbox() {
         val since = prefs.getLong(KEY_LAST_SCAN, -1L).takeIf { it >= 0 }
@@ -87,9 +104,9 @@ class WatchdogRepository(
     suspend fun syncGmail(): GmailSyncOutcome {
         if (!gmailImportEnabled) return GmailSyncOutcome.DONE
         val token = when (val auth = gmailAuth.authorize()) {
-            is GmailAuth.Granted -> auth.accessToken
+            is GmailAuth.Granted -> { gmailNeedsConsent = false; rememberGmailAccount(auth.accountEmail); auth.accessToken }
             // A worker cannot show the consent screen; the dashboard card asks again instead.
-            is GmailAuth.NeedsConsent, GmailAuth.Unavailable -> return GmailSyncOutcome.NEEDS_CONSENT
+            is GmailAuth.NeedsConsent, GmailAuth.Unavailable -> { gmailNeedsConsent = true; return GmailSyncOutcome.NEEDS_CONSENT }
         }
         val now = System.currentTimeMillis()
 
@@ -167,6 +184,53 @@ class WatchdogRepository(
     }
 
     /**
+     * Drops the connection. The Authorization API has no revoke method (see [GmailAuthManager]),
+     * so this clears what the app remembers locally and asks Google's token endpoint to end the
+     * grant itself; either step can be the one that actually matters, so both run. Gmail-sourced
+     * events and cursors go; SMS and notification events are untouched.
+     */
+    suspend fun disconnectGmail() {
+        val token = (gmailAuth.authorize() as? GmailAuth.Granted)?.accessToken
+        if (token != null) gmailApi.revoke(token)
+        gmailImportEnabled = false
+        gmailNeedsConsent = false
+        clearGmailCursors()
+        prefs.edit { remove(KEY_GMAIL_ACCOUNT) }
+        dao.clearGmailEvents()
+    }
+
+    /**
+     * Starts fresh against a different Google account. Its history has never been read from this
+     * phone, so the cursors reset the same way they were on the very first connect.
+     *
+     * A brand-new account has never approved this app, so Play Services cannot grant this
+     * silently — it comes back [GmailAuth.NeedsConsent] and the actual grant only lands later,
+     * out of [GmailAuthManager.fromConsentResult] after the consent screen. [finishAccountSwitch]
+     * is what applies the reset in that case; skipping it left the previous account's sync cursor
+     * in place, so a switch to a new account "succeeded" but silently synced nothing.
+     */
+    suspend fun switchGmailAccount(accountName: String): GmailAuth {
+        val auth = gmailAuth.authorize(gmailAuth.account(accountName))
+        if (auth is GmailAuth.Granted) finishAccountSwitch(auth, accountName)
+        return auth
+    }
+
+    /** Completes a switch once the token is actually granted, whichever path produced it. */
+    suspend fun finishAccountSwitch(auth: GmailAuth.Granted, accountName: String) {
+        gmailNeedsConsent = false
+        rememberGmailAccount(auth.accountEmail ?: accountName)
+        clearGmailCursors()
+        dao.clearGmailEvents()
+        gmailImportEnabled = true
+    }
+
+    private fun clearGmailCursors() = prefs.edit {
+        remove(KEY_GMAIL_SYNC)
+        remove(KEY_GMAIL_BACKFILL)
+        remove(KEY_GMAIL_SLICES)
+    }
+
+    /**
      * Stores the payment messages among [messages]; returns true if any were new.
      *
      * A charge announced by SMS, by the bank's app and by e-mail is one charge, so anything that
@@ -196,24 +260,48 @@ class WatchdogRepository(
             chargeKey(debit.date, debit.amount) to ChargeSource(EventSource.label(row.source), row.receivedAtMillis)
         }.toMap()
 
-    /** All subscriptions, recomputed whenever events, manual entries or user marks change. */
+    /** All subscriptions, recomputed whenever events, manual entries, user marks or facts change. */
     fun subscriptions(): Flow<List<Subscription>> =
-        combine(dao.events(), dao.manual(), dao.marks()) { events, manual, marks ->
+        combine(dao.events(), dao.manual(), dao.marks(), dao.userFacts()) { events, manual, marks, facts ->
             val today = LocalDate.now()
             val detected = engine.build(events.mapNotNull { it.toEvent() }, today)
             val added = manual.map {
                 engine.manual(
-                    key = manualKey(it.id), name = it.name, amount = BigDecimal(it.amount),
+                    key = manualKey(it.id), name = it.name, amount = Money(BigDecimal(it.amount)),
                     frequency = Frequency.valueOf(it.frequency), firstCharge = LocalDate.parse(it.firstCharge),
                     isTrial = it.isTrial, today = today,
                 )
             }
             val markByKey = marks.associate { it.subscriptionKey to it.mark }
+            val factByKey = facts.filterNot { it.dismissed }.associateBy { it.subscriptionKey }
             (detected + added)
                 .filter { markByKey[it.key] != UserMarkEntity.HIDDEN }
                 .map { if (markByKey[it.key] == UserMarkEntity.CANCELLED) it.copy(status = SubscriptionStatus.CANCELLED, nextRenewal = null) else it }
+                .map { sub -> factByKey[sub.key]?.let { applyUserFact(sub, it) } ?: sub }
                 .sortedWith(compareBy<Subscription> { !it.isLive }.thenBy { it.nextRenewal ?: LocalDate.MAX })
         }
+
+    /**
+     * What the user typed on the "Needs your input" card beats every guess — it is the only place
+     * a date like a NordVPN renewal, which lives inside that app and nowhere else on the phone,
+     * can ever come from.
+     */
+    private fun applyUserFact(sub: Subscription, fact: UserFactEntity): Subscription = sub.copy(
+        amount = fact.amount?.let { Money(BigDecimal(it), fact.currency ?: sub.amount.currency) } ?: sub.amount,
+        amountKnown = sub.amountKnown || fact.amount != null,
+        frequency = fact.frequency?.let(Frequency::valueOf) ?: sub.frequency,
+        frequencyKnown = sub.frequencyKnown || fact.frequency != null,
+        nextRenewal = fact.nextRenewal?.let(LocalDate::parse) ?: sub.nextRenewal,
+        renewalSource = if (fact.nextRenewal != null) RenewalSource.USER_SUPPLIED else sub.renewalSource,
+        confidence = if (fact.nextRenewal != null) Confidence.HIGH else sub.confidence,
+    )
+
+    /** Saves what the user typed for a subscription the app couldn't fully work out on its own. */
+    suspend fun setUserFact(key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) =
+        dao.setUserFact(UserFactEntity(key, frequency?.name, nextRenewal?.toString(), amount?.toPlainString(), currency))
+
+    /** "I don't know this either, and don't want to be asked again" — distinct from hiding it. */
+    suspend fun dismissUserFact(key: String) = dao.setUserFact(UserFactEntity(key, null, null, null, null, dismissed = true))
 
     suspend fun currentSubscriptions(): List<Subscription> = subscriptions().first()
 
@@ -249,6 +337,8 @@ class WatchdogRepository(
         private const val KEY_GMAIL_BACKFILL = "gmail_backfill_before_millis"
         private const val KEY_GMAIL_SLICES = "gmail_backfill_slices"
         private const val KEY_GMAIL_ENABLED = "gmail_import_enabled"
+        private const val KEY_GMAIL_ACCOUNT = "gmail_account_email"
+        private const val KEY_GMAIL_NEEDS_CONSENT = "gmail_needs_consent"
 
         /** Frontier value meaning the whole [FIRST_SCAN_DAYS] window has been covered. */
         private const val BACKFILL_DONE = 0L
@@ -270,8 +360,8 @@ class WatchdogRepository(
         private const val BACKFILL_SLICE = 75
 
         /** Amount scale differs between sources, so the pair is keyed as text, not BigDecimal. */
-        fun chargeKey(date: LocalDate, amount: BigDecimal) =
-            "$date|${amount.stripTrailingZeros().toPlainString()}"
+        fun chargeKey(date: LocalDate, amount: Money) =
+            "$date|${amount.currency}|${amount.amount.stripTrailingZeros().toPlainString()}"
 
         fun create(context: Context, dao: WatchdogDao) = WatchdogRepository(
             dao, SmsReader(context), context.getSharedPreferences("watchdog", Context.MODE_PRIVATE),

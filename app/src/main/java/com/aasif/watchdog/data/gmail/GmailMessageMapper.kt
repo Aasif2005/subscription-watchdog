@@ -11,12 +11,27 @@ import org.json.JSONObject
 /**
  * Turns one Gmail message into the same [Sms] shape the SMS and notification paths produce, so
  * all three share one parser. The e-mail analogue of `PaymentNotificationListener.toMessage`.
+ *
+ * This is also where a message earns the right to be read as a payment at all. Gmail's own
+ * category label and a handful of bulk-mail headers are the cheapest, most reliable way to tell a
+ * newsletter from a receipt — cheaper than any regex on the body — and DKIM is what lets
+ * [com.aasif.watchdog.core.parser.SmsParser] trust the *sending* domain over a `From` header that
+ * anyone can put anything in.
  */
 object GmailMessageMapper {
     /** Receipts state the amount near the top; the rest is footers that only slow the regexes. */
     private const val MAX_BODY_CHARS = 4_000
 
     private val angleAddress = Regex("""<([^>]+)>""")
+
+    /** Gmail's own classification of the message; present in `format=full` at no extra cost. */
+    private const val CATEGORY_PROMOTIONS = "CATEGORY_PROMOTIONS"
+
+    private val bulkMailHeader = Regex("""^(bulk|list)$""", RegexOption.IGNORE_CASE)
+
+    /** `Authentication-Results: mx.google.com; dkim=pass header.i=@netflix.com header.d=netflix.com`. */
+    private val dkimPass = Regex("""dkim=pass""", RegexOption.IGNORE_CASE)
+    private val dkimDomain = Regex("""header\.d=([A-Za-z0-9.\-]+)""", RegexOption.IGNORE_CASE)
 
     fun toSms(message: JSONObject): Sms? {
         val payload = message.optJSONObject("payload") ?: return null
@@ -31,7 +46,26 @@ object GmailMessageMapper {
             .take(MAX_BODY_CHARS)
         if (body.isBlank() || SmsClassifier.isPromotional(body)) return null
 
-        return Sms(sender = address(from), body = body, receivedAt = receivedAt.toLocalDateTime())
+        val labels = message.optJSONArray("labelIds")
+        val isBulkMail = bulkMailHeader.matches(header(headers, "Precedence").orEmpty()) ||
+            header(headers, "List-Unsubscribe") != null
+        // Marketing from a genuine merchant is still marketing: Coursera's own promotional mail
+        // is signed by coursera.org and would pass a sender check, which is why this is a
+        // separate rule from the DKIM one below rather than folded into it.
+        if (labelHas(labels, CATEGORY_PROMOTIONS)) return null
+        if (isBulkMail && !SmsClassifier.hasPaymentEvidence(body)) return null
+
+        val verifiedDomain = header(headers, "Authentication-Results")
+            ?.takeIf { dkimPass.containsMatchIn(it) }
+            ?.let { dkimDomain.find(it)?.groupValues?.get(1)?.lowercase() }
+
+        return Sms(sender = address(from), body = body, receivedAt = receivedAt.toLocalDateTime(), verifiedDomain = verifiedDomain)
+    }
+
+    private fun labelHas(labels: JSONArray?, target: String): Boolean {
+        if (labels == null) return false
+        for (i in 0 until labels.length()) if (labels.optString(i) == target) return true
+        return false
     }
 
     /** Plain text if the sender provided it, otherwise the HTML part flattened. */

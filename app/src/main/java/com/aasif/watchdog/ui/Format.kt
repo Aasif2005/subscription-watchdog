@@ -1,5 +1,6 @@
 package com.aasif.watchdog.ui
 
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.RenewalSource
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
@@ -13,6 +14,9 @@ import java.time.temporal.ChronoUnit
 import java.util.Locale
 
 private val rupees = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("en-IN"))
+
+/** Symbols for the handful of currencies mail actually bills in; anything else falls back to its code. */
+private val currencySymbols = mapOf("INR" to "₹", "USD" to "$", "EUR" to "€", "GBP" to "£")
 private val dayMonthYear = DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH)
 private val hourMinute = DateTimeFormatter.ofPattern("h:mm a", Locale.ENGLISH)
 
@@ -20,6 +24,14 @@ private val hourMinute = DateTimeFormatter.ofPattern("h:mm a", Locale.ENGLISH)
 fun formatRupees(amount: BigDecimal): String {
     rupees.minimumFractionDigits = if (amount.stripTrailingZeros().scale() <= 0) 0 else 2
     return rupees.format(amount)
+}
+
+/** [formatRupees] for INR, "$7.00"-style for anything else — no conversion, just its own symbol. */
+fun formatMoney(money: Money): String {
+    if (money.currency == Money.INR) return formatRupees(money.amount)
+    val symbol = currencySymbols[money.currency] ?: "${money.currency} "
+    val scale = if (money.amount.stripTrailingZeros().scale() <= 0) 0 else 2
+    return "$symbol${money.amount.setScale(scale, java.math.RoundingMode.HALF_UP).toPlainString()}"
 }
 
 fun formatDate(date: LocalDate): String = date.format(dayMonthYear)
@@ -48,16 +60,20 @@ fun Subscription.renewalLine(): String {
     return when {
         status == SubscriptionStatus.CANCELLED -> "Cancelled"
         status == SubscriptionStatus.LAPSED -> "No recent charges — probably ended"
+        next == null && frequency.hasSchedule && needsInput -> "Renewal date unknown — tell the app"
         next == null -> "Charged whenever the merchant bills (no fixed date)"
         status == SubscriptionStatus.TRIAL -> "Trial ends ${relativeDays(next)} · ${formatDate(next)}"
+        renewalSource == RenewalSource.PLAN_EXPIRY -> "Plan ends ${relativeDays(next)} · ${formatDate(next)}"
         else -> "Renews ${relativeDays(next)} · ${formatDate(next)}"
     }
 }
 
 fun RenewalSource.explanation(): String = when (this) {
+    RenewalSource.USER_SUPPLIED -> "You told us"
     RenewalSource.PRE_DEBIT_NOTICE -> "Exact date from your bank's pre-debit notice"
     RenewalSource.MANDATE -> "From your AutoPay mandate's start date and frequency"
     RenewalSource.PAYMENT_HISTORY -> "Estimated from the gaps between your past payments"
+    RenewalSource.PLAN_EXPIRY -> "The plan length stated in its receipt"
     RenewalSource.TRIAL_ESTIMATE -> "Estimated from this service's usual free-trial length"
     RenewalSource.MANUAL -> "Added by you"
 }

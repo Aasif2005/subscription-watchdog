@@ -1,9 +1,11 @@
 package com.aasif.watchdog.core.parser
 
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import java.math.BigDecimal
 import java.time.DateTimeException
 import java.time.LocalDate
+import java.time.Period
 
 /** A date found in an SMS, plus the text just before it, which tells us what the date means. */
 data class FoundDate(val date: LocalDate, val start: Int, val before: String)
@@ -13,18 +15,84 @@ internal object Extractors {
 
     // ---- Amounts ----------------------------------------------------------------------------
 
+    /**
+     * Symbols and codes that introduce a price. Mail from services billing outside India
+     * (NordVPN, GitHub) states dollars, so matching rupees alone silently lost their amount.
+     */
+    private const val CURRENCY = """(?:rs\.?|inr|₹|us\s?\$|\$|usd|eur|€|gbp|£)"""
+
     private val amountRegex =
-        Regex("""(?:rs\.?|inr|₹)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)""", RegexOption.IGNORE_CASE)
+        Regex("""($CURRENCY)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)""", RegexOption.IGNORE_CASE)
     private val balanceContext = Regex("""(bal|balance|limit)\W*$""", RegexOption.IGNORE_CASE)
 
-    /** Amounts in text order, skipping account balances and credit limits. */
-    fun amounts(body: String): List<BigDecimal> =
-        amountRegex.findAll(body)
-            .filterNot { m -> balanceContext.containsMatchIn(body.substring(maxOf(0, m.range.first - 25), m.range.first)) }
-            .mapNotNull { it.groupValues[1].replace(",", "").trimEnd('.').toBigDecimalOrNull() }
-            .toList()
+    /**
+     * Words that mean the amount left the reader's account, checked just before the figure —
+     * "your payment of ₹649" — since that is how a written-out receipt reads.
+     */
+    private val paidBefore = Regex(
+        """(paid|pay(ment|ing)?(\s+of)?|charged?|billed?|debited|deducted|total|subtotal|amount(\s+due)?|invoice|receipt|order\s+total|grand\s+total|you\s+were|has\s+been)\W{0,12}$""",
+        RegexOption.IGNORE_CASE,
+    )
 
-    fun amount(body: String): BigDecimal? = amounts(body).firstOrNull()
+    /**
+     * The same words checked just after — "Rs 649.00 debited from A/c" — which is how a bank's
+     * terse SMS phrasing reads instead. Bank SMS and receipt mail put the verb on opposite sides
+     * of the number, so both directions have to be checked.
+     */
+    private val paidAfter = Regex(
+        """^\s*(was\s+|has\s+been\s+|is\s+)?(paid|charged|billed|debited|deducted|spent)\b""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * What a price tag looks like. "₹7,499/year" and "from ₹199 per month" are the shape of an
+     * advert, not a receipt; a Coursera Plus promotion reached the dashboard through exactly this.
+     */
+    private val priceTagAfter = Regex(
+        """^\s*(?:/|\s+per\s+|\s+a\s+|\s+each\s+)\s*(?:year|yr|month|mo|week|user|seat)|^\s*(?:onwards|only|\+\s*(?:gst|tax))""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val priceTagBefore = Regex(
+        """(only|just|from|starting\s+at|starts\s+at|worth|save|upto|up\s+to|as\s+low\s+as|flat|get|off|upgrade\s+(for|to)|valued?\s+at)\W{0,12}$""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    private val currencyCodes = mapOf(
+        "rs" to Money.INR, "rs." to Money.INR, "inr" to Money.INR, "₹" to Money.INR,
+        "$" to "USD", "us$" to "USD", "us $" to "USD", "usd" to "USD",
+        "€" to "EUR", "eur" to "EUR", "£" to "GBP", "gbp" to "GBP",
+    )
+
+    /** Amounts in text order, skipping account balances and credit limits. */
+    fun amounts(body: String): List<Money> = found(body).map { it.money }
+
+    fun amount(body: String): Money? = amounts(body).firstOrNull()
+
+    /**
+     * Amounts that the text says were actually paid, charged or billed — and that are not
+     * advertised prices. This is the filter that separates a receipt from a promotion.
+     */
+    fun paidAmounts(body: String): List<Money> =
+        found(body).filter { it.paid && !it.priceTag }.map { it.money }
+
+    fun paidAmount(body: String): Money? = paidAmounts(body).firstOrNull()
+
+    private data class FoundAmount(val money: Money, val paid: Boolean, val priceTag: Boolean)
+
+    private fun found(body: String): List<FoundAmount> =
+        amountRegex.findAll(body).mapNotNull { m ->
+            val before = body.substring(maxOf(0, m.range.first - 40), m.range.first)
+            val after = body.drop(m.range.last + 1).take(20)
+            if (balanceContext.containsMatchIn(before.takeLast(25))) return@mapNotNull null
+            val value = m.groupValues[2].replace(",", "").trimEnd('.').toBigDecimalOrNull()
+                ?: return@mapNotNull null
+            val code = currencyCodes[m.groupValues[1].lowercase().replace(" ", "")] ?: Money.INR
+            FoundAmount(
+                money = Money(value, code),
+                paid = paidBefore.containsMatchIn(before) || paidAfter.containsMatchIn(after),
+                priceTag = priceTagAfter.containsMatchIn(after) || priceTagBefore.containsMatchIn(before),
+            )
+        }.toList()
 
     // ---- Dates ------------------------------------------------------------------------------
 
@@ -91,8 +159,10 @@ internal object Extractors {
         """fortnight""" to Frequency.FORTNIGHTLY,
         """quarter""" to Frequency.QUARTERLY,
         """annual|yearly|every year""" to Frequency.YEARLY,
-        """month""" to Frequency.MONTHLY,
-        """week""" to Frequency.WEEKLY,
+        // Not preceded by a count ("3 months", "12-month"): that names a plan's length, which
+        // [planDuration] reads instead — "3 months plan" is not the same claim as "billed monthly".
+        """(?<!\d)(?<!\d )(?<!\d-)month""" to Frequency.MONTHLY,
+        """(?<!\d)(?<!\d )(?<!\d-)week""" to Frequency.WEEKLY,
         """daily|every day""" to Frequency.DAILY,
     ).map { (pattern, f) -> Regex(pattern, RegexOption.IGNORE_CASE) to f }
 
@@ -100,6 +170,67 @@ internal object Extractors {
     fun frequency(body: String): Frequency? {
         val scope = frequencyField.find(body)?.groupValues?.get(1) ?: body
         return frequencyWords.firstOrNull { it.first.containsMatchIn(scope) }?.second
+    }
+
+    // ---- Plan length ------------------------------------------------------------------------
+
+    private val numberedPlan = Regex(
+        """\b(\d{1,2})[\s\-]*(month|mo|year|yr|week|day)s?\b|\b(\d{2,3})[\s\-]*days?\b""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val namedPlan = listOf(
+        """\b(annual|yearly|1[\s\-]?year)\s+(plan|subscription|membership|billing)""" to Period.ofYears(1),
+        """\bquarterly\s+(plan|subscription|membership|billing)""" to Period.ofMonths(3),
+        """\bhalf[\s\-]?yearly\s+(plan|subscription|membership|billing)""" to Period.ofMonths(6),
+        """\bmonthly\s+(plan|subscription|membership|billing)""" to Period.ofMonths(1),
+    ).map { (p, period) -> Regex(p, RegexOption.IGNORE_CASE) to period }
+
+    /** The mail says the plan renews by itself, so its end date is also its next charge. */
+    private val autoRenewWord = Regex(
+        """auto(matic(ally)?)?[\s\-]?renew|renews?\s+automatically|will\s+(be\s+)?renew|recurring\s+(billing|payment)|until\s+you\s+cancel""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * How long a plan was bought for: "3 months plan", "12-month subscription", "90 days".
+     *
+     * A receipt that never names a renewal date very often names the length instead, which is the
+     * only thing that turns "you subscribed on 1 Sep" into a date worth warning about.
+     */
+    fun planDuration(body: String): Period? {
+        numberedPlan.find(body)?.let { m ->
+            m.groupValues[3].toIntOrNull()?.let { return Period.ofDays(it) }
+            val n = m.groupValues[1].toIntOrNull() ?: return@let
+            if (n <= 0) return@let
+            return when (m.groupValues[2].lowercase().take(2)) {
+                "mo" -> Period.ofMonths(n)
+                "ye", "yr" -> Period.ofYears(n)
+                "we" -> Period.ofWeeks(n)
+                else -> Period.ofDays(n)
+            }
+        }
+        return namedPlan.firstOrNull { it.first.containsMatchIn(body) }?.second
+    }
+
+    fun autoRenews(body: String): Boolean = autoRenewWord.containsMatchIn(body)
+
+    /** The [Frequency] a plan length lines up with, if any. "3 months" is a quarterly plan. */
+    fun frequencyOf(period: Period): Frequency? {
+        val months = period.toTotalMonths().toInt()
+        if (period.days == 0 && months > 0) {
+            return Frequency.scheduled.firstOrNull { it.approxDays in 1..400 && monthsOf(it) == months }
+        }
+        if (months == 0) return Frequency.fromGap(period.days.toLong())
+        return null
+    }
+
+    private fun monthsOf(f: Frequency): Int = when (f) {
+        Frequency.MONTHLY -> 1
+        Frequency.BIMONTHLY -> 2
+        Frequency.QUARTERLY -> 3
+        Frequency.HALF_YEARLY -> 6
+        Frequency.YEARLY -> 12
+        else -> 0
     }
 
     // ---- Merchant ---------------------------------------------------------------------------
@@ -144,4 +275,27 @@ internal object Extractors {
     private val vpaRegex = Regex("""([A-Za-z0-9][A-Za-z0-9._\-]{1,60})@([A-Za-z]{2,})\b(?!\.)""")
 
     fun vpa(body: String): String? = vpaRegex.find(body)?.value
+
+    /**
+     * A UPI mandate's Unique Mandate Number, as in "UMN: 4f3a...@okhdfcbank".
+     *
+     * Banks put it in every AutoPay debit, including the many that never use the word "AutoPay" —
+     * which is why not one of the 731 debits read from this phone was recognised as recurring.
+     */
+    private val umnRegex = Regex("""\bumn\b\W{0,3}([A-Za-z0-9._\-]{6,}@[A-Za-z]{2,})?""", RegexOption.IGNORE_CASE)
+
+    fun hasUmn(body: String): Boolean = umnRegex.containsMatchIn(body)
+
+    /**
+     * A payee that is a phone number or a person's handle: money sent to a friend, never a
+     * subscription. These are what fill the repeated-amount clusters that look like plans.
+     */
+    private val personVpa = Regex("""\b(\+?91)?[6-9]\d{9}@[a-z]{2,}\b""", RegexOption.IGNORE_CASE)
+    private val p2pWord = Regex(
+        """\b(sent\s+to|transferred\s+to|paid\s+to\s+(mr|mrs|ms|shri|smt)\b|upi/p2p|/p2p/|self\s+transfer|to\s+your\s+own)\b""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    fun isPeerToPeer(body: String): Boolean =
+        personVpa.containsMatchIn(body) || p2pWord.containsMatchIn(body)
 }

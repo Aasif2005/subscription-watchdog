@@ -47,6 +47,13 @@ private fun App(vm: MainViewModel = viewModel()) {
     val gmailConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
         vm.onGmailConsentResult(it.data)
     }
+    // Only the account chooser knows which account was picked; asked for again on "Switch account".
+    val chooseGmailAccount = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        result.data?.getStringExtra(android.accounts.AccountManager.KEY_ACCOUNT_NAME)?.let { account ->
+            vm.switchGmailAccount(account) { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
+        }
+    }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState() }
     BackHandler(enabled = vm.canGoBack) { vm.back() }
 
     when (val screen = vm.screen) {
@@ -61,9 +68,24 @@ private fun App(vm: MainViewModel = viewModel()) {
             onGrantAccess = { vm.open(Screen.Onboarding) },
             onGrantNotificationAccess = { openNotificationAccessSettings(context) },
             gmailImportEnabled = vm.gmailImportEnabled,
+            gmailNeedsConsent = vm.gmailNeedsConsent,
             onConnectGmail = {
                 vm.connectGmail { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
             },
+            onOpenProfile = { vm.open(Screen.Profile) },
+            onSaveUserFact = vm::setUserFact,
+            onDismissUserFact = vm::dismissUserFact,
+            onHide = vm::hide,
+        )
+        Screen.Profile -> ProfileScreen(
+            gmailImportEnabled = vm.gmailImportEnabled,
+            gmailAccountEmail = vm.gmailAccountEmail,
+            onBack = { vm.back() },
+            onConnectGmail = {
+                vm.connectGmail { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
+            },
+            onSwitchAccount = { chooseGmailAccount.launch(vm.chooseGmailAccountIntent()) },
+            onDisconnect = vm::disconnectGmail,
         )
         is Screen.Detail -> {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }

@@ -1,9 +1,12 @@
 package com.aasif.watchdog.data.gmail
 
+import android.accounts.Account
+import android.accounts.AccountManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.AuthorizationResult
 import com.google.android.gms.auth.api.identity.Identity
 import com.google.android.gms.common.api.Scope
 import com.google.android.gms.tasks.Task
@@ -13,7 +16,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 sealed interface GmailAuth {
-    data class Granted(val accessToken: String) : GmailAuth
+    /** [accountEmail] is null when Play Services granted the token without saying which account. */
+    data class Granted(val accessToken: String, val accountEmail: String?) : GmailAuth
 
     /** Play Services needs the user to approve the scope; only a foreground screen can show this. */
     data class NeedsConsent(val pendingIntent: PendingIntent) : GmailAuth
@@ -26,24 +30,32 @@ sealed interface GmailAuth {
  * Obtains Gmail read access through Play Services, which owns the consent record and refreshes
  * tokens itself. Nothing is persisted here on purpose: no access or refresh token is ever
  * written to disk by this app.
+ *
+ * The Authorization API has no revoke call ([AuthorizationClient] exposes only `authorize` and
+ * reading a result back out of an intent — checked directly against play-services-auth 21.3.0),
+ * so "disconnect" in [com.aasif.watchdog.data.WatchdogRepository] means clearing what this app
+ * remembers locally and asking Google's token endpoint to drop the grant, not calling an SDK
+ * method that does not exist.
  */
 class GmailAuthManager(private val context: Context) {
     private val client get() = Identity.getAuthorizationClient(context)
 
-    private val request: AuthorizationRequest =
-        AuthorizationRequest.builder().setRequestedScopes(listOf(Scope(GMAIL_READONLY))).build()
+    private fun request(account: Account? = null) =
+        AuthorizationRequest.builder().setRequestedScopes(listOf(Scope(GMAIL_READONLY)))
+            .apply { account?.let { setAccount(it) } }
+            .build()
 
     /**
      * Asks for a token. Returns [GmailAuth.NeedsConsent] instead of throwing when the user has to
      * approve it, so a background worker can give up quietly and the UI can pick it up later.
      */
-    suspend fun authorize(): GmailAuth = try {
-        val result = client.authorize(request).await()
-        val pending = result.pendingIntent
-        when {
-            result.hasResolution() && pending != null -> GmailAuth.NeedsConsent(pending)
-            else -> result.accessToken?.let(GmailAuth::Granted) ?: GmailAuth.Unavailable
-        }
+    suspend fun authorize(): GmailAuth = authorize(request())
+
+    /** Same as [authorize], but scoped to one Google account — how "switch account" asks for a token. */
+    suspend fun authorize(account: Account): GmailAuth = authorize(request(account))
+
+    private suspend fun authorize(req: AuthorizationRequest): GmailAuth = try {
+        toGmailAuth(client.authorize(req).await())
     } catch (e: CancellationException) {
         throw e
     } catch (_: Exception) {
@@ -51,12 +63,27 @@ class GmailAuthManager(private val context: Context) {
     }
 
     /** Reads the token back out of the consent screen's result. */
-    fun tokenFrom(data: Intent?): String? = data?.let {
-        runCatching { client.getAuthorizationResultFromIntent(it).accessToken }.getOrNull()
+    fun fromConsentResult(data: Intent?): GmailAuth = data?.let {
+        runCatching { toGmailAuth(client.getAuthorizationResultFromIntent(it)) }.getOrNull()
+    } ?: GmailAuth.Unavailable
+
+    private fun toGmailAuth(result: AuthorizationResult): GmailAuth {
+        val pending = result.pendingIntent
+        if (result.hasResolution() && pending != null) return GmailAuth.NeedsConsent(pending)
+        val token = result.accessToken ?: return GmailAuth.Unavailable
+        val email = runCatching { result.toGoogleSignInAccount()?.email }.getOrNull()
+        return GmailAuth.Granted(token, email)
     }
+
+    /** The system's "choose a Google account" screen, for switching which inbox is read. */
+    fun chooseAccountIntent(): Intent =
+        AccountManager.newChooseAccountIntent(null, null, arrayOf(GOOGLE_ACCOUNT_TYPE), null, null, null, null)
+
+    fun account(name: String) = Account(name, GOOGLE_ACCOUNT_TYPE)
 
     private companion object {
         const val GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+        const val GOOGLE_ACCOUNT_TYPE = "com.google"
     }
 }
 

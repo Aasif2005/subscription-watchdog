@@ -27,9 +27,10 @@ import com.aasif.watchdog.R
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.engine.dueForReminder
 import com.aasif.watchdog.data.GmailSyncOutcome
+import com.aasif.watchdog.core.model.RenewalSource
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.ui.MainActivity
-import com.aasif.watchdog.ui.formatRupees
+import com.aasif.watchdog.ui.formatMoney
 import java.time.Duration
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -114,6 +115,14 @@ object Workers {
         WorkManager.getInstance(context)
             .enqueueUniqueWork(GMAIL_MORE, ExistingWorkPolicy.REPLACE, gmailSync(slicePause))
     }
+
+    /** Stops every Gmail work item, e.g. right after the user disconnects from the profile page. */
+    fun cancelGmailWork(context: Context) {
+        val wm = WorkManager.getInstance(context)
+        wm.cancelUniqueWork(GMAIL_NOW)
+        wm.cancelUniqueWork(GMAIL_MORE)
+        wm.cancelUniqueWork(GMAIL_DAILY)
+    }
 }
 
 /**
@@ -174,11 +183,20 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 1L -> "tomorrow"
                 else -> "in $days days"
             }
-            val price = formatRupees(sub.amount)
-            val (title, text) = if (sub.status == SubscriptionStatus.TRIAL) {
-                "${sub.name} free trial ends $whenText" to "$price will be charged unless you cancel before $date."
-            } else {
-                "${sub.name} renews $whenText" to "$price (${sub.frequency.label.lowercase()}) will be charged on $date."
+            // An amount nothing ever stated would otherwise read as a confident "₹0.00 will be
+            // charged"; the reminder is still worth sending, just without inventing a figure.
+            val price = if (sub.amountKnown) formatMoney(sub.amount) else null
+            val (title, text) = when {
+                sub.status == SubscriptionStatus.TRIAL ->
+                    "${sub.name} free trial ends $whenText" to
+                        (price?.let { "$it will be charged unless you cancel before $date." } ?: "Cancel before $date to avoid being charged.")
+                // A plan length read off a receipt is an end date, not a confirmed auto-renewal.
+                sub.renewalSource == RenewalSource.PLAN_EXPIRY ->
+                    "${sub.name} plan ends $whenText" to
+                        (price?.let { "$it plan ends on $date. Renew it if you want to keep it." } ?: "Your plan ends on $date.")
+                else ->
+                    "${sub.name} renews $whenText" to
+                        (price?.let { "$it (${sub.frequency.label.lowercase()}) will be charged on $date." } ?: "Renews on $date.")
             }
             notify(sub.key.hashCode(), title, text)
             repo.setNotified(sub.key, date)

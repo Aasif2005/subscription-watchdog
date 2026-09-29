@@ -35,4 +35,14 @@ interface WatchdogDao {
 
     @Query("SELECT * FROM user_marks")
     fun marks(): Flow<List<UserMarkEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun setUserFact(fact: UserFactEntity)
+
+    @Query("SELECT * FROM user_facts")
+    fun userFacts(): Flow<List<UserFactEntity>>
+
+    /** Switching Gmail accounts re-imports from scratch; SMS and notification events are untouched. */
+    @Query("DELETE FROM events WHERE source LIKE 'gmail:%'")
+    suspend fun clearGmailEvents()
 }

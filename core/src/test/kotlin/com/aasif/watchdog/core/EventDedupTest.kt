@@ -2,6 +2,7 @@ package com.aasif.watchdog.core
 
 import com.aasif.watchdog.core.engine.isLikelyDuplicateOf
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
 import java.math.BigDecimal
 import java.time.LocalDate
@@ -12,12 +13,14 @@ import kotlin.test.assertTrue
 class EventDedupTest {
     private val sep5 = LocalDate.of(2026, 9, 5)
 
+    private fun money(v: String) = Money(BigDecimal(v))
+
     private fun debit(
         merchant: String = "netflix",
         amount: String = "649",
         date: LocalDate = sep5,
         viaMandate: Boolean = true,
-    ) = PaymentEvent.Debit("$merchant", "Netflix", date, BigDecimal(amount), date, viaMandate)
+    ) = PaymentEvent.Debit("$merchant", "Netflix", date, money(amount), date, viaMandate)
 
     // ---- Debits ---------------------------------------------------------------------------------
 
@@ -53,18 +56,18 @@ class EventDedupTest {
 
     @Test
     fun `pre-debit notices collapse on the announced date`() {
-        val a = PaymentEvent.PreDebitNotice("netflix", "Netflix", sep5, BigDecimal("649"), sep5.plusDays(1))
-        val b = PaymentEvent.PreDebitNotice("netflix", "Netflix", sep5.plusDays(1), BigDecimal("649.00"), sep5.plusDays(1))
+        val a = PaymentEvent.PreDebitNotice("netflix", "Netflix", sep5, money("649"), sep5.plusDays(1))
+        val b = PaymentEvent.PreDebitNotice("netflix", "Netflix", sep5.plusDays(1), money("649.00"), sep5.plusDays(1))
         assertTrue(a.isLikelyDuplicateOf(b), "same announced debit, seen a day apart")
     }
 
     @Test
     fun `mandates collapse on start date, amount and frequency`() {
-        val a = PaymentEvent.MandateCreated("netflix", "Netflix", sep5, BigDecimal("649"), Frequency.MONTHLY, sep5, null)
-        val b = PaymentEvent.MandateCreated("netflix", "Netflix", sep5, BigDecimal("649.00"), Frequency.MONTHLY, sep5, null)
+        val a = PaymentEvent.MandateCreated("netflix", "Netflix", sep5, money("649"), Frequency.MONTHLY, sep5, null)
+        val b = PaymentEvent.MandateCreated("netflix", "Netflix", sep5, money("649.00"), Frequency.MONTHLY, sep5, null)
         assertTrue(a.isLikelyDuplicateOf(b))
 
-        val yearly = PaymentEvent.MandateCreated("netflix", "Netflix", sep5, BigDecimal("649"), Frequency.YEARLY, sep5, null)
+        val yearly = PaymentEvent.MandateCreated("netflix", "Netflix", sep5, money("649"), Frequency.YEARLY, sep5, null)
         assertFalse(a.isLikelyDuplicateOf(yearly), "a monthly and a yearly plan are different subscriptions")
     }
 
@@ -85,7 +88,7 @@ class EventDedupTest {
 
     @Test
     fun `different event types are never duplicates of each other`() {
-        val notice = PaymentEvent.PreDebitNotice("netflix", "Netflix", sep5, BigDecimal("649"), sep5)
+        val notice = PaymentEvent.PreDebitNotice("netflix", "Netflix", sep5, money("649"), sep5)
         assertFalse(debit().isLikelyDuplicateOf(notice))
         assertFalse(notice.isLikelyDuplicateOf(debit()))
     }

@@ -10,7 +10,14 @@ enum class SmsKind { MANDATE_CREATED, PRE_DEBIT, DEBIT, MANDATE_REVOKED, IRRELEV
 object SmsClassifier {
     private fun rx(p: String) = Regex(p, RegexOption.IGNORE_CASE)
 
-    private val recurringWord = rx("""\b(mandate|e-?mandate|auto\s?pay|standing\s+instruction|si|recurring|subscription|e-?nach|nach)\b""")
+    /**
+     * "si" used to be here as a bare alternative and, matched case-insensitively, fired on
+     * ordinary words; the real standing-instruction spellings are explicit.
+     */
+    private val recurringWord = rx(
+        """\b(mandate|e-?mandate|auto\s?pay|auto[\s\-]?debit|auto[\s\-]?renew\w*|standing\s+instruction|recurring|subscription|e-?nach|nach|ach|ecs|umn)\b""" +
+            """|\bSI[\s\-](?:ref|no|umn|debit)\b|\bmandate\s*ref\b""",
+    )
     private val revokedWord = rx("""\b(revoked|revocation|cancell?ed|paused|deleted|deactivated|terminated|stopped)\b""")
     private val createdWord = rx("""\b(created|registered|registration|set\s?up|activated|approved)\b""")
     private val preDebitWord = rx("""will\s+be\s+(debited|deducted|charged|executed|processed|auto-?debited)|to\s+be\s+debited|scheduled\s+(for|on)|\bdue\s+(on|for|date)\b|\bupcoming\b|pre-?debit""")
@@ -36,6 +43,17 @@ object SmsClassifier {
     }
 
     fun isRecurring(body: String): Boolean = recurringWord.containsMatchIn(body)
+
+    /**
+     * Whether the text is about money that actually moved, or is about to.
+     *
+     * A bank SMS is only ever sent because something happened to an account, so this is not asked
+     * of one. Mail is different: an advert for Coursera Plus contains the word "subscription", a
+     * price and a billing period, and reached the dashboard as a subscription the user never had.
+     * [Extractors.paidAmount] already requires a payment verb next to the figure and rejects the
+     * shape of a price tag ("₹7,499/year"), which is exactly what tells a receipt from an advert.
+     */
+    fun hasPaymentEvidence(body: String): Boolean = Extractors.paidAmount(body) != null
 
     /**
      * UPI app notifications mix marketing ("Set up AutoPay for Netflix, get ₹50 cashback") with

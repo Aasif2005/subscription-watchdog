@@ -1,7 +1,7 @@
 package com.aasif.watchdog.core.engine
 
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
-import java.math.BigDecimal
 import java.time.temporal.ChronoUnit
 import kotlin.math.abs
 
@@ -35,5 +35,5 @@ fun PaymentEvent.isLikelyDuplicateOf(other: PaymentEvent): Boolean {
 }
 
 /** Sources differ in scale ("199" vs "199.00"), which BigDecimal.equals() treats as unequal. */
-private fun sameAmount(a: BigDecimal?, b: BigDecimal?): Boolean =
-    if (a == null || b == null) a == b else a.compareTo(b) == 0
+private fun sameAmount(a: Money?, b: Money?): Boolean =
+    if (a == null || b == null) a == b else a.currency == b.currency && a.amount.compareTo(b.amount) == 0

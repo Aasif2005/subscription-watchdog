@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -53,6 +54,7 @@ import androidx.compose.ui.unit.dp
 import com.aasif.watchdog.core.engine.monthlyTotal
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.data.ChargeSource
@@ -119,13 +121,21 @@ fun DashboardScreen(
     onGrantAccess: () -> Unit,
     onGrantNotificationAccess: () -> Unit,
     gmailImportEnabled: Boolean,
+    gmailNeedsConsent: Boolean,
     onConnectGmail: () -> Unit,
+    onOpenProfile: () -> Unit,
+    onSaveUserFact: (key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) -> Unit,
+    onDismissUserFact: (key: String) -> Unit,
+    onHide: (key: String) -> Unit,
 ) {
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Subscriptions") },
-                actions = { if (hasSmsAccess) TextButton(onClick = onRescan) { Text("Rescan") } },
+                actions = {
+                    if (hasSmsAccess) TextButton(onClick = onRescan) { Text("Rescan") }
+                    TextButton(onClick = onOpenProfile) { Text("Profile") }
+                },
             )
         },
         floatingActionButton = { ExtendedFloatingActionButton(onClick = onAdd) { Text("Add manually") } },
@@ -136,6 +146,9 @@ fun DashboardScreen(
         }
         val live = subscriptions.filter { it.isLive }
         val ended = subscriptions.filterNot { it.isLive }
+        // Cleared once a fact is saved (renewalSource flips to USER_SUPPLIED), so a card leaves
+        // this list the moment it stops needing anything, without a separate "resolved" flag.
+        val needsInput = live.filter { it.needsInput }
 
         LazyColumn(
             Modifier.fillMaxSize().padding(padding),
@@ -167,19 +180,37 @@ fun DashboardScreen(
                     }
                 }
             }
-            if (!gmailImportEnabled) {
+            if (!gmailImportEnabled || gmailNeedsConsent) {
                 item {
                     Card(Modifier.fillMaxWidth().clickable(onClick = onConnectGmail)) {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Import subscriptions from Gmail", fontWeight = FontWeight.SemiBold)
                             Text(
-                                "Card subscriptions often send only an email receipt, with no SMS at all. " +
-                                    "This is the one feature that uses the internet: Google is asked for read-only " +
-                                    "access to your mail, and receipts are read on this phone. You can turn it down.",
+                                if (gmailNeedsConsent) "Gmail access needs to be approved again" else "Import subscriptions from Gmail",
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                if (gmailNeedsConsent) {
+                                    "Google asked us to confirm access again. Tap to continue — nothing you've already found is lost."
+                                } else {
+                                    "Card subscriptions often send only an email receipt, with no SMS at all. " +
+                                        "This is the one feature that uses the internet: Google is asked for read-only " +
+                                        "access to your mail, and receipts are read on this phone. You can turn it down."
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                         }
                     }
+                }
+            }
+            if (needsInput.isNotEmpty()) {
+                item { SectionHeader("Needs your input") }
+                items(needsInput, key = { "ask:${it.key}" }) { sub ->
+                    NeedsInputCard(
+                        sub = sub,
+                        onSave = { frequency, next, amount, currency -> onSaveUserFact(sub.key, frequency, next, amount, currency) },
+                        onNotASubscription = { onHide(sub.key) },
+                        onDismiss = { onDismissUserFact(sub.key) },
+                    )
                 }
             }
             if (subscriptions.isEmpty()) {
@@ -197,6 +228,66 @@ fun DashboardScreen(
             items(live, key = { it.key }) { SubscriptionRow(it, onClick = { onOpen(it.key) }) }
             if (ended.isNotEmpty()) item { SectionHeader("Ended") }
             items(ended, key = { it.key }) { SubscriptionRow(it, onClick = { onOpen(it.key) }) }
+        }
+    }
+}
+
+/**
+ * A subscription the app is confident is real but can't fully describe — the running example
+ * being a plan whose renewal date lives only inside its own app (NordVPN), never in an SMS or
+ * e-mail. Collapsed to one line until tapped, so a full inbox of these doesn't take over the
+ * dashboard.
+ */
+@Composable
+private fun NeedsInputCard(
+    sub: Subscription,
+    onSave: (frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) -> Unit,
+    onNotASubscription: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    var amountText by remember { mutableStateOf(if (sub.amountKnown) sub.amount.amount.toPlainString() else "") }
+    var dateText by remember { mutableStateOf(sub.nextRenewal?.toString() ?: "") }
+    var frequency by remember { mutableStateOf(if (sub.frequencyKnown) sub.frequency else Frequency.MONTHLY) }
+
+    val missing = buildString {
+        if (sub.nextRenewal == null) append("Renewal date")
+        if (!sub.amountKnown) { if (isNotEmpty()) append(" and "); append("amount") }
+    }.ifEmpty { "Details" }
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(16.dp)) {
+            Text(sub.name, style = MaterialTheme.typography.titleMedium)
+            Text("$missing unknown — tap to fill in", style = MaterialTheme.typography.bodyMedium)
+        }
+        if (expanded) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    amountText, { amountText = it.filter { c -> c.isDigit() || c == '.' } }, Modifier.fillMaxWidth(),
+                    label = { Text("Amount (${sub.amount.currency})") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                )
+                Text("How often", style = MaterialTheme.typography.labelLarge)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    manualFrequencies.forEach { f ->
+                        FilterChip(selected = frequency == f, onClick = { frequency = f }, label = { Text(f.label) })
+                    }
+                }
+                OutlinedTextField(
+                    dateText, { dateText = it }, Modifier.fillMaxWidth(),
+                    label = { Text("Next renewal (YYYY-MM-DD)") }, singleLine = true,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = {
+                        val amt = amountText.toBigDecimalOrNull()?.takeIf { it > BigDecimal.ZERO }
+                        val next = dateText.trim().takeIf { it.isNotBlank() }?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+                        onSave(frequency, next, amt, sub.amount.currency)
+                        expanded = false
+                    }) { Text("Save") }
+                    TextButton(onClick = onNotASubscription) { Text("Not a subscription") }
+                }
+                TextButton(onClick = onDismiss) { Text("Don't ask me about this") }
+            }
         }
     }
 }
@@ -254,8 +345,8 @@ private fun SubscriptionRow(sub: Subscription, onClick: () -> Unit) {
                 )
             }
             Column(horizontalAlignment = Alignment.End) {
-                Text(formatRupees(sub.amount), style = MaterialTheme.typography.titleMedium)
-                Text(sub.frequency.label, style = MaterialTheme.typography.bodySmall)
+                Text(if (sub.amountKnown) formatMoney(sub.amount) else "?", style = MaterialTheme.typography.titleMedium)
+                Text(if (sub.frequencyKnown) sub.frequency.label else "Unknown", style = MaterialTheme.typography.bodySmall)
             }
         }
     }
@@ -287,8 +378,15 @@ fun DetailScreen(
             Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("${formatRupees(sub.amount)} · ${sub.frequency.label}", style = MaterialTheme.typography.headlineSmall)
-            Text("${sub.category} · about ${formatRupees(sub.monthlyCost)} a month, ${formatRupees(sub.monthlyCost.multiply(BigDecimal(12)))} a year")
+            val amountLabel = if (sub.amountKnown) formatMoney(sub.amount) else "Amount unknown"
+            val frequencyLabel = if (sub.frequencyKnown) sub.frequency.label else "frequency unknown"
+            Text("$amountLabel · $frequencyLabel", style = MaterialTheme.typography.headlineSmall)
+            if (sub.amountKnown) {
+                val yearly = Money(sub.monthlyCost.amount.multiply(BigDecimal(12)), sub.monthlyCost.currency)
+                Text("${sub.category} · about ${formatMoney(sub.monthlyCost)} a month, ${formatMoney(yearly)} a year")
+            } else {
+                Text(sub.category)
+            }
 
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -318,7 +416,7 @@ fun DetailScreen(
                                         )
                                     }
                                 }
-                                Text(formatRupees(charge.amount))
+                                Text(formatMoney(charge.amount))
                             }
                         }
                     }
@@ -345,6 +443,57 @@ fun DetailScreen(
                 TextButton(onClick = onDelete, Modifier.fillMaxWidth()) { Text("Delete") }
             } else {
                 TextButton(onClick = onHide, Modifier.fillMaxWidth()) { Text("Not a subscription — hide it") }
+            }
+        }
+    }
+}
+
+// ---- Profile --------------------------------------------------------------------------------------
+
+@Composable
+fun ProfileScreen(
+    gmailImportEnabled: Boolean,
+    gmailAccountEmail: String?,
+    onBack: () -> Unit,
+    onConnectGmail: () -> Unit,
+    onSwitchAccount: () -> Unit,
+    onDisconnect: () -> Unit,
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Profile") },
+                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } },
+            )
+        },
+    ) { padding ->
+        Column(
+            Modifier.fillMaxSize().padding(padding).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("Gmail", style = MaterialTheme.typography.titleMedium)
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (gmailImportEnabled) {
+                        Text(gmailAccountEmail ?: "Connected account", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Read-only access to find subscription receipts. Only merchant, amount, dates and " +
+                                "frequency are kept — the e-mail text is never stored.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = onSwitchAccount) { Text("Switch account") }
+                            OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
+                        }
+                    } else {
+                        Text("Not connected", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Connect a Gmail account to also find subscriptions that only ever send an e-mail receipt.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Button(onClick = onConnectGmail) { Text("Connect Gmail") }
+                    }
+                }
             }
         }
     }
@@ -388,7 +537,7 @@ fun AddManualScreen(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             )
             Text("How often", style = MaterialTheme.typography.labelLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 manualFrequencies.forEach { f ->
                     FilterChip(selected = frequency == f, onClick = { frequency = f }, label = { Text(f.label) })
                 }

@@ -103,6 +103,31 @@ class GmailApiClient {
             )
         }
 
+    /**
+     * Tells Google to drop this token's grant. There is no SDK call for this (checked directly
+     * against play-services-auth 21.3.0: `AuthorizationClient` has no revoke method), so
+     * disconnecting is this one HTTP call plus clearing what the app remembers locally.
+     * Best-effort: a failure here still leaves the app's own state cleared, which is what a user
+     * pressing "Disconnect" actually cares about.
+     */
+    suspend fun revoke(accessToken: String): Boolean = withContext(Dispatchers.IO) {
+        val connection = (URL("$REVOKE_URL?token=${URLEncoder.encode(accessToken, "UTF-8")}").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+        }
+        try {
+            val ok = connection.responseCode == HttpURLConnection.HTTP_OK
+            runCatching { connection.inputStream.bufferedReader().use { it.readText() } }
+            ok
+        } catch (e: Exception) {
+            if (BuildConfig.DEBUG) Log.w(TAG, "revoke failed", e)
+            false
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private fun get(url: String, token: String): Response {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -152,6 +177,7 @@ class GmailApiClient {
     private companion object {
         const val TAG = "GmailSync"
         const val BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+        const val REVOKE_URL = "https://oauth2.googleapis.com/revoke"
         const val PAGE_SIZE = 100
         const val TOO_MANY_REQUESTS = 429
 

@@ -39,8 +39,8 @@ class SmsParser(
         if (!allowPersonalSenders && phoneNumber.matches(sms.sender.trim())) return null
         val body = sms.body.replace('\n', ' ')
         val received = sms.receivedAt.toLocalDate()
-        if (fromEmail && !namesKnownService(sms.sender) && !SmsClassifier.isRecurring(body)) return null
-        val m = merchant(sms.sender, body)
+        if (fromEmail && !readableAsPayment(sms, body)) return null
+        val m = merchant(sms, body)
 
         return when (SmsClassifier.classify(body)) {
             SmsKind.MANDATE_CREATED -> mandateCreated(m, body, received)
@@ -53,18 +53,26 @@ class SmsParser(
 
     private fun mandateCreated(m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.MandateCreated {
         val dates = Extractors.dates(body, received)
-        val validTill = dates.firstOrNull { endContext.containsMatchIn(it.before) }?.date
-        val start = dates.firstOrNull { startContext.containsMatchIn(it.before) && it.date != validTill }?.date
-            ?: dates.firstOrNull { it.date != validTill && !endContext.containsMatchIn(it.before) }?.date
+        val stated = dates.firstOrNull { endContext.containsMatchIn(it.before) }?.date
+        val start = dates.firstOrNull { startContext.containsMatchIn(it.before) && it.date != stated }?.date
+            ?: dates.firstOrNull { it.date != stated && !endContext.containsMatchIn(it.before) }?.date
+
+        // Nothing says when the plan ends, but "3 months plan" says how long it lasts, which is
+        // the same thing counted from the day it was bought.
+        val duration = Extractors.planDuration(body)
+        val validTill = stated ?: duration?.let { (start ?: received).plus(it) }
+        val amounts = if (fromEmail) Extractors.paidAmounts(body) else Extractors.amounts(body)
+
         return PaymentEvent.MandateCreated(
             merchantId = m.id,
             merchantName = m.name,
             receivedOn = received,
             // "Rs 1 verification ... Rs 149 monthly from 20-10-26": the plan price is the real amount.
-            amount = Extractors.amounts(body).let { all -> all.firstOrNull { it > TOKEN_AMOUNT } ?: all.firstOrNull() },
-            frequency = Extractors.frequency(body),
+            amount = amounts.firstOrNull { it > TOKEN_AMOUNT } ?: amounts.firstOrNull(),
+            frequency = Extractors.frequency(body) ?: duration?.let(Extractors::frequencyOf),
             startDate = start,
             validTill = validTill,
+            autoRenews = Extractors.autoRenews(body),
         )
     }
 
@@ -74,17 +82,43 @@ class SmsParser(
             .map { it.date }
             .firstOrNull { !it.isBefore(received) }
             ?: if (body.contains("tomorrow", ignoreCase = true)) received.plusDays(1) else return null
-        return PaymentEvent.PreDebitNotice(m.id, m.name, received, Extractors.amount(body), debitDate)
+        val amount = if (fromEmail) Extractors.paidAmount(body) else Extractors.amount(body)
+        return PaymentEvent.PreDebitNotice(m.id, m.name, received, amount, debitDate)
     }
 
     private fun debit(m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.Debit? {
-        val amount = Extractors.amount(body) ?: return null
+        val amount = (if (fromEmail) Extractors.paidAmount(body) else Extractors.amount(body)) ?: return null
         // A debit can't happen after the SMS reporting it; a later date is a misread (e.g. card expiry).
         val date = Extractors.dates(body, received).map { it.date }.firstOrNull { !it.isAfter(received) } ?: received
-        return PaymentEvent.Debit(m.id, m.name, received, amount, date, SmsClassifier.isRecurring(body))
+        return PaymentEvent.Debit(
+            merchantId = m.id,
+            merchantName = m.name,
+            receivedOn = received,
+            amount = amount,
+            date = date,
+            // A UMN is present in AutoPay debits that never spell out "AutoPay" anywhere.
+            viaMandate = SmsClassifier.isRecurring(body) || Extractors.hasUmn(body),
+            peerToPeer = !fromEmail && Extractors.isPeerToPeer(body),
+        )
+    }
+
+    /**
+     * Whether an e-mail is worth reading as a payment at all.
+     *
+     * Two things have to hold. It must show that money actually moved — an advert names a price,
+     * a receipt says you were charged — and it must be about a service we can name, either one
+     * the catalog knows or one the message itself says you subscribe to. Coursera's marketing mail
+     * satisfies the second on its own, which is how it became a subscription.
+     */
+    private fun readableAsPayment(sms: Sms, body: String): Boolean {
+        if (!SmsClassifier.hasPaymentEvidence(body)) return false
+        return namesKnownService(senderIdentity(sms)) || SmsClassifier.isRecurring(body)
     }
 
     private fun namesKnownService(sender: String) = normalizer.findKnownIn(sender) != null
+
+    /** The signed domain when the message carried one, otherwise whatever `From` claimed. */
+    private fun senderIdentity(sms: Sms) = sms.verifiedDomain ?: sms.sender
 
     /**
      * "no-reply@mail.nordvpn.com" -> "nordvpn": the label in front of the public suffix.
@@ -99,12 +133,28 @@ class SmsParser(
         return labels.dropLast(1).lastOrNull { it !in publicSuffixes }
     }
 
-    private fun merchant(sender: String, body: String): ResolvedMerchant {
+    /**
+     * A gateway or bank sends receipts on behalf of whoever it billed, so its own domain is
+     * never the merchant. Its mail still deserves reading, unlike a stranger's, because it is a
+     * genuine payment channel — just not the one whose subscription it names.
+     */
+    private fun isPaymentProcessor(sender: String): Boolean {
+        val name = senderDomainName(sender) ?: return false
+        return name in paymentProcessorDomains
+    }
+
+    private fun merchant(sms: Sms, body: String): ResolvedMerchant {
         // Mail is read from its sender alone: the body cues are the very thing that misfires on a
         // long message, so falling back to them would put the noise straight back in.
         if (fromEmail) {
-            normalizer.findKnownIn(sender)?.let { return normalizer.resolve(it.aliases.first()) }
-            senderDomainName(sender)?.let { return normalizer.resolve(it) }
+            val identity = senderIdentity(sms)
+            normalizer.findKnownIn(identity)?.let { return normalizer.resolve(it.aliases.first()) }
+            // A bank or payment processor mails receipts for everyone, so its own domain names
+            // nothing useful; the merchant it is billing for is in the text.
+            if (isPaymentProcessor(identity)) {
+                normalizer.findKnownIn(body)?.let { return normalizer.resolve(it.aliases.first()) }
+            }
+            senderDomainName(identity)?.let { return normalizer.resolve(it) }
             return MerchantNormalizer.UNKNOWN
         }
         normalizer.findKnownIn(body)?.let { return normalizer.resolve(it.aliases.first()) }
@@ -120,5 +170,11 @@ class SmsParser(
 
         /** Enough of a public-suffix list to see past "example.co.in" and "example.com". */
         val publicSuffixes = setOf("com", "co", "net", "org", "edu", "gov", "ac", "in", "uk", "au")
+
+        /** Gateways and processors whose own domain never names the merchant they billed for. */
+        val paymentProcessorDomains = setOf(
+            "razorpay", "payu", "payubiz", "cashfree", "billdesk", "ccavenue", "instamojo",
+            "stripe", "paypal", "cybersource", "atomtech", "citruspay", "juspay", "pinelabs",
+        )
     }
 }

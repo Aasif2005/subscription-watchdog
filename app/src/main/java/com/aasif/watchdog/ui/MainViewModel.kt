@@ -30,6 +30,7 @@ sealed interface Screen {
     data object Dashboard : Screen
     data class Detail(val key: String) : Screen
     data object AddManual : Screen
+    data object Profile : Screen
 }
 
 class MainViewModel(private val app: Application) : AndroidViewModel(app) {
@@ -55,6 +56,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var gmailImportEnabled: Boolean by mutableStateOf(repo.gmailImportEnabled)
         private set
 
+    /** True once a sync came back needing the scope re-approved — otherwise the import card just goes quiet. */
+    var gmailNeedsConsent: Boolean by mutableStateOf(repo.gmailNeedsConsent)
+        private set
+
+    var gmailAccountEmail: String? by mutableStateOf(repo.gmailAccountEmail)
+        private set
+
     /** Source and arrival time per charge on the open detail screen, keyed by charge. */
     var chargeSources: Map<String, ChargeSource> by mutableStateOf(emptyMap())
         private set
@@ -76,21 +84,85 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     fun connectGmail(onConsent: (PendingIntent) -> Unit) {
         viewModelScope.launch {
             when (val auth = repo.gmailAuth.authorize()) {
-                is GmailAuth.Granted -> enableGmailImport()
+                is GmailAuth.Granted -> enableGmailImport(auth)
                 is GmailAuth.NeedsConsent -> onConsent(auth.pendingIntent)
                 GmailAuth.Unavailable -> Unit
             }
         }
     }
 
+    /**
+     * Set right before a "switch account" consent screen is shown, so [onGmailConsentResult]
+     * knows the grant that comes back has to reset the sync cursors — otherwise a switch to a
+     * brand-new account (which can never be granted silently) "succeeds" but keeps the previous
+     * account's cursor, and the new account silently syncs nothing.
+     */
+    private var pendingAccountSwitch: String? = null
+
     fun onGmailConsentResult(data: Intent?) {
-        if (repo.gmailAuth.tokenFrom(data) != null) enableGmailImport()
+        val auth = repo.gmailAuth.fromConsentResult(data) as? GmailAuth.Granted ?: return
+        val switchingTo = pendingAccountSwitch
+        pendingAccountSwitch = null
+        if (switchingTo != null) applyAccountSwitch(auth, switchingTo) else enableGmailImport(auth)
     }
 
-    private fun enableGmailImport() {
+    private fun enableGmailImport(auth: GmailAuth.Granted) {
         repo.gmailImportEnabled = true
+        repo.gmailNeedsConsent = false
+        repo.rememberGmailAccount(auth.accountEmail)
         gmailImportEnabled = true
+        gmailNeedsConsent = false
+        gmailAccountEmail = repo.gmailAccountEmail
         Workers.gmailSyncNow(app)
+    }
+
+    private fun applyAccountSwitch(auth: GmailAuth.Granted, accountName: String) {
+        viewModelScope.launch {
+            repo.finishAccountSwitch(auth, accountName)
+            gmailImportEnabled = true
+            gmailNeedsConsent = false
+            gmailAccountEmail = repo.gmailAccountEmail
+            Workers.gmailSyncNow(app)
+        }
+    }
+
+    /** Re-checks state that can only change outside this screen: Settings, or a background sync. */
+    fun refreshGmailState() {
+        gmailImportEnabled = repo.gmailImportEnabled
+        gmailNeedsConsent = repo.gmailNeedsConsent
+        gmailAccountEmail = repo.gmailAccountEmail
+    }
+
+    /** Only Google's own "choose an account" screen can offer a different Google account. */
+    fun chooseGmailAccountIntent(): Intent = repo.gmailAuth.chooseAccountIntent()
+
+    fun switchGmailAccount(accountName: String, onConsent: (PendingIntent) -> Unit) {
+        viewModelScope.launch {
+            when (val auth = repo.switchGmailAccount(accountName)) {
+                // repo.switchGmailAccount already ran finishAccountSwitch for this branch.
+                is GmailAuth.Granted -> {
+                    gmailImportEnabled = true
+                    gmailNeedsConsent = false
+                    gmailAccountEmail = repo.gmailAccountEmail
+                    Workers.gmailSyncNow(app)
+                }
+                is GmailAuth.NeedsConsent -> {
+                    pendingAccountSwitch = accountName
+                    onConsent(auth.pendingIntent)
+                }
+                GmailAuth.Unavailable -> Unit
+            }
+        }
+    }
+
+    fun disconnectGmail() {
+        viewModelScope.launch {
+            repo.disconnectGmail()
+            Workers.cancelGmailWork(app)
+            gmailImportEnabled = false
+            gmailNeedsConsent = false
+            gmailAccountEmail = null
+        }
     }
 
     fun open(target: Screen) {
@@ -133,6 +205,15 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun addManual(name: String, amount: BigDecimal, frequency: Frequency, firstCharge: LocalDate, isTrial: Boolean) =
         launchAndGoBack { repo.addManual(name, amount, frequency, firstCharge, isTrial) }
+
+    /** What the user typed on a "Needs your input" card. Nulls are left as whatever was already known. */
+    fun setUserFact(key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) {
+        viewModelScope.launch { repo.setUserFact(key, frequency, nextRenewal, amount, currency) }
+    }
+
+    fun dismissUserFact(key: String) {
+        viewModelScope.launch { repo.dismissUserFact(key) }
+    }
 
     private fun launchAndGoBack(block: suspend () -> Unit) {
         viewModelScope.launch { block() }

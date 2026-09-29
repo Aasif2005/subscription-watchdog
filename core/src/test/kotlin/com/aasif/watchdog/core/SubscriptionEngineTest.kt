@@ -6,6 +6,7 @@ import com.aasif.watchdog.core.engine.monthlyTotal
 import com.aasif.watchdog.core.engine.yearlySavings
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.PaymentEvent.Debit
 import com.aasif.watchdog.core.model.RenewalSource
@@ -14,6 +15,7 @@ import java.math.BigDecimal
 import java.time.LocalDate
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -22,12 +24,13 @@ class SubscriptionEngineTest {
 
     private fun d(s: String) = LocalDate.parse(s)
     private fun rs(v: Int) = BigDecimal(v)
+    private fun money(v: Int) = Money(BigDecimal(v))
 
     private fun debit(id: String, amount: Int, date: String, viaMandate: Boolean = false, name: String = id) =
-        Debit(id, name, d(date), rs(amount), d(date), viaMandate)
+        Debit(id, name, d(date), money(amount), d(date), viaMandate)
 
     private fun mandate(id: String, amount: Int?, received: String, start: String?, f: Frequency? = Frequency.MONTHLY) =
-        PaymentEvent.MandateCreated(id, id, d(received), amount?.let(::rs), f, start?.let(::d), null)
+        PaymentEvent.MandateCreated(id, id, d(received), amount?.let(::money), f, start?.let(::d), null)
 
     @Test
     fun `predicts from payment history`() {
@@ -70,7 +73,7 @@ class SubscriptionEngineTest {
             listOf(
                 mandate("netflix", 649, "2026-01-10", "2026-01-10"),
                 debit("netflix", 649, "2026-08-10"),
-                PaymentEvent.PreDebitNotice("netflix", "Netflix", d("2026-09-10"), rs(649), d("2026-09-11")),
+                PaymentEvent.PreDebitNotice("netflix", "Netflix", d("2026-09-10"), money(649), d("2026-09-11")),
             ),
             today = d("2026-09-10"),
         ).single()
@@ -149,7 +152,7 @@ class SubscriptionEngineTest {
             listOf(debit("netflix", 499, "2026-05-05"), debit("netflix", 499, "2026-06-05"), debit("netflix", 649, "2026-07-05"), debit("netflix", 649, "2026-08-05")),
             today = d("2026-08-10"),
         ).single()
-        assertEquals(rs(649), s.amount)
+        assertEquals(money(649), s.amount)
         assertEquals(4, s.charges.size)
     }
 
@@ -172,7 +175,28 @@ class SubscriptionEngineTest {
 
     @Test
     fun `manual entry`() {
-        val s = engine.manual("m:gym", "Gym", rs(1500), Frequency.MONTHLY, d("2026-01-15"), isTrial = false, today = d("2026-09-20"))
+        val s = engine.manual("m:gym", "Gym", money(1500), Frequency.MONTHLY, d("2026-01-15"), isTrial = false, today = d("2026-09-20"))
         assertEquals(d("2026-10-15"), s.nextRenewal)
+    }
+
+    @Test
+    fun `an amount or frequency that was never stated is marked unknown, not zero`() {
+        val s = engine.build(listOf(mandate("hotstar", null, "2026-09-01", null, f = null)), today = d("2026-09-10")).single()
+        assertFalse(s.amountKnown, "no amount was ever seen")
+        assertFalse(s.frequencyKnown, "no frequency was ever seen")
+        assertEquals(BigDecimal.ZERO, s.amount.amount, "the placeholder value, not counted anywhere")
+    }
+
+    @Test
+    fun `a subscription with no known amount is excluded from the monthly total`() {
+        val subs = engine.build(
+            listOf(
+                debit("netflix", 649, "2026-07-05"), debit("netflix", 649, "2026-08-05"),
+                mandate("hotstar", null, "2026-09-01", null, f = null),
+            ),
+            today = d("2026-09-10"),
+        )
+        assertEquals(setOf("netflix", "hotstar"), subs.map { it.merchantId }.toSet())
+        assertEquals(BigDecimal("649.00"), subs.monthlyTotal(), "hotstar's unknown amount must not count as ₹0")
     }
 }

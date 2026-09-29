@@ -1,5 +1,6 @@
 package com.aasif.watchdog.core
 
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.parser.HtmlText
@@ -35,7 +36,7 @@ class EmailParsingTest {
     fun `an HTML receipt with no matching SMS becomes a debit`() {
         val e = assertIs<PaymentEvent.Debit>(parseEmail("billing@netflix.com", netflixReceipt))
         assertEquals("netflix", e.merchantId)
-        assertEquals(BigDecimal("649.00"), e.amount)
+        assertEquals(Money(BigDecimal("649.00")), e.amount)
         assertEquals(LocalDate.of(2026, 9, 5), e.date)
         assertTrue(e.viaMandate, "the receipt mentions a subscription")
     }
@@ -59,7 +60,7 @@ class EmailParsingTest {
             """.trimIndent(),
         ))
         assertEquals("spotify", e.merchantId)
-        assertEquals(BigDecimal("119"), e.amount)
+        assertEquals(Money(BigDecimal("119")), e.amount)
         assertEquals(LocalDate.of(2026, 10, 12), e.debitDate)
     }
 
@@ -127,7 +128,7 @@ class EmailParsingTest {
             """.trimIndent(),
         ))
         assertEquals("linkedin", e.merchantId, "the sender names the service; the body does not")
-        assertEquals(BigDecimal("7499.00"), e.amount)
+        assertEquals(Money(BigDecimal("7499.00")), e.amount)
     }
 
     @Test
@@ -140,7 +141,7 @@ class EmailParsingTest {
             """.trimIndent(),
         ))
         assertEquals("u:acmeanalytics", e.merchantId, "the domain names it, not the footer")
-        assertEquals(BigDecimal("499.00"), e.amount)
+        assertEquals(Money(BigDecimal("499.00")), e.amount)
     }
 
     @Test
@@ -164,6 +165,51 @@ class EmailParsingTest {
     fun `the stricter reading still keeps an ordinary receipt from a known service`() {
         val e = assertIs<PaymentEvent.Debit>(parseMail("billing@netflix.com", netflixReceipt))
         assertEquals("netflix", e.merchantId)
-        assertEquals(BigDecimal("649.00"), e.amount)
+        assertEquals(Money(BigDecimal("649.00")), e.amount)
+    }
+
+    // ---- Payment evidence, not just a merchant name (see SmsClassifier.hasPaymentEvidence) ----
+
+    /**
+     * The case this rule exists for. Coursera's own marketing subdomain (m.learn.coursera.org)
+     * genuinely is Coursera, so no amount of sender verification would have rejected this mail —
+     * only asking whether the reader was actually charged does.
+     */
+    @Test
+    fun `a Coursera Plus advert with a per-year price is not a subscription`() {
+        assertNull(parseMail(
+            "no-reply@m.learn.coursera.org",
+            """
+            <p>Unlock unlimited learning with <b>Coursera Plus</b> for just &#8377;7,499/year.
+            Get access to 7,000+ courses from top universities. Upgrade now!</p>
+            <footer><a>Unsubscribe</a> from Coursera promotional emails.</footer>
+            """.trimIndent(),
+        ))
+    }
+
+    @Test
+    fun `a LinkedIn notification with an unrelated number produces no amount`() {
+        assertNull(parseMail(
+            "messages-noreply@linkedin.com",
+            "<p>You have 3 new messages waiting for you on LinkedIn. See what's new.</p>",
+        ))
+    }
+
+    @Test
+    fun `a USD receipt keeps its currency instead of being read as rupees`() {
+        val e = assertIs<PaymentEvent.Debit>(parseMail(
+            "billing@github.com",
+            "<p>Your payment of \$7.00 was charged for GitHub Pro subscription on 01-09-2026.</p>",
+        ))
+        assertEquals("u:github", e.merchantId)
+        assertEquals(Money(BigDecimal("7.00"), "USD"), e.amount)
+    }
+
+    @Test
+    fun `a price starting at a figure is an advert, not a receipt`() {
+        assertNull(parseMail(
+            "no-reply@m.learn.coursera.org",
+            "<p>Plans starting at just &#8377;399 per month. Subscribe to Coursera Plus today.</p>",
+        ))
     }
 }

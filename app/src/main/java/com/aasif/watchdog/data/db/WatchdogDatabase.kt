@@ -8,8 +8,8 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [EventEntity::class, ManualSubscriptionEntity::class, UserMarkEntity::class],
-    version = 2,
+    entities = [EventEntity::class, ManualSubscriptionEntity::class, UserMarkEntity::class, UserFactEntity::class],
+    version = 3,
     exportSchema = false,
 )
 abstract class WatchdogDatabase : RoomDatabase() {
@@ -28,9 +28,28 @@ abstract class WatchdogDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Adds currency (rows so far are all INR), the peer-to-peer and auto-renew flags, and the
+         * table the "Needs your input" screen writes to.
+         */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE events ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'")
+                db.execSQL("ALTER TABLE events ADD COLUMN peerToPeer INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE events ADD COLUMN autoRenews INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS user_facts (
+                        subscriptionKey TEXT NOT NULL PRIMARY KEY,
+                        frequency TEXT, nextRenewal TEXT, amount TEXT, currency TEXT,
+                        dismissed INTEGER NOT NULL DEFAULT 0
+                    )""",
+                )
+            }
+        }
+
         fun create(context: Context): WatchdogDatabase =
             Room.databaseBuilder(context, WatchdogDatabase::class.java, "watchdog.db")
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .build()
     }
 }

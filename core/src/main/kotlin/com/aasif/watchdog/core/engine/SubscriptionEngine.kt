@@ -5,6 +5,7 @@ import com.aasif.watchdog.core.merchant.MerchantCatalog
 import com.aasif.watchdog.core.model.Charge
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.PaymentEvent.Debit
 import com.aasif.watchdog.core.model.PaymentEvent.MandateCreated
@@ -37,7 +38,7 @@ class SubscriptionEngine(
         val mandate: MandateCreated?,
         val notices: List<PreDebitNotice>,
     ) {
-        val amount: BigDecimal? get() = series?.latestAmount ?: mandate?.amount ?: notices.lastOrNull()?.amount
+        val amount: Money? get() = series?.latestAmount ?: mandate?.amount ?: notices.lastOrNull()?.amount
     }
 
     fun build(events: List<PaymentEvent>, today: LocalDate): List<Subscription> =
@@ -62,9 +63,9 @@ class SubscriptionEngine(
         }
 
         // Match the latest mandate and each notice to the series with the closest amount.
-        fun closest(amount: BigDecimal?): RecurringSeries =
+        fun closest(amount: Money?): RecurringSeries =
             if (amount == null) series.maxBy { it.debits.last().date }
-            else series.minBy { (it.latestAmount - amount).abs() }
+            else series.minBy { if (it.latestAmount.currency != amount.currency) BigDecimal(Long.MAX_VALUE) else (it.latestAmount.amount - amount.amount).abs() }
 
         val latestMandate = mandates.lastOrNull()
         val mandateSeries = latestMandate?.let { closest(it.amount) }
@@ -78,12 +79,11 @@ class SubscriptionEngine(
         val known = catalog[plan.merchantId]
         val charges = plan.series?.debits?.map { Charge(it.date, it.amount) }.orEmpty()
         val lastCharge = charges.maxOfOrNull { it.date }
-        val frequency = plan.mandate?.frequency?.takeIf { it.hasSchedule }
-            ?: plan.series?.frequency
-            ?: Frequency.MONTHLY
+        val statedFrequency = plan.mandate?.frequency?.takeIf { it.hasSchedule } ?: plan.series?.frequency
+        val frequency = statedFrequency ?: Frequency.MONTHLY
         val samePlanCount = all.count { it.merchantId == plan.merchantId }
         val key = if (samePlanCount == 1) plan.merchantId
-        else "${plan.merchantId}#${plan.amount?.setScale(0, java.math.RoundingMode.HALF_UP) ?: 0}"
+        else "${plan.merchantId}#${plan.amount?.amount?.setScale(0, java.math.RoundingMode.HALF_UP) ?: 0}"
 
         val prediction = predict(plan, frequency, lastCharge, known, events, today)
         return Subscription(
@@ -91,7 +91,7 @@ class SubscriptionEngine(
             merchantId = plan.merchantId,
             name = known?.name ?: plan.merchantName,
             category = known?.category ?: "Other",
-            amount = plan.amount ?: BigDecimal.ZERO,
+            amount = plan.amount ?: Money(BigDecimal.ZERO),
             frequency = frequency,
             nextRenewal = prediction.next,
             renewalSource = prediction.source,
@@ -99,6 +99,8 @@ class SubscriptionEngine(
             status = prediction.status,
             charges = charges,
             cancelUrl = known?.cancelUrl,
+            amountKnown = plan.amount != null,
+            frequencyKnown = statedFrequency != null,
         )
     }
 
@@ -147,7 +149,11 @@ class SubscriptionEngine(
                 val status = if (isTrialMandate(mandate, known)) SubscriptionStatus.TRIAL else SubscriptionStatus.ACTIVE
                 return Prediction(start, RenewalSource.MANDATE, Confidence.HIGH, status)
             }
-            if (frequency.hasSchedule && mandate.frequency?.hasSchedule == true) {
+            // A duration read off a receipt ("3 months plan") gives a frequency too, but unless the
+            // mail actually says it renews, that date is where the plan *ends* — a single point,
+            // not licence to assume it repeats forever. Step 4 (PLAN_EXPIRY) handles that case.
+            val assumesRenewal = mandate.validTill == null || mandate.autoRenews
+            if (frequency.hasSchedule && mandate.frequency?.hasSchedule == true && assumesRenewal) {
                 return Prediction(frequency.nextOnOrAfter(start, from), RenewalSource.MANDATE, Confidence.HIGH, SubscriptionStatus.ACTIVE)
             }
         }
@@ -163,7 +169,15 @@ class SubscriptionEngine(
             return Prediction(next, RenewalSource.PAYMENT_HISTORY, series.confidence, SubscriptionStatus.ACTIVE)
         }
 
-        // 4. A mandate with no date and no history: most likely a free trial.
+        // 4. A stated plan length ("3 months plan") ran out on a date nothing stronger overrides.
+        // Whether that date is also the next charge depends on auto-renewal, which the mail may or
+        // may not say — either way it is a real date, worth surfacing at MEDIUM rather than guessed.
+        if (mandate?.validTill != null && !mandate.validTill.isBefore(from)) {
+            val status = if (lastCharge == null && isTrialMandate(mandate, known)) SubscriptionStatus.TRIAL else SubscriptionStatus.ACTIVE
+            return Prediction(mandate.validTill, RenewalSource.PLAN_EXPIRY, Confidence.MEDIUM, status)
+        }
+
+        // 5. A mandate with no date and no history: most likely a free trial.
         if (mandate != null) {
             known?.trialDays?.let { days ->
                 val trialEnd = mandate.receivedOn.plusDays(days.toLong())
@@ -187,7 +201,8 @@ class SubscriptionEngine(
      */
     private fun isTrialMandate(mandate: MandateCreated?, known: KnownMerchant?): Boolean {
         if (mandate == null) return false
-        if (mandate.amount != null && mandate.amount <= BigDecimal(2)) return true
+        val amount = mandate.amount
+        if (amount != null && amount <= BigDecimal(2)) return true
         val start = mandate.startDate
         if (start != null) return ChronoUnit.DAYS.between(mandate.receivedOn, start) >= TRIAL_MIN_DAYS
         return known?.trialDays != null
@@ -207,7 +222,7 @@ class SubscriptionEngine(
     fun manual(
         key: String,
         name: String,
-        amount: BigDecimal,
+        amount: Money,
         frequency: Frequency,
         firstCharge: LocalDate,
         isTrial: Boolean,
@@ -242,10 +257,17 @@ fun List<Subscription>.dueForReminder(today: LocalDate, leadDays: Int): List<Sub
         .filter { ChronoUnit.DAYS.between(today, it.nextRenewal) in 0..leadDays.toLong() }
         .sortedBy { it.nextRenewal }
 
+/**
+ * Sums only what is actually known, in rupees. A plan with an unknown amount used to count as
+ * ₹0 towards this total, which made it look cheaper, not incomplete; excluding it is the honest
+ * answer. A plan billed in another currency is real spend too, just not one this figure can add
+ * without a conversion rate the app doesn't fetch.
+ */
 fun List<Subscription>.monthlyTotal(): BigDecimal =
-    filter { it.status == SubscriptionStatus.ACTIVE }.fold(BigDecimal.ZERO) { acc, s -> acc + s.monthlyCost }
+    filter { it.status == SubscriptionStatus.ACTIVE && it.amountKnown && it.amount.currency == Money.INR }
+        .fold(BigDecimal.ZERO) { acc, s -> acc + s.monthlyCost.amount }
 
 /** What cancelled plans would have cost over a year; the basis for the savings report. */
 fun List<Subscription>.yearlySavings(): BigDecimal =
-    filter { it.status == SubscriptionStatus.CANCELLED }
-        .fold(BigDecimal.ZERO) { acc, s -> acc + s.monthlyCost.multiply(BigDecimal(12)) }
+    filter { it.status == SubscriptionStatus.CANCELLED && it.amountKnown && it.amount.currency == Money.INR }
+        .fold(BigDecimal.ZERO) { acc, s -> acc + s.monthlyCost.amount.multiply(BigDecimal(12)) }
