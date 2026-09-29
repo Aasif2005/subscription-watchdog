@@ -47,7 +47,7 @@ private fun App(vm: MainViewModel = viewModel()) {
     val gmailConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
         vm.onGmailConsentResult(it.data)
     }
-    BackHandler(enabled = vm.screen is Screen.Detail || vm.screen is Screen.AddManual) { vm.back() }
+    BackHandler(enabled = vm.canGoBack) { vm.back() }
 
     when (val screen = vm.screen) {
         Screen.Onboarding -> OnboardingScreen(onResult = vm::onPermissionsResult)

@@ -42,6 +42,16 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var screen: Screen by mutableStateOf(if (hasSmsAccess()) Screen.Dashboard else Screen.Onboarding)
         private set
 
+    /**
+     * Whether the dashboard is behind the current screen.
+     *
+     * Onboarding is both the first screen of a fresh install and somewhere the dashboard can send
+     * the user to grant access later, and back means different things in the two cases: leave the
+     * app, or return to the dashboard. Only how the screen was reached tells them apart.
+     */
+    var canGoBack: Boolean by mutableStateOf(false)
+        private set
+
     var gmailImportEnabled: Boolean by mutableStateOf(repo.gmailImportEnabled)
         private set
 
@@ -84,6 +94,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun open(target: Screen) {
+        canGoBack = true
         screen = target
     }
 
@@ -94,13 +105,18 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     /** Returns false when there is nowhere to go back to. */
     fun back(): Boolean {
-        if (screen == Screen.Dashboard || screen == Screen.Onboarding) return false
-        screen = Screen.Dashboard
+        if (!canGoBack) return false
+        goToDashboard()
         return true
     }
 
     fun onPermissionsResult(smsGranted: Boolean) {
         if (smsGranted) Workers.scanNow(app)
+        goToDashboard()
+    }
+
+    private fun goToDashboard() {
+        canGoBack = false
         screen = Screen.Dashboard
     }
 
@@ -120,6 +136,6 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     private fun launchAndGoBack(block: suspend () -> Unit) {
         viewModelScope.launch { block() }
-        screen = Screen.Dashboard
+        goToDashboard()
     }
 }
