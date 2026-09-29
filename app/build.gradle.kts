@@ -54,4 +54,7 @@ dependencies {
 
     implementation(libs.work.runtime.ktx)
     implementation(libs.kotlinx.coroutines.core)
+
+    // Gmail import only: OAuth consent and access tokens. The Gmail REST calls use HttpURLConnection.
+    implementation(libs.play.services.auth)
 }

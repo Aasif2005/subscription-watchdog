@@ -8,6 +8,12 @@
     <!-- Pick up new payment SMS as they arrive. -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+      Gmail import only, and only once the user turns it on. SMS and notification scanning never
+      touch the network; no other feature in the app makes a request.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:name=".WatchdogApp"

@@ -6,6 +6,7 @@ import android.content.Intent
 import android.provider.Telephony
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.model.Sms
+import com.aasif.watchdog.data.EventSource
 import com.aasif.watchdog.work.Workers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,7 +26,7 @@ class SmsReceiver : BroadcastReceiver() {
         val repository = (context.applicationContext as WatchdogApp).repository
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                if (repository.ingest(messages)) Workers.remindNow(context.applicationContext)
+                if (repository.ingest(messages, EventSource.SMS)) Workers.remindNow(context.applicationContext)
             } finally {
                 pending.finish()
             }

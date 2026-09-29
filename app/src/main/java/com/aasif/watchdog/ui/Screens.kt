@@ -55,6 +55,8 @@ import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
+import com.aasif.watchdog.data.ChargeSource
+import com.aasif.watchdog.data.WatchdogRepository
 import java.math.BigDecimal
 import java.time.LocalDate
 import java.time.format.DateTimeParseException
@@ -116,6 +118,8 @@ fun DashboardScreen(
     onRescan: () -> Unit,
     onGrantAccess: () -> Unit,
     onGrantNotificationAccess: () -> Unit,
+    gmailImportEnabled: Boolean,
+    onConnectGmail: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -157,6 +161,21 @@ fun DashboardScreen(
                             Text(
                                 "Some banks send the renewal notice only in GPay, PhonePe or Paytm, not by SMS. " +
                                     "Allow notification access so those are caught too. Only payment apps are read, on this phone.",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                    }
+                }
+            }
+            if (!gmailImportEnabled) {
+                item {
+                    Card(Modifier.fillMaxWidth().clickable(onClick = onConnectGmail)) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Import subscriptions from Gmail", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Card subscriptions often send only an email receipt, with no SMS at all. " +
+                                    "This is the one feature that uses the internet: Google is asked for read-only " +
+                                    "access to your mail, and receipts are read on this phone. You can turn it down.",
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                         }
@@ -248,6 +267,7 @@ private fun SubscriptionRow(sub: Subscription, onClick: () -> Unit) {
 fun DetailScreen(
     sub: Subscription,
     isManual: Boolean,
+    chargeSources: Map<String, ChargeSource>,
     onBack: () -> Unit,
     onMarkCancelled: () -> Unit,
     onUndoCancel: () -> Unit,
@@ -281,13 +301,23 @@ fun DetailScreen(
             }
 
             if (sub.charges.isNotEmpty()) {
-                Text("Payments found in your SMS", style = MaterialTheme.typography.titleSmall)
+                Text("Payments detected", style = MaterialTheme.typography.titleSmall)
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
                         sub.charges.sortedByDescending { it.date }.forEachIndexed { i, charge ->
                             if (i > 0) HorizontalDivider()
+                            val source = chargeSources[WatchdogRepository.chargeKey(charge.date, charge.amount)]
                             Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                                Text(formatDate(charge.date), Modifier.weight(1f))
+                                Column(Modifier.weight(1f)) {
+                                    Text(formatDateTime(charge.date, source?.atMillis))
+                                    if (source != null) {
+                                        Text(
+                                            "via ${source.label}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
                                 Text(formatRupees(charge.amount))
                             }
                         }

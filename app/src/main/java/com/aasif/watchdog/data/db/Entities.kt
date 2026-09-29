@@ -26,6 +26,10 @@ data class EventEntity(
     val startDate: String?,
     val validTill: String?,
     val viaMandate: Boolean,
+    /** `channel:origin`, see [com.aasif.watchdog.data.EventSource]. Shown, never matched on. */
+    val source: String = "",
+    /** Arrival time. [receivedOn] keeps only the day, which is all the engine needs. 0 if unknown. */
+    val receivedAtMillis: Long = 0,
 )
 
 @Entity(tableName = "manual_subscriptions")
@@ -55,22 +59,26 @@ private const val PRE_DEBIT = "PRE_DEBIT"
 private const val DEBIT = "DEBIT"
 private const val REVOKED = "REVOKED"
 
-fun PaymentEvent.toEntity(smsKey: String): EventEntity = when (this) {
+fun PaymentEvent.toEntity(smsKey: String, source: String, receivedAtMillis: Long): EventEntity = when (this) {
     is PaymentEvent.MandateCreated -> EventEntity(
         smsKey, MANDATE, merchantId, merchantName, receivedOn.toString(), amount?.toPlainString(),
         date = null, frequency = frequency?.name, startDate = startDate?.toString(), validTill = validTill?.toString(), viaMandate = true,
+        source = source, receivedAtMillis = receivedAtMillis,
     )
     is PaymentEvent.PreDebitNotice -> EventEntity(
         smsKey, PRE_DEBIT, merchantId, merchantName, receivedOn.toString(), amount?.toPlainString(),
         date = debitDate.toString(), frequency = null, startDate = null, validTill = null, viaMandate = true,
+        source = source, receivedAtMillis = receivedAtMillis,
     )
     is PaymentEvent.Debit -> EventEntity(
         smsKey, DEBIT, merchantId, merchantName, receivedOn.toString(), amount.toPlainString(),
         date = date.toString(), frequency = null, startDate = null, validTill = null, viaMandate = viaMandate,
+        source = source, receivedAtMillis = receivedAtMillis,
     )
     is PaymentEvent.MandateRevoked -> EventEntity(
         smsKey, REVOKED, merchantId, merchantName, receivedOn.toString(), amount = null,
         date = null, frequency = null, startDate = null, validTill = null, viaMandate = true,
+        source = source, receivedAtMillis = receivedAtMillis,
     )
 }
 

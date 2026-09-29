@@ -8,8 +8,11 @@ import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -40,6 +43,10 @@ private fun App(vm: MainViewModel = viewModel()) {
     // Notification access is granted in system Settings, so re-check whenever the user comes back.
     var hasNotificationAccess by remember { mutableStateOf(vm.hasNotificationAccess()) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { hasNotificationAccess = vm.hasNotificationAccess() }
+    // Google's own consent screen; it decides what the user is agreeing to, not us.
+    val gmailConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
+        vm.onGmailConsentResult(it.data)
+    }
     BackHandler(enabled = vm.screen is Screen.Detail || vm.screen is Screen.AddManual) { vm.back() }
 
     when (val screen = vm.screen) {
@@ -53,6 +60,10 @@ private fun App(vm: MainViewModel = viewModel()) {
             onRescan = vm::rescan,
             onGrantAccess = { vm.open(Screen.Onboarding) },
             onGrantNotificationAccess = { openNotificationAccessSettings(context) },
+            gmailImportEnabled = vm.gmailImportEnabled,
+            onConnectGmail = {
+                vm.connectGmail { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
+            },
         )
         is Screen.Detail -> {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }
@@ -60,9 +71,11 @@ private fun App(vm: MainViewModel = viewModel()) {
                 // Hidden or deleted while open; the list no longer has it.
                 LaunchedEffect(screen.key) { vm.back() }
             } else {
+                LaunchedEffect(sub.merchantId) { vm.loadChargeSources(sub.merchantId) }
                 DetailScreen(
                     sub = sub,
                     isManual = vm.isManual(sub.key),
+                    chargeSources = vm.chargeSources,
                     onBack = { vm.back() },
                     onMarkCancelled = { vm.markCancelled(sub.key) },
                     onUndoCancel = { vm.undoMark(sub.key) },

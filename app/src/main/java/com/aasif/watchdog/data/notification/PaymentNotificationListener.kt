@@ -10,6 +10,7 @@ import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.parser.SmsClassifier
+import com.aasif.watchdog.data.EventSource
 import com.aasif.watchdog.data.sms.toLocalDateTime
 import com.aasif.watchdog.work.Workers
 import kotlinx.coroutines.CoroutineScope
@@ -44,7 +45,7 @@ class PaymentNotificationListener : NotificationListenerService() {
     private fun ingest(messages: List<Sms>) {
         val app = applicationContext as WatchdogApp
         scope.launch {
-            if (app.repository.ingest(messages)) Workers.remindNow(app)
+            if (app.repository.ingest(messages, EventSource.APP)) Workers.remindNow(app)
         }
     }
 
@@ -62,23 +63,10 @@ class PaymentNotificationListener : NotificationListenerService() {
     }
 
     companion object {
-        private val paymentApps = setOf(
-            "com.google.android.apps.nbu.paisa.user", // Google Pay
-            "com.phonepe.app",
-            "net.one97.paytm",
-            "in.org.npci.upiapp", // BHIM
-            "com.dreamplug.androidapp", // CRED
-            "com.mobikwik_new",
-            "com.naviapp",
-            "com.sbi.lotusintouch", // SBI YONO
-            "com.csam.icici.bank.imobile",
-            "com.snapwork.hdfc",
-            "com.axis.mobile",
-            "com.msf.kbank.mobile", // Kotak
-        )
-
         // Debug builds also accept `adb shell cmd notification post`, which posts as the shell.
-        private val allowedPackages = if (BuildConfig.DEBUG) paymentApps + "com.android.shell" else paymentApps
+        private val allowedPackages = EventSource.paymentApps.keys.let {
+            if (BuildConfig.DEBUG) it + "com.android.shell" else it
+        }
 
         fun isEnabled(context: Context) =
             context.packageName in NotificationManagerCompat.getEnabledListenerPackages(context)

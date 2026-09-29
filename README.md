@@ -2,6 +2,8 @@
 
 Android app that reads bank / UPI payment SMS (and, if allowed, payment alerts from UPI and bank app notifications) **on the device** to find every recurring charge (UPI AutoPay, card e-mandates, OTT and app subscriptions, free trials that turn paid), shows what they cost per month, and warns before each renewal.
 
+Subscriptions that only ever send an e-mail receipt are invisible to all of that, so there is also an **opt-in [Gmail import](#gmail-import-optional-uses-the-internet)** — the one part of the app that uses the network.
+
 ## How the renewal date is found
 
 Each SMS is classified as one of four kinds (`core/.../parser/SmsClassifier.kt`), and the renewal date comes from the strongest signal available (`core/.../engine/SubscriptionEngine.kt`):
@@ -22,9 +24,13 @@ Other details:
 ## Project layout
 
 ```
-core/   Pure Kotlin: SMS parser, merchant catalog, recurrence detection, renewal prediction. No Android dependency.
-app/    Android (Kotlin + Jetpack Compose): SMS reading, Room storage, WorkManager reminders, UI.
+core/   Pure Kotlin: SMS parser, merchant catalog, recurrence detection, renewal prediction,
+        HTML-to-text, Gmail query building, duplicate rules. No Android dependency.
+app/    Android (Kotlin + Jetpack Compose): SMS reading, notification listener, Gmail sync,
+        Room storage, WorkManager reminders, UI.
 ```
+
+Everything that can be tested without a device lives in `core/`, which is why the Gmail parsing rules are there and only the network and OAuth glue is in `app/`.
 
 ## Build
 
@@ -59,18 +65,38 @@ adb shell cmd notification post -S bigtext -t "'UPI AutoPay reminder'" t1 "'Rs 1
 
 Some banks send the AutoPay pre-debit notice only inside the UPI app. With notification access, `PaymentNotificationListener` reads notifications from an allowlist of UPI and bank apps (GPay, PhonePe, Paytm, BHIM, CRED, major banks) and runs them through the same parser. Notifications from every other app are dropped without being read. UPI apps also push marketing ("set up AutoPay, get ₹50 cashback"), so notifications that look promotional are skipped (`SmsClassifier.isPromotional`). An alert and the SMS for the same charge don't double-count: identical debits are merged, and the earliest pre-debit date wins.
 
+## Gmail import (optional, uses the internet)
+
+Card subscriptions and services that only e-mail a receipt never produce a payment SMS, so nothing on the device can see them. Gmail import is the answer to that, and it is the **one** feature that leaves the phone.
+
+It is off until the user turns it on from the dashboard card, which explains what happens before Google's consent screen appears. The scope requested is `gmail.readonly` and nothing else. Play Services owns the consent and refreshes the token, so **this app never stores an access or refresh token**; only "import is on" and a sync cursor are saved.
+
+A sync asks Gmail for mail matching a payment-word query (`GmailQueryBuilder`), flattens each body to plain text (`HtmlText`) and runs it through the same `SmsClassifier`/`SmsParser` as SMS. As with SMS, only merchant, amount, dates and frequency are stored — the e-mail text is never kept. Merchant names are deliberately kept out of the search query, and Promotions are deliberately *not* excluded, because Gmail files some genuine billing mail there; marketing is dropped later by `isPromotional`.
+
+Mail is read more strictly than SMS (`SmsParser`'s `fromEmail`). A bank's DLT-header SMS is terse, so the cue words that find a payee in it are reliable; an e-mail runs to thousands of characters and ends in a marketing footer, where the same cues match ordinary prose. So mail has to name a service the catalog knows or say outright that the payment recurs, and its merchant is read from the sending domain rather than from the body. Without that, a bank's own transaction alerts arrived as a recurring charge called "Idfcfirst Bank Instead" and a NordVPN receipt was filed under "Monitor".
+
+History is covered in slices, newest first, because Gmail lists newest first and a capped run only ever sees the newest part of a window. Each slice reads 75 messages and moves a saved frontier back to the oldest message it read; the next slice follows about a minute later. Both the size and the pause come from Gmail's per-minute quota, which stops a full-format read at roughly a hundred messages. A slice that is throttled part-way keeps what it already read and banks that ground, and only a slice that read something counts against the slice budget — otherwise a spell of throttling spends the whole budget and ends the backfill having imported nothing.
+
+A charge that arrives by SMS, by app notification and by e-mail is stored once: `isLikelyDuplicateOf` (in `core/.../engine/EventDedup.kt`) compares merchant, date and amount and ignores which source it came from.
+
+## Where a payment was spotted
+
+Each charge on the detail screen shows its origin and arrival time — "via PhonePe", "via Gmail", "via SMS (VM-HDFCBK)". Charges recorded before this was added show the date only, since the arrival time was never stored.
+
 ## Privacy
 
-- SMS are parsed on the device. Only the merchant, amount, dates and frequency are stored; the SMS text is never kept.
+- SMS and notifications are parsed on the device and never leave it. Only the merchant, amount, dates and frequency are stored; the message text is never kept.
 - Cloud backup and device-to-device transfer are disabled (`data_extraction_rules.xml`).
 - Notification access is optional. Only allowlisted payment apps are read, and like SMS, only the extracted fields are stored.
-- There is no network permission.
+- The network is used by Gmail import and nothing else. With it switched off, the app makes no requests at all; `INTERNET` is declared solely for that opt-in feature.
 
 ## Before publishing to Play Store
 
 - `READ_SMS` / `RECEIVE_SMS` are restricted permissions. Submit the **Permissions Declaration Form** under the "SMS-based money management" exception, with a demo video.
-- Publish a privacy policy that states SMS and notifications are processed on-device only.
+- Publish a privacy policy that states SMS and notifications are processed on-device only, and that Gmail import is opt-in and network-based.
 - Notification access needs a prominent in-app disclosure before the user is sent to Settings (Play User Data policy). The dashboard card explains it; review the wording against the policy.
+- `gmail.readonly` is a restricted scope. While the OAuth consent screen stays in **Testing** with the developer as the only test user, no Google review is needed — but the app cannot be shared with anyone else until it passes OAuth verification and a CASA security assessment. Budget for that before any public release.
+- The OAuth client is Android-type, matched by package name and signing certificate, so a release build signed with a different key needs its SHA-1 added in the Google Cloud console.
 - Replace the placeholder launcher icon with an adaptive icon.
 
 ## Roadmap (premium)

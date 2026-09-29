@@ -14,6 +14,10 @@ interface WatchdogDao {
     @Query("SELECT * FROM events")
     fun events(): Flow<List<EventEntity>>
 
+    /** Only the rows a new event could duplicate, so ingest never loads the whole table. */
+    @Query("SELECT * FROM events WHERE merchantId = :merchantId")
+    suspend fun eventsForMerchant(merchantId: String): List<EventEntity>
+
     @Insert
     suspend fun insertManual(entry: ManualSubscriptionEntity)
 

@@ -2,6 +2,8 @@ package com.aasif.watchdog.ui
 
 import android.Manifest
 import android.app.Application
+import android.app.PendingIntent
+import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -12,6 +14,8 @@ import androidx.lifecycle.viewModelScope
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
+import com.aasif.watchdog.data.ChargeSource
+import com.aasif.watchdog.data.gmail.GmailAuth
 import com.aasif.watchdog.data.notification.PaymentNotificationListener
 import com.aasif.watchdog.work.Workers
 import kotlinx.coroutines.flow.SharingStarted
@@ -38,6 +42,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var screen: Screen by mutableStateOf(if (hasSmsAccess()) Screen.Dashboard else Screen.Onboarding)
         private set
 
+    var gmailImportEnabled: Boolean by mutableStateOf(repo.gmailImportEnabled)
+        private set
+
+    /** Source and arrival time per charge on the open detail screen, keyed by charge. */
+    var chargeSources: Map<String, ChargeSource> by mutableStateOf(emptyMap())
+        private set
+
     init {
         // Pick up anything that arrived while the app was closed.
         if (hasSmsAccess()) Workers.scanNow(app)
@@ -48,8 +59,37 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun hasNotificationAccess() = PaymentNotificationListener.isEnabled(app)
 
+    /**
+     * Asks Play Services for Gmail read access. [onConsent] is called with the screen to show
+     * when the user still has to approve the scope.
+     */
+    fun connectGmail(onConsent: (PendingIntent) -> Unit) {
+        viewModelScope.launch {
+            when (val auth = repo.gmailAuth.authorize()) {
+                is GmailAuth.Granted -> enableGmailImport()
+                is GmailAuth.NeedsConsent -> onConsent(auth.pendingIntent)
+                GmailAuth.Unavailable -> Unit
+            }
+        }
+    }
+
+    fun onGmailConsentResult(data: Intent?) {
+        if (repo.gmailAuth.tokenFrom(data) != null) enableGmailImport()
+    }
+
+    private fun enableGmailImport() {
+        repo.gmailImportEnabled = true
+        gmailImportEnabled = true
+        Workers.gmailSyncNow(app)
+    }
+
     fun open(target: Screen) {
         screen = target
+    }
+
+    fun loadChargeSources(merchantId: String) {
+        chargeSources = emptyMap()
+        viewModelScope.launch { chargeSources = repo.chargeSources(merchantId) }
     }
 
     /** Returns false when there is nowhere to go back to. */
@@ -64,7 +104,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         screen = Screen.Dashboard
     }
 
-    fun rescan() = Workers.scanNow(app)
+    fun rescan() {
+        Workers.scanNow(app)
+        if (repo.gmailImportEnabled) Workers.gmailSyncNow(app)
+    }
 
     fun markCancelled(key: String) = launchAndGoBack { repo.markCancelled(key) }
     fun hide(key: String) = launchAndGoBack { repo.hide(key) }
