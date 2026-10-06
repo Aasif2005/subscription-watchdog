@@ -27,12 +27,16 @@ object SmsClassifier {
     private val creditWord = rx("""\bcredited\b""")
     private val promoWord = rx("""\b(cashback|offers?|rewards?|coupons?|discount|scratch\s+card|win|refer|invite|hurry|limited\s+time)\b|%\s*off|save\s+up\s+to|\bget\s+(rs\.?|inr|₹)""")
 
+    /** "unless cancelled", "until cancelled": terms of a live plan, not news that it ended. */
+    private val conditionalCancel = rx("""\b(unless|until|before|if)\s+(\w+\s+){0,2}(cancell?ed|paused|stopped|terminated|deactivated|deleted)\b""")
+
     fun classify(body: String): SmsKind {
         val recurring = recurringWord.containsMatchIn(body)
         val debit = debitWord.containsMatchIn(body)
+        val revoked = revokedWord.containsMatchIn(conditionalCancel.replace(body, " "))
         return when {
             otpWord.containsMatchIn(body) && !debit -> SmsKind.IRRELEVANT
-            recurring && revokedWord.containsMatchIn(body) -> SmsKind.MANDATE_REVOKED
+            recurring && revoked -> SmsKind.MANDATE_REVOKED
             recurring && createdWord.containsMatchIn(body) -> SmsKind.MANDATE_CREATED
             preDebitWord.containsMatchIn(body) && (recurring || debit) -> SmsKind.PRE_DEBIT
             failedWord.containsMatchIn(body) -> SmsKind.IRRELEVANT
@@ -60,4 +64,11 @@ object SmsClassifier {
      * real alerts, and a promo would otherwise read as a new mandate.
      */
     fun isPromotional(body: String): Boolean = promoWord.containsMatchIn(body)
+
+    /**
+     * The mail version of [isPromotional]. An advert only names a price; a receipt says money was
+     * charged, and receipts use the same words ("Individual Offer (Apple Music)"), so proof of
+     * payment outranks the keyword.
+     */
+    fun isPromotionalMail(body: String): Boolean = isPromotional(body) && !hasPaymentEvidence(body)
 }

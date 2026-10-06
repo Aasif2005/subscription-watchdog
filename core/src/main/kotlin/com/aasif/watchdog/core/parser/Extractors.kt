@@ -172,6 +172,28 @@ internal object Extractors {
         return frequencyWords.firstOrNull { it.first.containsMatchIn(scope) }?.second
     }
 
+    // ---- Free trials ------------------------------------------------------------------------
+
+    /** What a trial receipt promises: when paying starts, and at what price. */
+    data class TrialTerms(val firstCharge: LocalDate, val price: Money?)
+
+    private val trialEnds = Regex("""\btrial\b[^.]{0,80}?\b(?:ends?|ending|expires?)\s+on\s+""", RegexOption.IGNORE_CASE)
+    private val renewalPrice = Regex("""\b(?:currently|then|thereafter|after\s+(?:the\s+)?trial)[\s(:,]{0,4}""", RegexOption.IGNORE_CASE)
+
+    /**
+     * "Your trial will end on 15 Feb 2027 ... (currently ₹139.00/month)". The receipt's own total is
+     * zero, so the only amount worth keeping is the one quoted for after the trial — which is
+     * exactly the price-tag shape [paidAmounts] rejects, hence read here on purpose.
+     */
+    fun trialTerms(body: String, received: LocalDate): TrialTerms? {
+        val ends = trialEnds.find(body) ?: return null
+        val date = dates(body.substring(ends.range.last + 1).take(30), received).firstOrNull()?.date ?: return null
+        val price = renewalPrice.find(body)?.let { m ->
+            found(body.substring(m.range.last + 1).take(30)).firstOrNull()?.money
+        }
+        return TrialTerms(date, price)
+    }
+
     // ---- Plan length ------------------------------------------------------------------------
 
     private val numberedPlan = Regex(

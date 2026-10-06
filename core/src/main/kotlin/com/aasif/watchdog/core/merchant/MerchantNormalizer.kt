@@ -32,7 +32,16 @@ class MerchantNormalizer(catalog: List<KnownMerchant> = MerchantCatalog.all) {
         // Catch small typos and truncations such as "NETFLX ENT" or "SPOTIFYIN", word by word.
         val candidates = (cleaned.split(' ').map(::squash) + squashed).filter { it.length >= 5 }.distinct()
         aliases.firstOrNull { (alias, _) ->
-            alias.length >= 5 && candidates.any { jaroWinkler(it, alias) >= FUZZY_THRESHOLD }
+            alias.length >= 5 && candidates.any {
+                // The Jaro-Winkler prefix bonus scores an exact-prefix match almost as high as a
+                // real typo, which used to fuzzy-match a short, genuinely different, uncatalogued
+                // word onto a longer sibling alias it happens to prefix — "SWIGGY" (a plain food
+                // order) onto "swiggyone" (the paid membership), the same way for "flipkart" onto
+                // "flipkartplus" or "amazon" onto "amazonprime". A real typo or truncation stays
+                // close to the alias's own length; capping the gap keeps that case while rejecting
+                // a shorter word that is simply a different, legitimate brand on its own.
+                kotlin.math.abs(it.length - alias.length) <= MAX_LENGTH_GAP && jaroWinkler(it, alias) >= FUZZY_THRESHOLD
+            }
         }?.let { return it.second.toResolved() }
 
         if (squashed.isEmpty()) return UNKNOWN
@@ -43,6 +52,9 @@ class MerchantNormalizer(catalog: List<KnownMerchant> = MerchantCatalog.all) {
 
     companion object {
         private const val FUZZY_THRESHOLD = 0.92
+
+        /** How many characters a fuzzy candidate may differ in length from the alias it matches. */
+        private const val MAX_LENGTH_GAP = 2
 
         val UNKNOWN = ResolvedMerchant("u:unknown", "Unknown merchant", "Other", known = null)
 

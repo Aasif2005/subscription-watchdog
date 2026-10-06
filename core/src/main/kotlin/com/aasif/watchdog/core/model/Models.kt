@@ -56,6 +56,8 @@ sealed interface PaymentEvent {
         val validTill: LocalDate?,
         /** The mail said the plan renews by itself, so [validTill] is a charge, not just an end. */
         val autoRenews: Boolean = false,
+        /** Exact arrival time when known; orders a mandate against a revocation received the same day. */
+        val receivedAt: LocalDateTime? = null,
     ) : PaymentEvent
 
     /** RBI-mandated notice sent ~24h before a recurring debit, carrying the exact date. */
@@ -85,6 +87,8 @@ sealed interface PaymentEvent {
         override val merchantId: String,
         override val merchantName: String,
         override val receivedOn: LocalDate,
+        /** Exact arrival time when known, see [MandateCreated.receivedAt]. */
+        val receivedAt: LocalDateTime? = null,
     ) : PaymentEvent
 }
 
@@ -138,6 +142,11 @@ data class Subscription(
      */
     val amountKnown: Boolean = true,
     val frequencyKnown: Boolean = true,
+    /**
+     * The payee is a billing channel (Google Play, the App Store) that bills for many different
+     * apps, so the bank's text cannot say which one this is.
+     */
+    val sharedBilling: Boolean = false,
 ) {
     val lastCharged: LocalDate? get() = charges.maxOfOrNull { it.date }
     val monthlyCost: Money get() = Money(frequency.monthlyEquivalent(amount.amount), amount.currency)

@@ -16,6 +16,21 @@ android {
         versionName = "0.1.0"
     }
 
+    // `full` reads bank SMS; `play` is the variant that can ship without Google Play's restricted
+    // SMS permissions if the "SMS-based money management" exception is not granted. Same
+    // applicationId, so the OAuth client and signing setup are shared.
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("full") {
+            dimension = "distribution"
+            buildConfigField("boolean", "SMS_ENABLED", "true")
+        }
+        create("play") {
+            dimension = "distribution"
+            buildConfigField("boolean", "SMS_ENABLED", "false")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true

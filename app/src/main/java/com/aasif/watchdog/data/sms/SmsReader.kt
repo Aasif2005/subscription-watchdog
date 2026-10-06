@@ -3,9 +3,7 @@ package com.aasif.watchdog.data.sms
 import android.content.Context
 import android.provider.Telephony
 import com.aasif.watchdog.core.model.Sms
-import java.time.Instant
-import java.time.LocalDateTime
-import java.time.ZoneId
+import com.aasif.watchdog.data.toLocalDateTime
 
 /** Reads SMS from the system inbox. Requires READ_SMS. */
 class SmsReader(private val context: Context) {
@@ -34,5 +32,3 @@ class SmsReader(private val context: Context) {
         return messages to newest
     }
 }
-
-fun Long.toLocalDateTime(): LocalDateTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(this), ZoneId.systemDefault())

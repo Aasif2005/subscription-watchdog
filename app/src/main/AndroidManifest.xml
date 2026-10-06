@@ -1,16 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-feature android:name="android.hardware.telephony" android:required="false" />
-
-    <!-- Read past bank SMS once to find existing subscriptions; everything stays on the device. -->
-    <uses-permission android:name="android.permission.READ_SMS" />
-    <!-- Pick up new payment SMS as they arrive. -->
-    <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!--
-      Gmail import only, and only once the user turns it on. SMS and notification scanning never
-      touch the network; no other feature in the app makes a request.
+      Gmail import only, and only once the user turns it on. SMS and notification scanning never touches
+      the network; no other feature in the app makes a request.
     -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -33,15 +27,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <receiver
-            android:name=".data.sms.SmsReceiver"
-            android:exported="true"
-            android:permission="android.permission.BROADCAST_SMS">
-            <intent-filter>
-                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
-            </intent-filter>
-        </receiver>
 
         <service
             android:name=".data.notification.PaymentNotificationListener"

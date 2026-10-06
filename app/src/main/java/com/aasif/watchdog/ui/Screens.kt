@@ -58,70 +58,30 @@ import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.data.ChargeSource
+import com.aasif.watchdog.data.EvidenceItem
+import com.aasif.watchdog.data.GmailAccountStatus
 import com.aasif.watchdog.data.WatchdogRepository
 import java.math.BigDecimal
 import java.time.LocalDate
 import java.time.format.DateTimeParseException
 import java.time.temporal.ChronoUnit
 
-// ---- Onboarding ---------------------------------------------------------------------------------
-
-@Composable
-fun OnboardingScreen(onResult: (smsGranted: Boolean) -> Unit) {
-    val permissions = buildList {
-        add(Manifest.permission.READ_SMS)
-        add(Manifest.permission.RECEIVE_SMS)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
-    }.toTypedArray()
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-        onResult(result[Manifest.permission.READ_SMS] == true)
-    }
-
-    Scaffold { padding ->
-        Column(
-            Modifier.fillMaxSize().padding(padding).padding(24.dp).verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            Spacer(Modifier.height(32.dp))
-            Text("Find every autopay you forgot about", style = MaterialTheme.typography.headlineMedium)
-            Text(
-                "Subscription Watchdog reads the payment SMS from your bank and UPI apps to list every " +
-                    "recurring charge (OTT, music, cloud storage, free trials that turn paid) and warns you before each renewal.",
-                style = MaterialTheme.typography.bodyLarge,
-            )
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Your SMS never leave this phone", fontWeight = FontWeight.SemiBold)
-                    Text("• Messages are read and understood on the device. Nothing is uploaded.")
-                    Text("• Only payment details are kept: merchant, amount and date. The SMS text is never stored.")
-                    Text("• Personal chats and OTPs are ignored.")
-                }
-            }
-            Spacer(Modifier.weight(1f, fill = false))
-            Button(onClick = { launcher.launch(permissions) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Allow SMS access")
-            }
-            TextButton(onClick = { onResult(false) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Skip — I'll add subscriptions myself")
-            }
-        }
-    }
-}
-
 // ---- Dashboard ----------------------------------------------------------------------------------
 
 @Composable
 fun DashboardScreen(
     subscriptions: List<Subscription>?,
+    smsSupported: Boolean,
     hasSmsAccess: Boolean,
+    onGrantSms: () -> Unit,
     hasNotificationAccess: Boolean,
     onOpen: (String) -> Unit,
     onAdd: () -> Unit,
     onRescan: () -> Unit,
-    onGrantAccess: () -> Unit,
     onGrantNotificationAccess: () -> Unit,
     gmailImportEnabled: Boolean,
     gmailNeedsConsent: Boolean,
+    gmailBackfillComplete: Boolean,
     onConnectGmail: () -> Unit,
     onOpenProfile: () -> Unit,
     onSaveUserFact: (key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) -> Unit,
@@ -133,7 +93,7 @@ fun DashboardScreen(
             TopAppBar(
                 title = { Text("Subscriptions") },
                 actions = {
-                    if (hasSmsAccess) TextButton(onClick = onRescan) { Text("Rescan") }
+                    if (gmailImportEnabled || hasSmsAccess) TextButton(onClick = onRescan) { Text("Rescan") }
                     TextButton(onClick = onOpenProfile) { Text("Profile") }
                 },
             )
@@ -156,13 +116,18 @@ fun DashboardScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             item { SummaryCard(subscriptions) }
-            if (!hasSmsAccess) {
+            if (smsSupported && !hasSmsAccess) {
                 item {
-                    Card(Modifier.fillMaxWidth().clickable(onClick = onGrantAccess)) {
-                        Text(
-                            "SMS access is off, so only subscriptions you add are shown. Tap to turn on automatic detection.",
-                            Modifier.padding(16.dp),
-                        )
+                    Card(Modifier.fillMaxWidth().clickable(onClick = onGrantSms)) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Read bank SMS for AutoPay", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Banks text you when an AutoPay mandate is set up, cancelled, or about to be charged " +
+                                    "— the exact renewal date lives there. Messages are read on this phone only; only " +
+                                    "merchant, amount and dates are kept. Optional.",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
                     }
                 }
             }
@@ -172,7 +137,7 @@ fun DashboardScreen(
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text("Catch AutoPay alerts from UPI apps", fontWeight = FontWeight.SemiBold)
                             Text(
-                                "Some banks send the renewal notice only in GPay, PhonePe or Paytm, not by SMS. " +
+                                "AutoPay renewal notices from GPay, PhonePe, Paytm and your bank app show up here. " +
                                     "Allow notification access so those are caught too. Only payment apps are read, on this phone.",
                                 style = MaterialTheme.typography.bodyMedium,
                             )
@@ -192,10 +157,27 @@ fun DashboardScreen(
                                 if (gmailNeedsConsent) {
                                     "Google asked us to confirm access again. Tap to continue — nothing you've already found is lost."
                                 } else {
-                                    "Card subscriptions often send only an email receipt, with no SMS at all. " +
+                                    "Card and app-store subscriptions often send only an email receipt. " +
                                         "This is the one feature that uses the internet: Google is asked for read-only " +
                                         "access to your mail, and receipts are read on this phone. You can turn it down."
                                 },
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                    }
+                }
+            } else if (!gmailBackfillComplete) {
+                // Once connected, the card above stops showing so it doesn't get stuck telling a
+                // connected user to connect. Nothing replaced it, so a backfill that genuinely
+                // takes several minutes looked identical to a stuck one — there was no way to tell
+                // from inside the app. This says so.
+                item {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Importing your Gmail history", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "This can take a few minutes on a large mailbox. Subscriptions found so far " +
+                                    "are already shown below.",
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                         }
@@ -216,8 +198,7 @@ fun DashboardScreen(
             if (subscriptions.isEmpty()) {
                 item {
                     Text(
-                        if (hasSmsAccess) "No recurring payments found yet. We keep watching new SMS, and you can add one manually."
-                        else "Nothing here yet.",
+                        "Nothing here yet. Connect Gmail, read bank SMS or allow notification access to find subscriptions, or add one manually.",
                         Modifier.fillMaxWidth().padding(top = 32.dp),
                         textAlign = TextAlign.Center,
                         style = MaterialTheme.typography.bodyLarge,
@@ -359,6 +340,8 @@ fun DetailScreen(
     sub: Subscription,
     isManual: Boolean,
     chargeSources: Map<String, ChargeSource>,
+    evidence: List<EvidenceItem>,
+    onName: (String) -> Unit,
     onBack: () -> Unit,
     onMarkCancelled: () -> Unit,
     onUndoCancel: () -> Unit,
@@ -423,8 +406,65 @@ fun DetailScreen(
                 }
             }
 
+            if (sub.sharedBilling) {
+                var typedName by remember(sub.key) { mutableStateOf("") }
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Which app is this?", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "Your bank only shows the store that collects the money, not the app behind it. " +
+                                "Open the store's subscriptions list to see which app this ${formatMoney(sub.amount)} belongs to, then name it here.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (sub.cancelUrl != null) {
+                            OutlinedButton(onClick = { uriHandler.openUri(sub.cancelUrl!!) }, Modifier.fillMaxWidth()) {
+                                Text("Open the store's subscriptions")
+                            }
+                        }
+                        OutlinedTextField(
+                            value = typedName,
+                            onValueChange = { typedName = it },
+                            label = { Text("Name, e.g. Claude Pro") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Button(onClick = { onName(typedName) }, enabled = typedName.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+                            Text("Save name")
+                        }
+                    }
+                }
+            }
+
+            if (evidence.isNotEmpty()) {
+                Text("Why this is here", style = MaterialTheme.typography.titleSmall)
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        evidence.forEachIndexed { i, item ->
+                            if (i > 0) HorizontalDivider()
+                            Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(item.kind)
+                                    Text(
+                                        "${item.source} · ${formatDateTime(item.date, item.atMillis)}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                item.amount?.let { Text(formatMoney(it)) }
+                            }
+                        }
+                        Text(
+                            "Only these details are kept. The message text itself is never stored.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 8.dp),
+                        )
+                    }
+                }
+            }
+
             Spacer(Modifier.height(8.dp))
-            if (sub.isLive && sub.cancelUrl != null) {
+            if (sub.isLive && sub.cancelUrl != null && !sub.sharedBilling) {
                 Button(onClick = { uriHandler.openUri(sub.cancelUrl!!) }, Modifier.fillMaxWidth()) {
                     Text("Open ${sub.name}'s cancel page")
                 }
@@ -453,11 +493,13 @@ fun DetailScreen(
 @Composable
 fun ProfileScreen(
     gmailImportEnabled: Boolean,
-    gmailAccountEmail: String?,
+    gmailAccounts: List<GmailAccountStatus>,
     onBack: () -> Unit,
     onConnectGmail: () -> Unit,
-    onSwitchAccount: () -> Unit,
-    onDisconnect: () -> Unit,
+    onAddAccount: () -> Unit,
+    onRemoveAccount: (String) -> Unit,
+    smsSupported: Boolean,
+    onForceFullRescan: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -475,16 +517,28 @@ fun ProfileScreen(
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (gmailImportEnabled) {
-                        Text(gmailAccountEmail ?: "Connected account", fontWeight = FontWeight.SemiBold)
                         Text(
                             "Read-only access to find subscription receipts. Only merchant, amount, dates and " +
                                 "frequency are kept — the e-mail text is never stored.",
                             style = MaterialTheme.typography.bodyMedium,
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = onSwitchAccount) { Text("Switch account") }
-                            OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
+                        gmailAccounts.forEach { account ->
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(account.email, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        when {
+                                            account.needsConsent -> "Needs your permission again"
+                                            account.importing -> "Still catching up on your mail history — this can take a few minutes."
+                                            else -> "Up to date"
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
+                                }
+                                TextButton(onClick = { onRemoveAccount(account.email) }) { Text("Remove") }
+                            }
                         }
+                        OutlinedButton(onClick = onAddAccount) { Text("Add another account") }
                     } else {
                         Text("Not connected", fontWeight = FontWeight.SemiBold)
                         Text(
@@ -492,6 +546,21 @@ fun ProfileScreen(
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Button(onClick = onConnectGmail) { Text("Connect Gmail") }
+                    }
+                }
+            }
+
+
+            if (smsSupported) {
+                Text("SMS scan", style = MaterialTheme.typography.titleMedium)
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "Re-reads every SMS on the phone from scratch, so a fix to how a merchant is " +
+                                "recognised applies to charges already scanned, not just new ones.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        OutlinedButton(onClick = onForceFullRescan) { Text("Force full rescan") }
                     }
                 }
             }

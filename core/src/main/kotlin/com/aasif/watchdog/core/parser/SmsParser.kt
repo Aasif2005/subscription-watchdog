@@ -41,6 +41,7 @@ class SmsParser(
         val received = sms.receivedAt.toLocalDate()
         if (fromEmail && !readableAsPayment(sms, body)) return null
         val m = merchant(sms, body)
+        if (fromEmail) trialReceipt(m, body, received)?.let { return it }
 
         return when (SmsClassifier.classify(body)) {
             SmsKind.MANDATE_CREATED -> mandateCreated(m, body, received)
@@ -49,6 +50,22 @@ class SmsParser(
             SmsKind.MANDATE_REVOKED -> PaymentEvent.MandateRevoked(m.id, m.name, received)
             SmsKind.IRRELEVANT -> null
         }
+    }
+
+    /** A free-trial receipt: nothing was charged, but the mail states the day paying begins. */
+    private fun trialReceipt(m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.MandateCreated? {
+        val trial = Extractors.trialTerms(body, received) ?: return null
+        if (!trial.firstCharge.isAfter(received)) return null
+        return PaymentEvent.MandateCreated(
+            merchantId = m.id,
+            merchantName = m.name,
+            receivedOn = received,
+            amount = trial.price,
+            frequency = Extractors.frequency(body),
+            startDate = trial.firstCharge,
+            validTill = null,
+            autoRenews = true,
+        )
     }
 
     private fun mandateCreated(m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.MandateCreated {
@@ -148,6 +165,11 @@ class SmsParser(
         // long message, so falling back to them would put the noise straight back in.
         if (fromEmail) {
             val identity = senderIdentity(sms)
+            // Play bills for other companies' subscriptions; the receipt says whose.
+            if (sms.sender.contains("googleplay", ignoreCase = true)) {
+                normalizer.findKnownIn(body.replace(playName, " "))
+                    ?.let { return normalizer.resolve(it.aliases.first()) }
+            }
             normalizer.findKnownIn(identity)?.let { return normalizer.resolve(it.aliases.first()) }
             // A bank or payment processor mails receipts for everyone, so its own domain names
             // nothing useful; the merchant it is billing for is in the text.
@@ -166,6 +188,7 @@ class SmsParser(
     }
 
     private companion object {
+        val playName = Regex("""google\s*play""", RegexOption.IGNORE_CASE)
         val TOKEN_AMOUNT = java.math.BigDecimal(2)
 
         /** Enough of a public-suffix list to see past "example.co.in" and "example.com". */

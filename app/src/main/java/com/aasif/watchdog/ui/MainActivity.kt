@@ -2,10 +2,12 @@ package com.aasif.watchdog.ui
 
 import android.content.ActivityNotFoundException
 import android.content.Context
+import android.Manifest
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,6 +27,7 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.aasif.watchdog.data.notification.PaymentNotificationListener
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,31 +50,57 @@ private fun App(vm: MainViewModel = viewModel()) {
     val gmailConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
         vm.onGmailConsentResult(it.data)
     }
-    // Only the account chooser knows which account was picked; asked for again on "Switch account".
+    // Every Gmail connection starts in the system account chooser, so the account is always named.
     val chooseGmailAccount = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         result.data?.getStringExtra(android.accounts.AccountManager.KEY_ACCOUNT_NAME)?.let { account ->
-            vm.switchGmailAccount(account) { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
+            vm.addGmailAccount(account) { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
         }
     }
+    val connectGmail = { chooseGmailAccount.launch(vm.chooseGmailAccountIntent()) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState() }
+    // Renewal reminders are notifications; asked for once on launch.
+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    // SMS is optional: the dashboard offers it, and the user decides.
+    var hasSmsAccess by remember { mutableStateOf(vm.hasSmsAccess()) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { hasSmsAccess = vm.hasSmsAccess() }
+    val askSms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        hasSmsAccess = vm.hasSmsAccess()
+        vm.onSmsPermissionResult(result[Manifest.permission.READ_SMS] == true)
+    }
+    vm.gmailMessage?.let { message ->
+        LaunchedEffect(message) {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            vm.gmailMessageShown()
+        }
+    }
+    // The import runs in the background; without this the "still importing" card only cleared
+    // on the next resume, long after the import had finished.
+    LaunchedEffect(vm.gmailImportEnabled, vm.gmailBackfillComplete) {
+        while (vm.gmailImportEnabled && !vm.gmailBackfillComplete) {
+            delay(5_000)
+            vm.refreshGmailState()
+        }
+    }
     BackHandler(enabled = vm.canGoBack) { vm.back() }
 
     when (val screen = vm.screen) {
-        Screen.Onboarding -> OnboardingScreen(onResult = vm::onPermissionsResult)
         Screen.Dashboard -> DashboardScreen(
             subscriptions = subscriptions,
-            hasSmsAccess = vm.hasSmsAccess(),
+            smsSupported = vm.smsSupported,
+            hasSmsAccess = hasSmsAccess,
+            onGrantSms = { askSms.launch(arrayOf(Manifest.permission.READ_SMS, Manifest.permission.RECEIVE_SMS)) },
             hasNotificationAccess = hasNotificationAccess,
             onOpen = { vm.open(Screen.Detail(it)) },
             onAdd = { vm.open(Screen.AddManual) },
             onRescan = vm::rescan,
-            onGrantAccess = { vm.open(Screen.Onboarding) },
             onGrantNotificationAccess = { openNotificationAccessSettings(context) },
             gmailImportEnabled = vm.gmailImportEnabled,
             gmailNeedsConsent = vm.gmailNeedsConsent,
-            onConnectGmail = {
-                vm.connectGmail { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
-            },
+            gmailBackfillComplete = vm.gmailBackfillComplete,
+            onConnectGmail = connectGmail,
             onOpenProfile = { vm.open(Screen.Profile) },
             onSaveUserFact = vm::setUserFact,
             onDismissUserFact = vm::dismissUserFact,
@@ -79,13 +108,13 @@ private fun App(vm: MainViewModel = viewModel()) {
         )
         Screen.Profile -> ProfileScreen(
             gmailImportEnabled = vm.gmailImportEnabled,
-            gmailAccountEmail = vm.gmailAccountEmail,
+            gmailAccounts = vm.gmailAccounts,
             onBack = { vm.back() },
-            onConnectGmail = {
-                vm.connectGmail { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
-            },
-            onSwitchAccount = { chooseGmailAccount.launch(vm.chooseGmailAccountIntent()) },
-            onDisconnect = vm::disconnectGmail,
+            onConnectGmail = connectGmail,
+            onAddAccount = connectGmail,
+            onRemoveAccount = vm::removeGmailAccount,
+            smsSupported = vm.smsSupported,
+            onForceFullRescan = vm::forceFullRescan,
         )
         is Screen.Detail -> {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }
@@ -98,6 +127,8 @@ private fun App(vm: MainViewModel = viewModel()) {
                     sub = sub,
                     isManual = vm.isManual(sub.key),
                     chargeSources = vm.chargeSources,
+                    evidence = vm.evidence,
+                    onName = { vm.nameSubscription(sub.key, it) },
                     onBack = { vm.back() },
                     onMarkCancelled = { vm.markCancelled(sub.key) },
                     onUndoCancel = { vm.undoMark(sub.key) },

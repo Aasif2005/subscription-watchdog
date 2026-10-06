@@ -5,9 +5,12 @@ import android.content.SharedPreferences
 import android.util.Log
 import androidx.core.content.edit
 import com.aasif.watchdog.BuildConfig
+import com.aasif.watchdog.core.engine.StampedEvent
 import com.aasif.watchdog.core.engine.SubscriptionEngine
-import com.aasif.watchdog.core.engine.isLikelyDuplicateOf
+import com.aasif.watchdog.core.engine.isDuplicateOfAny
+import com.aasif.watchdog.core.engine.worthKeepingFromSms
 import com.aasif.watchdog.core.gmail.GmailQueryBuilder
+import com.aasif.watchdog.core.merchant.MerchantCatalog
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Money
@@ -47,6 +50,18 @@ enum class GmailSyncOutcome {
     RETRY,
 }
 
+/** What the profile page shows for one connected Google account. */
+data class GmailAccountStatus(val email: String, val needsConsent: Boolean, val importing: Boolean)
+
+/** One thing the app saw that supports a subscription existing: what it was, where, and when. */
+data class EvidenceItem(
+    val kind: String,
+    val amount: Money?,
+    val source: String,
+    val atMillis: Long,
+    val date: LocalDate,
+)
+
 /** Where a charge was spotted, and when the alert arrived. */
 data class ChargeSource(val label: String, val atMillis: Long)
 
@@ -73,21 +88,52 @@ class WatchdogRepository(
         get() = prefs.getBoolean(KEY_GMAIL_ENABLED, false)
         set(value) = prefs.edit { putBoolean(KEY_GMAIL_ENABLED, value) }
 
-    /** Local record of which Google account is connected, for the profile page. Never sent anywhere. */
-    val gmailAccountEmail: String? get() = prefs.getString(KEY_GMAIL_ACCOUNT, null)
+    /**
+     * The Google accounts whose mail is read, kept locally for the profile page and never sent
+     * anywhere. Every account has its own cursors and its own consent, so subscriptions billed
+     * to one account are not hidden by connecting another.
+     */
+    val gmailAccounts: List<String>
+        get() = prefs.getStringSet(KEY_GMAIL_ACCOUNTS, null)?.sorted()
+            // Installs from before several accounts could be connected only stored the one.
+            ?: listOfNotNull(prefs.getString(KEY_GMAIL_ACCOUNT, null))
 
-    fun rememberGmailAccount(email: String?) {
-        if (email != null) prefs.edit { putString(KEY_GMAIL_ACCOUNT, email) }
+    /** True once any account's sync has come back needing the scope approved again. */
+    val gmailNeedsConsent: Boolean
+        get() = !prefs.getStringSet(KEY_GMAIL_CONSENT, null).isNullOrEmpty()
+
+    private fun setNeedsConsent(account: String, needs: Boolean) {
+        val current = prefs.getStringSet(KEY_GMAIL_CONSENT, null).orEmpty()
+        val updated = if (needs) current + account else current - account
+        if (updated != current) prefs.edit(commit = true) { putStringSet(KEY_GMAIL_CONSENT, updated) }
     }
 
-    /** True once a sync has come back needing the scope approved again — the case the dashboard's
-     *  import card used to go silent on, since [gmailImportEnabled] alone can't tell them apart. */
-    var gmailNeedsConsent: Boolean
-        get() = prefs.getBoolean(KEY_GMAIL_NEEDS_CONSENT, false)
-        set(value) = prefs.edit { putBoolean(KEY_GMAIL_NEEDS_CONSENT, value) }
+    /**
+     * False while any account's [backfillStep] still has history left. The import card
+     * disappearing the moment [gmailImportEnabled] turns on (deliberately, so it doesn't get stuck
+     * telling a connected user to connect) otherwise leaves a multi-minute backfill
+     * indistinguishable from a stalled one. This is what the dashboard's "still importing" card
+     * keys off.
+     */
+    val gmailBackfillComplete: Boolean
+        get() = gmailAccounts.all { backfillDone(it) }
+
+    private fun backfillDone(account: String) = prefs.getLong(key(KEY_GMAIL_BACKFILL, account), -1L) == BACKFILL_DONE
+
+    /** One row of the profile page: an account and what the import is doing for it. */
+    fun gmailAccountStatuses(): List<GmailAccountStatus> {
+        val needing = prefs.getStringSet(KEY_GMAIL_CONSENT, null).orEmpty()
+        return gmailAccounts.map { GmailAccountStatus(it, needsConsent = it in needing, importing = !backfillDone(it)) }
+    }
+
+    /** True when the mail rules changed since the last import, so the next sync starts over. */
+    val gmailNeedsReread: Boolean
+        get() = prefs.getInt(KEY_GMAIL_CLASSIFIER_VERSION, 0) < GMAIL_CLASSIFIER_VERSION
 
     /** Parses new inbox SMS since the last scan. The first scan looks back [FIRST_SCAN_DAYS]. */
     suspend fun scanInbox() {
+        if (!BuildConfig.SMS_ENABLED) return
+        reclassifyIfNeeded()
         val since = prefs.getLong(KEY_LAST_SCAN, -1L).takeIf { it >= 0 }
             ?: LocalDate.now().minusDays(FIRST_SCAN_DAYS).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
         val (messages, newest) = reader.readSince(since)
@@ -96,158 +142,257 @@ class WatchdogRepository(
     }
 
     /**
-     * Reads new subscription mail, then continues walking back through older mail.
+     * Re-derives every SMS event under the current parsing logic, once per app update that changes
+     * it. `scanInbox` only reads SMS newer than [KEY_LAST_SCAN] and inserts are IGNORE-on-conflict,
+     * so without this a parser or catalog fix would never reach an SMS already scanned. Bump
+     * [CLASSIFIER_VERSION] whenever such a change would classify old SMS differently. Mail and
+     * notification events are untouched.
+     */
+    private suspend fun reclassifyIfNeeded() {
+        if (prefs.getInt(KEY_CLASSIFIER_VERSION, 0) >= CLASSIFIER_VERSION) return
+        dao.clearSmsEvents()
+        prefs.edit {
+            remove(KEY_LAST_SCAN)
+            putInt(KEY_CLASSIFIER_VERSION, CLASSIFIER_VERSION)
+        }
+    }
+
+    /** The Profile page's manual escape hatch: re-derive every SMS event now, then scan again. */
+    suspend fun forceFullRescan() {
+        dao.clearSmsEvents()
+        prefs.edit { remove(KEY_LAST_SCAN) }
+    }
+
+    /**
+     * In a build that does not read SMS, discards whatever an earlier build collected from it, once.
+     * (Google Play restricts the SMS permissions, so the `play` variant ships without them.)
+     */
+    suspend fun purgeSmsIfUnsupported() {
+        if (BuildConfig.SMS_ENABLED || prefs.getBoolean(KEY_SMS_PURGED, false)) return
+        dao.clearSmsEvents()
+        prefs.edit(commit = true) {
+            remove(KEY_LAST_SCAN)
+            remove(KEY_CLASSIFIER_VERSION)
+            putBoolean(KEY_SMS_PURGED, true)
+        }
+    }
+
+    /**
+     * Mail already imported keeps whatever the old
+     * rules made of it, and the backfill never revisits a window it has covered. Bump
+     * [GMAIL_CLASSIFIER_VERSION] when mail parsing (or how mail is tagged) changes; the next sync
+     * then clears mail-sourced events and walks every account's history again.
+     */
+    private suspend fun rereadMailIfNeeded() {
+        if (prefs.getInt(KEY_GMAIL_CLASSIFIER_VERSION, 0) >= GMAIL_CLASSIFIER_VERSION) return
+        val accounts = gmailAccounts
+        dao.clearGmailEvents()
+        prefs.edit(commit = true) {
+            // Persisted now so the one-account layout of older installs is carried over.
+            putStringSet(KEY_GMAIL_ACCOUNTS, accounts.toSet())
+            for (account in accounts) clearCursors(account)
+            remove(KEY_GMAIL_SYNC)
+            remove(KEY_GMAIL_BACKFILL)
+            remove(KEY_GMAIL_SLICES)
+            putInt(KEY_GMAIL_CLASSIFIER_VERSION, GMAIL_CLASSIFIER_VERSION)
+        }
+    }
+
+    /**
+     * Reads new subscription mail for every connected account, then continues walking back
+     * through each one's older mail.
      *
      * Both cursors only move on a clean run, so a rate-limited sync re-reads its window rather
-     * than stepping over it. Returns [GmailSyncOutcome.MORE] while history is still being covered.
+     * than stepping over it. Returns [GmailSyncOutcome.MORE] while any account's history is still
+     * being covered. An account that needs consent again only stops itself, not the others.
      */
     suspend fun syncGmail(): GmailSyncOutcome {
         if (!gmailImportEnabled) return GmailSyncOutcome.DONE
-        val token = when (val auth = gmailAuth.authorize()) {
-            is GmailAuth.Granted -> { gmailNeedsConsent = false; rememberGmailAccount(auth.accountEmail); auth.accessToken }
+        rereadMailIfNeeded()
+        var result = GmailSyncOutcome.DONE
+        for (account in gmailAccounts) {
+            val outcome = syncAccount(account)
+            if (outcome.priority > result.priority) result = outcome
+        }
+        return result
+    }
+
+    private val GmailSyncOutcome.priority: Int
+        get() = when (this) {
+            GmailSyncOutcome.DONE -> 0
+            GmailSyncOutcome.NEEDS_CONSENT -> 1
+            GmailSyncOutcome.RETRY -> 2
+            GmailSyncOutcome.MORE -> 3
+        }
+
+    private suspend fun syncAccount(account: String): GmailSyncOutcome {
+        val token = when (val auth = gmailAuth.authorize(gmailAuth.account(account))) {
+            is GmailAuth.Granted -> { setNeedsConsent(account, false); auth.accessToken }
             // A worker cannot show the consent screen; the dashboard card asks again instead.
-            is GmailAuth.NeedsConsent, GmailAuth.Unavailable -> { gmailNeedsConsent = true; return GmailSyncOutcome.NEEDS_CONSENT }
+            is GmailAuth.NeedsConsent, GmailAuth.Unavailable -> { setNeedsConsent(account, true); return GmailSyncOutcome.NEEDS_CONSENT }
         }
         val now = System.currentTimeMillis()
 
         // Anything that arrived since the last run. The first run only starts the cursor, because
         // everything before it is the backfill's job.
-        val lastSync = prefs.getLong(KEY_GMAIL_SYNC, -1L)
+        val syncKey = key(KEY_GMAIL_SYNC, account)
+        val lastSync = prefs.getLong(syncKey, -1L)
         if (lastSync < 0) {
-            prefs.edit { putLong(KEY_GMAIL_SYNC, now) }
+            // commit(), not apply(): this runs inside a background WorkManager job with nothing
+            // keeping the process alive afterward, and an async write that loses the race against
+            // process death makes the next run re-derive "now" from scratch — see backfillStep's
+            // frontier write below, where that exact race was the reason the backfill never
+            // advanced past its first slice.
+            prefs.edit(commit = true) { putLong(syncKey, now) }
         } else {
             when (val fetched = gmailApi.fetch(token, GmailQueryBuilder.build(lastSync / 1000), MAX_GMAIL_MESSAGES)) {
                 is GmailFetch.Ok -> {
-                    ingest(fetched.messages, EventSource.GMAIL)
+                    ingest(fetched.messages, EventSource.GMAIL, account)
                     // A throttled run only read the newest part of the window, so the cursor stays
                     // put and the next run re-reads it; the duplicate check absorbs the overlap.
-                    if (!fetched.throttled) prefs.edit { putLong(KEY_GMAIL_SYNC, now) }
+                    if (!fetched.throttled) prefs.edit(commit = true) { putLong(syncKey, now) }
                 }
                 GmailFetch.RateLimited -> return GmailSyncOutcome.RETRY
                 GmailFetch.AuthRevoked -> return GmailSyncOutcome.NEEDS_CONSENT
                 GmailFetch.Failed -> return GmailSyncOutcome.DONE
             }
         }
-        return backfillStep(token, now)
+        return backfillStep(account, token, now)
     }
 
     /**
-     * One slice of history, newest slice first.
+     * One slice of one account's history, newest slice first.
      *
      * Gmail lists newest first, so a capped run can only ever see the newest part of a window.
      * Each run therefore pulls the newest uncovered slice and moves the frontier back to the
      * oldest message it saw; repeated runs eventually reach [FIRST_SCAN_DAYS].
      */
-    private suspend fun backfillStep(token: String, now: Long): GmailSyncOutcome {
-        val frontier = prefs.getLong(KEY_GMAIL_BACKFILL, -1L)
+    private suspend fun backfillStep(account: String, token: String, now: Long): GmailSyncOutcome {
+        val backfillKey = key(KEY_GMAIL_BACKFILL, account)
+        val slicesKey = key(KEY_GMAIL_SLICES, account)
+        val frontier = prefs.getLong(backfillKey, -1L)
         if (frontier == BACKFILL_DONE) return GmailSyncOutcome.DONE
         val before = if (frontier > 0) frontier else now
         val start = LocalDate.now().minusDays(FIRST_SCAN_DAYS)
             .atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
         // The frontier is forced to move, so this is only a stop against a slice that somehow
         // cannot make progress; the limit is far beyond any believable volume of payment mail.
-        val slice = prefs.getInt(KEY_GMAIL_SLICES, 0)
-        if (before <= start || slice >= MAX_BACKFILL_SLICES) return finishBackfill()
+        val slice = prefs.getInt(slicesKey, 0)
+        if (before <= start || slice >= MAX_BACKFILL_SLICES) return finishBackfill(account)
 
         return when (val fetched = gmailApi.fetch(token, GmailQueryBuilder.build(start / 1000, before / 1000), BACKFILL_SLICE)) {
             is GmailFetch.Ok -> {
                 // Counted here rather than before the fetch: a run that read nothing has not used
                 // up a slice, and counting attempts instead of progress let a spell of throttling
                 // burn the whole budget and declare the backfill finished having imported nothing.
-                prefs.edit { putInt(KEY_GMAIL_SLICES, slice + 1) }
-                val stored = ingest(fetched.messages, EventSource.GMAIL)
+                // commit(), not apply() — see the sync cursor comment above.
+                prefs.edit(commit = true) { putInt(slicesKey, slice + 1) }
+                val stored = ingest(fetched.messages, EventSource.GMAIL, account)
                 if (BuildConfig.DEBUG) {
-                    Log.i("GmailSync", "backfill slice=$slice stored=$stored msgs=${fetched.messages.size} exhausted=${fetched.exhausted} throttled=${fetched.throttled}")
+                    Log.i("GmailSync", "backfill $account slice=$slice stored=$stored msgs=${fetched.messages.size} exhausted=${fetched.exhausted} throttled=${fetched.throttled}")
                 }
                 // Forced to strictly decrease, so a window Gmail rounds to whole days still ends.
                 val next = fetched.oldestScannedMillis?.let { minOf(it, before - 1_000L) }
-                if (fetched.exhausted || next == null || next <= start) finishBackfill()
+                if (fetched.exhausted || next == null || next <= start) finishBackfill(account)
                 else {
-                    prefs.edit { putLong(KEY_GMAIL_BACKFILL, next) }
+                    prefs.edit(commit = true) { putLong(backfillKey, next) }
                     GmailSyncOutcome.MORE
                 }
             }
-            GmailFetch.RateLimited -> logOutcome(GmailSyncOutcome.RETRY)
-            GmailFetch.AuthRevoked -> logOutcome(GmailSyncOutcome.NEEDS_CONSENT)
-            GmailFetch.Failed -> logOutcome(GmailSyncOutcome.DONE)
+            GmailFetch.RateLimited -> logOutcome(account, GmailSyncOutcome.RETRY)
+            GmailFetch.AuthRevoked -> logOutcome(account, GmailSyncOutcome.NEEDS_CONSENT)
+            GmailFetch.Failed -> logOutcome(account, GmailSyncOutcome.DONE)
         }
     }
 
-    private fun logOutcome(outcome: GmailSyncOutcome): GmailSyncOutcome {
-        if (BuildConfig.DEBUG) Log.w("GmailSync", "backfill ended early: $outcome")
+    private fun logOutcome(account: String, outcome: GmailSyncOutcome): GmailSyncOutcome {
+        if (BuildConfig.DEBUG) Log.w("GmailSync", "backfill $account ended early: $outcome")
         return outcome
     }
 
-    private fun finishBackfill(): GmailSyncOutcome {
-        prefs.edit { putLong(KEY_GMAIL_BACKFILL, BACKFILL_DONE) }
+    private fun finishBackfill(account: String): GmailSyncOutcome {
+        prefs.edit(commit = true) { putLong(key(KEY_GMAIL_BACKFILL, account), BACKFILL_DONE) }
         return GmailSyncOutcome.DONE
     }
 
     /**
-     * Drops the connection. The Authorization API has no revoke method (see [GmailAuthManager]),
-     * so this clears what the app remembers locally and asks Google's token endpoint to end the
-     * grant itself; either step can be the one that actually matters, so both run. Gmail-sourced
-     * events and cursors go; SMS and notification events are untouched.
-     */
-    suspend fun disconnectGmail() {
-        val token = (gmailAuth.authorize() as? GmailAuth.Granted)?.accessToken
-        if (token != null) gmailApi.revoke(token)
-        gmailImportEnabled = false
-        gmailNeedsConsent = false
-        clearGmailCursors()
-        prefs.edit { remove(KEY_GMAIL_ACCOUNT) }
-        dao.clearGmailEvents()
-    }
-
-    /**
-     * Starts fresh against a different Google account. Its history has never been read from this
-     * phone, so the cursors reset the same way they were on the very first connect.
+     * Adds [accountName] to the accounts being read, without touching the others. Its history has
+     * never been read from this phone, so only its own cursors start fresh.
      *
      * A brand-new account has never approved this app, so Play Services cannot grant this
      * silently — it comes back [GmailAuth.NeedsConsent] and the actual grant only lands later,
-     * out of [GmailAuthManager.fromConsentResult] after the consent screen. [finishAccountSwitch]
-     * is what applies the reset in that case; skipping it left the previous account's sync cursor
-     * in place, so a switch to a new account "succeeded" but silently synced nothing.
+     * out of [GmailAuthManager.fromConsentResult] after the consent screen; [finishAddAccount] is
+     * what records it in that case.
      */
-    suspend fun switchGmailAccount(accountName: String): GmailAuth {
+    suspend fun addGmailAccount(accountName: String): GmailAuth {
         val auth = gmailAuth.authorize(gmailAuth.account(accountName))
-        if (auth is GmailAuth.Granted) finishAccountSwitch(auth, accountName)
+        if (auth is GmailAuth.Granted) finishAddAccount(auth, accountName)
         return auth
     }
 
-    /** Completes a switch once the token is actually granted, whichever path produced it. */
-    suspend fun finishAccountSwitch(auth: GmailAuth.Granted, accountName: String) {
-        gmailNeedsConsent = false
-        rememberGmailAccount(auth.accountEmail ?: accountName)
-        clearGmailCursors()
-        dao.clearGmailEvents()
-        gmailImportEnabled = true
+    /** Records a granted account, whichever path produced the token; false if it can't be named. */
+    suspend fun finishAddAccount(auth: GmailAuth.Granted, accountName: String): Boolean {
+        val email = auth.accountEmail ?: accountName
+        if (email.isBlank()) return false
+        dao.clearGmailEventsFor(email)
+        prefs.edit(commit = true) {
+            putStringSet(KEY_GMAIL_ACCOUNTS, gmailAccounts.toSet() + email)
+            clearCursors(email)
+            putBoolean(KEY_GMAIL_ENABLED, true)
+        }
+        setNeedsConsent(email, false)
+        return true
     }
 
-    private fun clearGmailCursors() = prefs.edit {
-        remove(KEY_GMAIL_SYNC)
-        remove(KEY_GMAIL_BACKFILL)
-        remove(KEY_GMAIL_SLICES)
+    /**
+     * Stops reading one account: asks Google to drop its grant (the Authorization API has no
+     * revoke call — see [GmailAuthManager] — so this is the token endpoint plus clearing what the
+     * app remembers), and forgets that account's cursors and mail-sourced events. The other
+     * accounts and notification events are untouched; removing the last one turns the import off.
+     */
+    suspend fun removeGmailAccount(email: String) {
+        val token = (gmailAuth.authorize(gmailAuth.account(email)) as? GmailAuth.Granted)?.accessToken
+        if (token != null) gmailApi.revoke(token)
+        setNeedsConsent(email, false)
+        val remaining = gmailAccounts - email
+        prefs.edit(commit = true) {
+            putStringSet(KEY_GMAIL_ACCOUNTS, remaining.toSet())
+            clearCursors(email)
+            if (remaining.isEmpty()) putBoolean(KEY_GMAIL_ENABLED, false)
+        }
+        dao.clearGmailEventsFor(email)
+    }
+
+    private fun key(base: String, account: String) = "$base:$account"
+
+    private fun SharedPreferences.Editor.clearCursors(account: String) {
+        remove(key(KEY_GMAIL_SYNC, account))
+        remove(key(KEY_GMAIL_BACKFILL, account))
+        remove(key(KEY_GMAIL_SLICES, account))
     }
 
     /**
      * Stores the payment messages among [messages]; returns true if any were new.
      *
-     * A charge announced by SMS, by the bank's app and by e-mail is one charge, so anything that
+     * A charge announced by the bank's app and by e-mail is one charge, so anything that
      * matches an event already held for that merchant is dropped rather than stored again.
      */
-    suspend fun ingest(messages: List<Sms>, channel: String): Boolean {
+    suspend fun ingest(messages: List<Sms>, channel: String, account: String? = null): Boolean {
         val entities = mutableListOf<EventEntity>()
-        val knownByMerchant = mutableMapOf<String, MutableList<PaymentEvent>>()
+        val knownByMerchant = mutableMapOf<String, MutableList<StampedEvent>>()
         val sourceParser = if (channel == EventSource.GMAIL) mailParser else parser
         for (sms in messages) {
             val event = sourceParser.parse(sms) ?: continue
+            if (channel == EventSource.SMS && !event.worthKeepingFromSms()) continue
+            val atMillis = sms.receivedAt.toMillis()
             val known = knownByMerchant.getOrPut(event.merchantId) {
-                dao.eventsForMerchant(event.merchantId).mapNotNull { it.toEvent() }.toMutableList()
+                dao.eventsForMerchant(event.merchantId)
+                    .mapNotNull { row -> row.toEvent()?.let { StampedEvent(it, row.receivedAtMillis) } }
+                    .toMutableList()
             }
-            if (known.any { event.isLikelyDuplicateOf(it) }) continue
-            known += event
-            entities += event.toEntity(smsKey(sms), EventSource.of(channel, sms.sender), sms.receivedAt.toMillis())
+            if (event.isDuplicateOfAny(atMillis, known)) continue
+            known += StampedEvent(event, atMillis)
+            entities += event.toEntity(smsKey(sms), EventSource.of(channel, account?.let { "$it|${sms.sender}" } ?: sms.sender), atMillis)
         }
         if (entities.isNotEmpty()) dao.insertEvents(entities)
         return entities.isNotEmpty()
@@ -260,11 +405,56 @@ class WatchdogRepository(
             chargeKey(debit.date, debit.amount) to ChargeSource(EventSource.label(row.source), row.receivedAtMillis)
         }.toMap()
 
+    /**
+     * Everything stored for a merchant, newest first, as the proof the subscription is real. Only
+     * the extracted fields exist (the message text is never kept), but kind, amount, source and
+     * the exact arrival time are enough to tell the user which bank text or mail it came from.
+     */
+    suspend fun evidence(merchantId: String): List<EvidenceItem> =
+        dao.eventsForMerchant(merchantId).mapNotNull { row ->
+            val event = row.toEvent() ?: return@mapNotNull null
+            val kind = when (event) {
+                is PaymentEvent.MandateCreated -> "AutoPay mandate created"
+                is PaymentEvent.MandateRevoked -> "AutoPay mandate cancelled"
+                is PaymentEvent.PreDebitNotice -> "Upcoming debit notice for ${event.debitDate}"
+                is PaymentEvent.Debit -> "Payment"
+            }
+            val amount = when (event) {
+                is PaymentEvent.MandateCreated -> event.amount
+                is PaymentEvent.PreDebitNotice -> event.amount
+                is PaymentEvent.Debit -> event.amount
+                is PaymentEvent.MandateRevoked -> null
+            }
+            EvidenceItem(kind, amount, EventSource.label(row.source), row.receivedAtMillis, event.receivedOn)
+        }.sortedWith(compareByDescending<EvidenceItem> { it.date }.thenByDescending { it.atMillis })
+
+    /**
+     * A bank text can only name the billing channel ("Google Play"), never the app behind it. Mail
+     * can: a Play receipt for the same amount a day or two earlier or later says which app. When
+     * exactly one mail names it, the bank event is filed under that app instead of the channel, so
+     * the two stop appearing as a mystery "Google Play subscription" next to the real one.
+     */
+    private fun nameChannelEventsFromMail(rows: List<EventEntity>): List<EventEntity> {
+        val channels = MerchantCatalog.all.filter { it.sharedBilling }.map { it.id }.toSet()
+        val mail = rows.filter { it.source.startsWith("gmail:") && it.merchantId !in channels }
+        if (mail.isEmpty()) return rows
+        return rows.map { row ->
+            if (row.merchantId !in channels || row.source.startsWith("gmail:")) return@map row
+            val day = LocalDate.parse(row.receivedOn)
+            val candidates = mail.filter { m ->
+                m.type == row.type && kotlin.math.abs(java.time.temporal.ChronoUnit.DAYS.between(day, LocalDate.parse(m.receivedOn))) <= 1 &&
+                    (row.type != "MANDATE" || (row.amount != null && m.amount != null && BigDecimal(row.amount).compareTo(BigDecimal(m.amount)) == 0))
+            }
+            val named = candidates.map { it.merchantId }.distinct().singleOrNull() ?: return@map row
+            row.copy(merchantId = named, merchantName = candidates.first { it.merchantId == named }.merchantName)
+        }
+    }
+
     /** All subscriptions, recomputed whenever events, manual entries, user marks or facts change. */
     fun subscriptions(): Flow<List<Subscription>> =
         combine(dao.events(), dao.manual(), dao.marks(), dao.userFacts()) { events, manual, marks, facts ->
             val today = LocalDate.now()
-            val detected = engine.build(events.mapNotNull { it.toEvent() }, today)
+            val detected = engine.build(nameChannelEventsFromMail(events).mapNotNull { it.toEvent() }, today)
             val added = manual.map {
                 engine.manual(
                     key = manualKey(it.id), name = it.name, amount = Money(BigDecimal(it.amount)),
@@ -287,6 +477,7 @@ class WatchdogRepository(
      * can ever come from.
      */
     private fun applyUserFact(sub: Subscription, fact: UserFactEntity): Subscription = sub.copy(
+        name = fact.name?.takeIf { it.isNotBlank() } ?: sub.name,
         amount = fact.amount?.let { Money(BigDecimal(it), fact.currency ?: sub.amount.currency) } ?: sub.amount,
         amountKnown = sub.amountKnown || fact.amount != null,
         frequency = fact.frequency?.let(Frequency::valueOf) ?: sub.frequency,
@@ -298,10 +489,19 @@ class WatchdogRepository(
 
     /** Saves what the user typed for a subscription the app couldn't fully work out on its own. */
     suspend fun setUserFact(key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) =
-        dao.setUserFact(UserFactEntity(key, frequency?.name, nextRenewal?.toString(), amount?.toPlainString(), currency))
+        dao.setUserFact(UserFactEntity(key, frequency?.name, nextRenewal?.toString(), amount?.toPlainString(), currency, name = existingFact(key)?.name))
 
     /** "I don't know this either, and don't want to be asked again" — distinct from hiding it. */
-    suspend fun dismissUserFact(key: String) = dao.setUserFact(UserFactEntity(key, null, null, null, null, dismissed = true))
+    suspend fun dismissUserFact(key: String) =
+        dao.setUserFact(UserFactEntity(key, null, null, null, null, dismissed = true, name = existingFact(key)?.name))
+
+    /** What the user says a subscription is, e.g. which app a Google Play charge is for. Blank clears it. */
+    suspend fun nameSubscription(key: String, name: String) {
+        val current = existingFact(key) ?: UserFactEntity(key, null, null, null, null)
+        dao.setUserFact(current.copy(name = name.trim().ifBlank { null }))
+    }
+
+    private suspend fun existingFact(key: String): UserFactEntity? = dao.userFacts().first().firstOrNull { it.subscriptionKey == key }
 
     suspend fun currentSubscriptions(): List<Subscription> = subscriptions().first()
 
@@ -332,13 +532,32 @@ class WatchdogRepository(
         atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
 
     companion object {
-        private const val KEY_LAST_SCAN = "last_scan_millis"
         private const val KEY_GMAIL_SYNC = "last_gmail_sync_millis"
         private const val KEY_GMAIL_BACKFILL = "gmail_backfill_before_millis"
         private const val KEY_GMAIL_SLICES = "gmail_backfill_slices"
         private const val KEY_GMAIL_ENABLED = "gmail_import_enabled"
         private const val KEY_GMAIL_ACCOUNT = "gmail_account_email"
-        private const val KEY_GMAIL_NEEDS_CONSENT = "gmail_needs_consent"
+        private const val KEY_GMAIL_ACCOUNTS = "gmail_accounts"
+        private const val KEY_GMAIL_CONSENT = "gmail_consent_accounts"
+        private const val KEY_LAST_SCAN = "last_scan_millis"
+        private const val KEY_CLASSIFIER_VERSION = "classifier_version"
+        private const val KEY_SMS_PURGED = "sms_events_purged"
+        private const val KEY_GMAIL_CLASSIFIER_VERSION = "gmail_classifier_version"
+
+        /**
+         * 1: Play trial receipts (promo filter, "unless cancelled", merchant, trial dates).
+         * 2: per-account cursors, and mail events tagged with the account that received them.
+         */
+        private const val GMAIL_CLASSIFIER_VERSION = 2
+
+        /**
+         * Bump whenever a change to [com.aasif.watchdog.core.parser.SmsParser] or
+         * [com.aasif.watchdog.core.merchant.MerchantCatalog] would classify already-scanned SMS
+         * differently — see [reclassifyIfNeeded]. 2: SMS now keeps only what a subscription can be
+         * built on ([worthKeepingFromSms]). 3: a mandate re-created after a revocation is kept instead
+         * of dropped as a duplicate of the first.
+         */
+        private const val CLASSIFIER_VERSION = 3
 
         /** Frontier value meaning the whole [FIRST_SCAN_DAYS] window has been covered. */
         private const val BACKFILL_DONE = 0L
@@ -346,7 +565,7 @@ class WatchdogRepository(
         /** 120 slices of [BACKFILL_SLICE] is far more payment mail than a year can hold. */
         private const val MAX_BACKFILL_SLICES = 120
         private const val KEY_LEAD_DAYS = "reminder_lead_days"
-        private const val FIRST_SCAN_DAYS = 400L // just over a year, enough to see yearly plans renew once
+        private const val FIRST_SCAN_DAYS = 400L // just over a year of mail, enough to see yearly plans renew once
         private const val MANUAL_PREFIX = "manual:"
 
         /** A capped run is safe to repeat: the duplicate check absorbs whatever it re-reads. */

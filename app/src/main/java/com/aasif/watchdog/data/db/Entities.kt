@@ -7,6 +7,7 @@ import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
 import java.math.BigDecimal
 import java.time.LocalDate
+import com.aasif.watchdog.data.toLocalDateTime
 
 /**
  * One parsed payment SMS. Only the extracted fields are stored, never the SMS text.
@@ -14,7 +15,7 @@ import java.time.LocalDate
  */
 @Entity(tableName = "events")
 data class EventEntity(
-    /** sender | received day | body hash: the same SMS seen by the live receiver and a later inbox scan dedupes. */
+    /** sender | received day | body hash: the same message read twice (a re-sync, a re-posted notification) dedupes. */
     @PrimaryKey val smsKey: String,
     val type: String,
     val merchantId: String,
@@ -76,6 +77,8 @@ data class UserFactEntity(
     val currency: String?,
     /** "This isn't right, but don't ask me about it again" — distinct from marking it not a subscription. */
     val dismissed: Boolean = false,
+    /** What the user says this is. For a Google Play charge the bank text cannot name the app behind it. */
+    val name: String? = null,
 )
 
 private const val MANDATE = "MANDATE"
@@ -113,10 +116,11 @@ fun EventEntity.toEvent(): PaymentEvent? {
         MANDATE -> PaymentEvent.MandateCreated(
             merchantId, merchantName, received, amt,
             frequency?.let(Frequency::valueOf), startDate?.let(LocalDate::parse), validTill?.let(LocalDate::parse), autoRenews,
+            receivedAt = receivedAtMillis.takeIf { it > 0 }?.toLocalDateTime(),
         )
         PRE_DEBIT -> PaymentEvent.PreDebitNotice(merchantId, merchantName, received, amt, LocalDate.parse(date ?: return null))
         DEBIT -> PaymentEvent.Debit(merchantId, merchantName, received, amt ?: return null, LocalDate.parse(date ?: return null), viaMandate, peerToPeer)
-        REVOKED -> PaymentEvent.MandateRevoked(merchantId, merchantName, received)
+        REVOKED -> PaymentEvent.MandateRevoked(merchantId, merchantName, received, receivedAtMillis.takeIf { it > 0 }?.toLocalDateTime())
         else -> null
     }
 }

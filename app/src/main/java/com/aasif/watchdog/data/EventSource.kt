@@ -2,7 +2,7 @@ package com.aasif.watchdog.data
 
 /**
  * Where a stored event came from, written as `channel:origin` — `app:com.phonepe.app`,
- * `gmail:billing@netflix.com`, `sms:VM-HDFCBK`.
+ * `gmail:me@gmail.com|billing@netflix.com`.
  *
  * Deliberately not part of the duplicate rules: one charge seen both by SMS and by e-mail is
  * still one charge. This exists so the detail screen can say where a payment was spotted.
@@ -30,14 +30,15 @@ object EventSource {
 
     fun of(channel: String, origin: String) = "$channel:$origin"
 
-    /** Short label for the detail screen: "PhonePe", "Gmail", "SMS (VM-HDFCBK)". */
+    /** Short label for the detail screen: "PhonePe", "Gmail (me@gmail.com)". */
     fun label(source: String): String {
         if (source.isBlank()) return "SMS"
         val channel = source.substringBefore(':')
         val origin = source.substringAfter(':', "")
         return when {
             channel == APP -> paymentApps[origin] ?: "payment app"
-            channel == GMAIL -> "Gmail"
+            // Tagged `account|sender` since mail from several accounts can be read at once.
+            channel == GMAIL -> if ('|' in origin) "Gmail (${origin.substringBefore('|')})" else "Gmail"
             channel == SMS -> if (origin.isBlank()) "SMS" else "SMS ($origin)"
             // Rows stored before provenance existed keep the bare sender, recovered from smsKey.
             source in paymentApps -> paymentApps.getValue(source)

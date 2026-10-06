@@ -62,11 +62,15 @@ object Workers {
 
     fun schedulePeriodic(context: Context) {
         val wm = WorkManager.getInstance(context)
-        // Catches SMS the receiver missed (app killed, permission granted later).
-        wm.enqueueUniquePeriodicWork(
-            SCAN_DAILY, ExistingPeriodicWorkPolicy.KEEP,
-            PeriodicWorkRequestBuilder<ScanWorker>(1, TimeUnit.DAYS).build(),
-        )
+        if (BuildConfig.SMS_ENABLED) {
+            // Catches SMS the receiver missed (app killed, permission granted later).
+            wm.enqueueUniquePeriodicWork(
+                SCAN_DAILY, ExistingPeriodicWorkPolicy.KEEP,
+                PeriodicWorkRequestBuilder<ScanWorker>(1, TimeUnit.DAYS).build(),
+            )
+        } else {
+            wm.cancelUniqueWork(SCAN_DAILY)
+        }
         // Always enqueued; the worker itself returns early unless Gmail import is switched on.
         wm.enqueueUniquePeriodicWork(
             GMAIL_DAILY, ExistingPeriodicWorkPolicy.KEEP,
@@ -158,7 +162,9 @@ class GmailSyncWorker(context: Context, params: WorkerParameters) : CoroutineWor
 
 class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        if (ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+        if (!BuildConfig.SMS_ENABLED ||
+            ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED
+        ) {
             return Result.success()
         }
         (applicationContext as WatchdogApp).repository.scanInbox()
@@ -169,6 +175,7 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val repo = (applicationContext as WatchdogApp).repository
+        repo.purgeSmsIfUnsupported()
         val today = LocalDate.now()
         val due = repo.currentSubscriptions().dueForReminder(today, repo.reminderLeadDays)
         if (due.isEmpty() || !canNotify()) return Result.success()

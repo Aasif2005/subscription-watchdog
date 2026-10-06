@@ -4,12 +4,12 @@ import android.util.Base64
 import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.parser.HtmlText
 import com.aasif.watchdog.core.parser.SmsClassifier
-import com.aasif.watchdog.data.sms.toLocalDateTime
+import com.aasif.watchdog.data.toLocalDateTime
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Turns one Gmail message into the same [Sms] shape the SMS and notification paths produce, so
+ * Turns one Gmail message into the same [Sms] message shape the notification path produces, so
  * all three share one parser. The e-mail analogue of `PaymentNotificationListener.toMessage`.
  *
  * This is also where a message earns the right to be read as a payment at all. Gmail's own
@@ -44,7 +44,7 @@ object GmailMessageMapper {
             .filter { it.isNotBlank() }
             .joinToString(" ")
             .take(MAX_BODY_CHARS)
-        if (body.isBlank() || SmsClassifier.isPromotional(body)) return null
+        if (body.isBlank() || SmsClassifier.isPromotionalMail(body)) return null
 
         val labels = message.optJSONArray("labelIds")
         val isBulkMail = bulkMailHeader.matches(header(headers, "Precedence").orEmpty()) ||

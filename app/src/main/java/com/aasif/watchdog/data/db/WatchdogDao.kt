@@ -45,4 +45,18 @@ interface WatchdogDao {
     /** Switching Gmail accounts re-imports from scratch; SMS and notification events are untouched. */
     @Query("DELETE FROM events WHERE source LIKE 'gmail:%'")
     suspend fun clearGmailEvents()
+
+    /** One account's mail events, tagged `gmail:<account>|<sender>`; compared by prefix so `_` in an address is not a wildcard. */
+    @Query("DELETE FROM events WHERE substr(source, 1, length('gmail:' || :account || '|')) = 'gmail:' || :account || '|'")
+    suspend fun clearGmailEventsFor(account: String)
+
+    /**
+     * Drops everything read from SMS (`sms:` tags, plus older rows that stored a bare sender) while
+     * leaving mail and payment-app notification events alone. Used to re-derive SMS under changed
+     * parsing rules, and to discard SMS data in builds that no longer read SMS. `insertEvents`
+     * is IGNORE-on-conflict by [smsKey][EventEntity.smsKey], so re-parsing the same SMS without
+     * clearing its old row first would keep the stale classification forever.
+     */
+    @Query("DELETE FROM events WHERE source NOT LIKE 'gmail:%' AND source NOT LIKE 'app:%'")
+    suspend fun clearSmsEvents()
 }

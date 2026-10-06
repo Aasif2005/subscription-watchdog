@@ -11,7 +11,7 @@ import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.parser.SmsClassifier
 import com.aasif.watchdog.data.EventSource
-import com.aasif.watchdog.data.sms.toLocalDateTime
+import com.aasif.watchdog.data.toLocalDateTime
 import com.aasif.watchdog.work.Workers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,7 +21,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Reads payment alerts that UPI and bank apps show as notifications. Some banks send the
- * AutoPay pre-debit notice only inside the UPI app, so the SMS inbox never sees it.
+ * AutoPay pre-debit notice only inside the UPI app, and this is the one on-device source of them.
  * Notifications from any other app are ignored without being read.
  */
 class PaymentNotificationListener : NotificationListenerService() {

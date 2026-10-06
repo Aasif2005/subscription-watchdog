@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [EventEntity::class, ManualSubscriptionEntity::class, UserMarkEntity::class, UserFactEntity::class],
-    version = 3,
+    version = 4,
     exportSchema = false,
 )
 abstract class WatchdogDatabase : RoomDatabase() {
@@ -47,9 +47,16 @@ abstract class WatchdogDatabase : RoomDatabase() {
             }
         }
 
+        /** Lets the user name a subscription the bank text could only attribute to a billing channel. */
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE user_facts ADD COLUMN name TEXT")
+            }
+        }
+
         fun create(context: Context): WatchdogDatabase =
             Room.databaseBuilder(context, WatchdogDatabase::class.java, "watchdog.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                 .build()
     }
 }

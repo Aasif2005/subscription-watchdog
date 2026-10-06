@@ -96,6 +96,35 @@ class SubscriptionEngineTest {
         assertEquals(RenewalSource.TRIAL_ESTIMATE, s.renewalSource)
     }
 
+    /**
+     * A plan change sends "old mandate revoked" and "new mandate created" on the same day, and the
+     * live plan is the new one — this used to report the user's active Claude Pro as cancelled.
+     */
+    @Test
+    fun `a revocation on the day a new mandate is created does not cancel it`() {
+        val subs = engine.build(
+            listOf(
+                mandate("claude", 1999, "2026-09-18", "2026-09-18"),
+                PaymentEvent.MandateRevoked("claude", "Claude", d("2026-09-18")),
+            ),
+            today = d("2026-10-04"),
+        )
+        assertTrue(subs.single().isLive, "same-day revoke + new mandate is a replacement, not a cancellation")
+    }
+
+    @Test
+    fun `a revocation on the day of a charge still cancels`() {
+        val subs = engine.build(
+            listOf(
+                mandate("netflix", 649, "2026-01-10", "2026-01-10"),
+                debit("netflix", 649, "2026-08-10"),
+                PaymentEvent.MandateRevoked("netflix", "Netflix", d("2026-08-10")),
+            ),
+            today = d("2026-08-25"),
+        )
+        assertEquals(SubscriptionStatus.CANCELLED, subs.single().status)
+    }
+
     @Test
     fun `revoked mandate is cancelled and counts as savings`() {
         val subs = engine.build(

@@ -37,3 +37,20 @@ fun PaymentEvent.isLikelyDuplicateOf(other: PaymentEvent): Boolean {
 /** Sources differ in scale ("199" vs "199.00"), which BigDecimal.equals() treats as unequal. */
 private fun sameAmount(a: Money?, b: Money?): Boolean =
     if (a == null || b == null) a == b else a.currency == b.currency && a.amount.compareTo(b.amount) == 0
+
+/** An event with the time it arrived (epoch millis, 0 if unknown), for judging duplicates by order. */
+data class StampedEvent(val event: PaymentEvent, val atMillis: Long)
+
+/**
+ * [isLikelyDuplicateOf] against everything already held, with one exception: a mandate announced
+ * again *after a revocation* is a new mandate, not a repeat. A failed or abandoned setup is
+ * created, revoked and created again within minutes, and treating the second creation as a
+ * duplicate of the first left only "created, then revoked" — a live plan reported as cancelled.
+ */
+fun PaymentEvent.isDuplicateOfAny(atMillis: Long, known: List<StampedEvent>): Boolean =
+    known.any { k ->
+        isLikelyDuplicateOf(k.event) && !(
+            this is PaymentEvent.MandateCreated && atMillis > 0 && k.atMillis > 0 &&
+                known.any { it.event is PaymentEvent.MandateRevoked && it.atMillis > k.atMillis && it.atMillis < atMillis }
+            )
+    }

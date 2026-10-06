@@ -27,7 +27,10 @@ object RecurrenceDetector {
     private const val MIN_REGULARITY = 0.6
 
     /**
-     * @param debits all debits for a single merchant.
+     * @param debits all debits for a single merchant that are eligible for pattern matching at
+     *   all — [SubscriptionEngine.patternEligible] has already dropped merchants where amount and
+     *   timing alone are not evidence (a movie chain, a prepaid recharge; see [NonSubscriptionCatalog]
+     *   and [KnownMerchant.autopayOnly]), so this only ever sees debits it makes sense to judge.
      * @param knownMerchant true for catalog services; a regular charge there is almost certainly a
      *   subscription, whereas for an unknown shop it could be a habit (weekly groceries).
      */

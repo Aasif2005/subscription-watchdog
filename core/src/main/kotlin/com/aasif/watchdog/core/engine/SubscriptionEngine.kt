@@ -2,6 +2,7 @@ package com.aasif.watchdog.core.engine
 
 import com.aasif.watchdog.core.merchant.KnownMerchant
 import com.aasif.watchdog.core.merchant.MerchantCatalog
+import com.aasif.watchdog.core.merchant.NonSubscriptionCatalog
 import com.aasif.watchdog.core.model.Charge
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
@@ -50,8 +51,10 @@ class SubscriptionEngine(
 
     private fun plansFor(merchantId: String, events: List<PaymentEvent>): List<Plan> {
         val name = events.last().merchantName
-        val series = RecurrenceDetector.detect(events.filterIsInstance<Debit>(), merchantId in catalog)
-        val mandates = events.filterIsInstance<MandateCreated>().sortedBy { it.receivedOn }
+        val known = catalog[merchantId]
+        val eligibleDebits = events.filterIsInstance<Debit>().filter { patternEligible(merchantId, known, it) }
+        val series = RecurrenceDetector.detect(eligibleDebits, merchantId in catalog)
+        val mandates = events.filterIsInstance<MandateCreated>().sortedWith(compareBy({ it.receivedOn }, { it.receivedAt }))
         val notices = events.filterIsInstance<PreDebitNotice>()
 
         if (series.isEmpty()) {
@@ -74,6 +77,22 @@ class SubscriptionEngine(
             Plan(merchantId, name, s, latestMandate.takeIf { mandateSeries === s }, noticesBySeries[s].orEmpty())
         }
     }
+
+    /**
+     * Whether a debit is allowed to feed [RecurrenceDetector]'s amount+timing pattern match.
+     *
+     * That match can only see amount and timing, which is not evidence for merchants that sell
+     * one-off units — three movie outings that happen to land ~90 days apart at a similar ticket
+     * price fit a "quarterly subscription" exactly as well as a real one would ([NonSubscriptionCatalog]),
+     * and a prepaid mobile recharge repeats on a schedule as a matter of habit, not because it
+     * auto-renews ([KnownMerchant.autopayOnly]). Both are excluded from pattern matching; a debit
+     * that carries its own explicit mandate/AutoPay signal is still let through, since that is real
+     * evidence rather than a coincidence — and a genuine mandate-registration SMS reaches the
+     * subscription a different way entirely, via [MandateCreated] in [plansFor] above, so excluding
+     * the plain debits here does not affect it.
+     */
+    private fun patternEligible(merchantId: String, known: KnownMerchant?, debit: Debit): Boolean =
+        debit.viaMandate || (known?.autopayOnly != true && !NonSubscriptionCatalog.matches(merchantId))
 
     private fun toSubscription(plan: Plan, all: List<Plan>, events: List<PaymentEvent>, today: LocalDate): Subscription {
         val known = catalog[plan.merchantId]
@@ -100,8 +119,26 @@ class SubscriptionEngine(
             charges = charges,
             cancelUrl = known?.cancelUrl,
             amountKnown = plan.amount != null,
-            frequencyKnown = statedFrequency != null,
+            frequencyKnown = statedFrequency != null && !isUnconfirmedMembershipGuess(known, plan),
+            sharedBilling = known?.sharedBilling == true,
         )
+    }
+
+    /**
+     * True when [known] shares its payment descriptor with a non-subscription sibling product
+     * ([KnownMerchant.membershipConfusable]) and the only reason this plan exists at all is a bare
+     * amount+timing pattern — no mandate registration, no pre-debit notice, no debit that itself
+     * carried a mandate/AutoPay signal. A Swiggy One charge inferred purely from "two similar
+     * amounts to Bundl Technologies" is exactly as likely to be two Instamart orders; that pattern
+     * alone is not allowed to promote it to a confident subscription (see [toSubscription]) — it
+     * is deliberately reported as if the frequency were never stated, which is what routes it to
+     * the existing "Needs your input" card instead of a silent Active status.
+     */
+    private fun isUnconfirmedMembershipGuess(known: KnownMerchant?, plan: Plan): Boolean {
+        if (known?.membershipConfusable != true) return false
+        val hasRealEvidence = plan.mandate != null || plan.notices.isNotEmpty() ||
+            plan.series?.debits?.any { it.viaMandate } == true
+        return !hasRealEvidence
     }
 
     private data class Prediction(
@@ -110,6 +147,22 @@ class SubscriptionEngine(
         val confidence: Confidence,
         val status: SubscriptionStatus,
     )
+
+    private fun revocationEndsPlan(
+        revoked: MandateRevoked,
+        mandate: MandateCreated?,
+        lastCharge: LocalDate?,
+        lastActivity: LocalDate?,
+    ): Boolean {
+        val revokedOn = revoked.receivedOn
+        if (lastActivity == null || revokedOn.isAfter(lastActivity)) return true
+        if (revokedOn.isBefore(lastActivity)) return false
+        val sameDayAsMandate = mandate?.receivedOn == revokedOn && (lastCharge == null || lastCharge.isBefore(revokedOn))
+        if (!sameDayAsMandate) return true
+        val revokedAt = revoked.receivedAt
+        val createdAt = mandate?.receivedAt
+        return if (revokedAt != null && createdAt != null) revokedAt.isAfter(createdAt) else false
+    }
 
     private fun predict(
         plan: Plan,
@@ -122,11 +175,14 @@ class SubscriptionEngine(
         val mandate = plan.mandate
         val lastActivity = listOfNotNull(lastCharge, mandate?.receivedOn).maxOrNull()
 
-        // Cancelled: a revocation newer than the latest mandate or charge.
-        val revokedOn = events.filterIsInstance<MandateRevoked>()
+        // Cancelled: a revocation newer than the latest mandate or charge. On the day of the latest
+        // mandate the order of the two decides it (a plan change or a retried setup sends "revoked"
+        // and "created" within minutes); with no times to go on, a same-day pair counts as the
+        // mandate replacing the old one. On a charge day, a revocation still cancels.
+        val revoked = events.filterIsInstance<MandateRevoked>()
             .filter { it.merchantId == plan.merchantId }
-            .maxOfOrNull { it.receivedOn }
-        if (revokedOn != null && (lastActivity == null || !revokedOn.isBefore(lastActivity))) {
+            .maxWithOrNull(compareBy({ it.receivedOn }, { it.receivedAt }))
+        if (revoked != null && revocationEndsPlan(revoked, mandate, lastCharge, lastActivity)) {
             return Prediction(null, RenewalSource.MANDATE, Confidence.HIGH, SubscriptionStatus.CANCELLED)
         }
         if (mandate?.validTill?.isBefore(today) == true) {
