@@ -8,9 +8,9 @@ package com.aasif.watchdog.core.gmail
  * receipt always carries one of these payment words anyway, while a bare merchant name mostly
  * matches newsletters and inflates the message count against the per-run cap.
  *
- * Promotions are not excluded either: Gmail files some genuine billing mail there, and dropping
- * that category would hide exactly the subscriptions this feature exists to find. Marketing is
- * filtered later by [com.aasif.watchdog.core.parser.SmsClassifier.isPromotional].
+ * Gmail's Promotions tab is excluded: the mapper discards every message carrying that label anyway,
+ * so downloading it only spends quota and time. Other marketing is filtered later by
+ * [com.aasif.watchdog.core.parser.SmsClassifier.isPromotional].
  */
 object GmailQueryBuilder {
     private val terms = listOf(
@@ -28,6 +28,6 @@ object GmailQueryBuilder {
         append('(').append(terms.joinToString(" OR ")).append(')')
         append(" after:").append(afterEpochSeconds)
         beforeEpochSeconds?.let { append(" before:").append(it) }
-        append(" -in:spam -in:trash")
+        append(" -in:spam -in:trash -category:promotions")
     }
 }

@@ -5,11 +5,16 @@ import android.content.SharedPreferences
 import android.util.Log
 import androidx.core.content.edit
 import com.aasif.watchdog.BuildConfig
+import com.aasif.watchdog.core.engine.ReminderAnswer
+import com.aasif.watchdog.core.engine.ReminderState
 import com.aasif.watchdog.core.engine.StampedEvent
 import com.aasif.watchdog.core.engine.SubscriptionEngine
 import com.aasif.watchdog.core.engine.isDuplicateOfAny
 import com.aasif.watchdog.core.engine.worthKeepingFromSms
+import com.aasif.watchdog.core.gmail.CatchUpCursor
+import com.aasif.watchdog.core.gmail.CatchUpStep
 import com.aasif.watchdog.core.gmail.GmailQueryBuilder
+import com.aasif.watchdog.core.gmail.next
 import com.aasif.watchdog.core.merchant.MerchantCatalog
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
@@ -40,12 +45,18 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 
+/** How many notifications an app has posted that the listener looked at, and how many yielded a payment. */
+data class NotificationStat(val packageName: String, val seen: Int, val found: Int, val lastSeenMillis: Long)
+
 /** What a Gmail sync run ended up doing, so the worker knows whether to come back. */
 enum class GmailSyncOutcome {
     DONE,
 
-    /** History is not fully covered yet; run again soon rather than waiting for tomorrow. */
+    /** History is not fully covered yet; run again straight away, Gmail did not push back. */
     MORE,
+
+    /** Like [MORE], but Gmail throttled this run, so the next one should wait out the quota window. */
+    MORE_AFTER_THROTTLE,
     NEEDS_CONSENT,
     RETRY,
 }
@@ -98,11 +109,16 @@ class WatchdogRepository(
             // Installs from before several accounts could be connected only stored the one.
             ?: listOfNotNull(prefs.getString(KEY_GMAIL_ACCOUNT, null))
 
-    /** True once any account's sync has come back needing the scope approved again. */
+    /**
+     * True once a connected account's sync has come back needing the scope approved again. Only
+     * accounts still connected count: a sync that was running while its account was removed can
+     * flag it after the removal, and that flag must not keep the reconnect card on screen.
+     */
     val gmailNeedsConsent: Boolean
-        get() = !prefs.getStringSet(KEY_GMAIL_CONSENT, null).isNullOrEmpty()
+        get() = gmailAccounts.any { it in prefs.getStringSet(KEY_GMAIL_CONSENT, null).orEmpty() }
 
     private fun setNeedsConsent(account: String, needs: Boolean) {
+        if (needs && account !in gmailAccounts) return
         val current = prefs.getStringSet(KEY_GMAIL_CONSENT, null).orEmpty()
         val updated = if (needs) current + account else current - account
         if (updated != current) prefs.edit(commit = true) { putStringSet(KEY_GMAIL_CONSENT, updated) }
@@ -203,8 +219,9 @@ class WatchdogRepository(
      * through each one's older mail.
      *
      * Both cursors only move on a clean run, so a rate-limited sync re-reads its window rather
-     * than stepping over it. Returns [GmailSyncOutcome.MORE] while any account's history is still
-     * being covered. An account that needs consent again only stops itself, not the others.
+     * than stepping over it. Returns [GmailSyncOutcome.MORE] (or [GmailSyncOutcome.MORE_AFTER_THROTTLE]
+     * when Gmail pushed back) while any account's history is still being covered. An account that
+     * needs consent again only stops itself, not the others.
      */
     suspend fun syncGmail(): GmailSyncOutcome {
         if (!gmailImportEnabled) return GmailSyncOutcome.DONE
@@ -223,10 +240,11 @@ class WatchdogRepository(
             GmailSyncOutcome.NEEDS_CONSENT -> 1
             GmailSyncOutcome.RETRY -> 2
             GmailSyncOutcome.MORE -> 3
+            GmailSyncOutcome.MORE_AFTER_THROTTLE -> 4
         }
 
     private suspend fun syncAccount(account: String): GmailSyncOutcome {
-        val token = when (val auth = gmailAuth.authorize(gmailAuth.account(account))) {
+        var token = when (val auth = gmailAuth.authorize(gmailAuth.account(account))) {
             is GmailAuth.Granted -> { setNeedsConsent(account, false); auth.accessToken }
             // A worker cannot show the consent screen; the dashboard card asks again instead.
             is GmailAuth.NeedsConsent, GmailAuth.Unavailable -> { setNeedsConsent(account, true); return GmailSyncOutcome.NEEDS_CONSENT }
@@ -245,12 +263,36 @@ class WatchdogRepository(
             // advanced past its first slice.
             prefs.edit(commit = true) { putLong(syncKey, now) }
         } else {
-            when (val fetched = gmailApi.fetch(token, GmailQueryBuilder.build(lastSync / 1000), MAX_GMAIL_MESSAGES)) {
+            val boundKey = key(KEY_GMAIL_CATCHUP_BEFORE, account)
+            val targetKey = key(KEY_GMAIL_CATCHUP_TARGET, account)
+            val cursor = CatchUpCursor(
+                lastSync,
+                upperBound = prefs.getLong(boundKey, -1L).takeIf { it > 0 },
+                target = prefs.getLong(targetKey, -1L).takeIf { it > 0 },
+            )
+            val query = GmailQueryBuilder.build(lastSync / 1000, cursor.upperBound?.let { it / 1000 })
+            val (fetched, usedToken) = fetchMail(account, token, query, MAX_GMAIL_MESSAGES)
+            token = usedToken
+            when (fetched) {
                 is GmailFetch.Ok -> {
                     ingest(fetched.messages, EventSource.GMAIL, account)
-                    // A throttled run only read the newest part of the window, so the cursor stays
-                    // put and the next run re-reads it; the duplicate check absorbs the overlap.
-                    if (!fetched.throttled) prefs.edit(commit = true) { putLong(syncKey, now) }
+                    // A throttled or capped run only read the newest part of the window. Restarting
+                    // from the newest next time would re-read that part forever once the window
+                    // holds more than one run can fetch, so the read walks backwards instead.
+                    when (val step = cursor.next(now, fetched.exhausted, fetched.oldestScannedMillis)) {
+                        is CatchUpStep.Done -> prefs.edit(commit = true) {
+                            putLong(syncKey, step.lastSync)
+                            remove(boundKey)
+                            remove(targetKey)
+                        }
+                        is CatchUpStep.Continue -> {
+                            prefs.edit(commit = true) {
+                                putLong(boundKey, step.upperBound)
+                                putLong(targetKey, step.target)
+                            }
+                            return if (fetched.throttled) GmailSyncOutcome.MORE_AFTER_THROTTLE else GmailSyncOutcome.MORE
+                        }
+                    }
                 }
                 GmailFetch.RateLimited -> return GmailSyncOutcome.RETRY
                 GmailFetch.AuthRevoked -> return GmailSyncOutcome.NEEDS_CONSENT
@@ -280,7 +322,7 @@ class WatchdogRepository(
         val slice = prefs.getInt(slicesKey, 0)
         if (before <= start || slice >= MAX_BACKFILL_SLICES) return finishBackfill(account)
 
-        return when (val fetched = gmailApi.fetch(token, GmailQueryBuilder.build(start / 1000, before / 1000), BACKFILL_SLICE)) {
+        return when (val fetched = fetchMail(account, token, GmailQueryBuilder.build(start / 1000, before / 1000), BACKFILL_SLICE).first) {
             is GmailFetch.Ok -> {
                 // Counted here rather than before the fetch: a run that read nothing has not used
                 // up a slice, and counting attempts instead of progress let a spell of throttling
@@ -296,13 +338,29 @@ class WatchdogRepository(
                 if (fetched.exhausted || next == null || next <= start) finishBackfill(account)
                 else {
                     prefs.edit(commit = true) { putLong(backfillKey, next) }
-                    GmailSyncOutcome.MORE
+                    if (fetched.throttled) GmailSyncOutcome.MORE_AFTER_THROTTLE else GmailSyncOutcome.MORE
                 }
             }
             GmailFetch.RateLimited -> logOutcome(account, GmailSyncOutcome.RETRY)
             GmailFetch.AuthRevoked -> logOutcome(account, GmailSyncOutcome.NEEDS_CONSENT)
             GmailFetch.Failed -> logOutcome(account, GmailSyncOutcome.DONE)
         }
+    }
+
+    /**
+     * Play Services caches access tokens, and one that was revoked (or whose grant was reset) is
+     * still handed out until it expires, so a 401 is not yet proof the user must approve again.
+     * Drop the cached token, ask for a fresh one and retry once; only a second rejection counts.
+     * Returns the token it ended up using, so the next call in the same run does not repeat this.
+     */
+    private suspend fun fetchMail(account: String, token: String, query: String, max: Int): Pair<GmailFetch, String> {
+        val first = gmailApi.fetch(token, query, max)
+        if (first != GmailFetch.AuthRevoked) return first to token
+        gmailAuth.clearToken(token)
+        val fresh = (gmailAuth.authorize(gmailAuth.account(account)) as? GmailAuth.Granted)?.accessToken
+            ?: return GmailFetch.AuthRevoked to token
+        if (BuildConfig.DEBUG) Log.i("GmailSync", "401 for $account, retrying with a fresh token")
+        return gmailApi.fetch(fresh, query, max) to fresh
     }
 
     private fun logOutcome(account: String, outcome: GmailSyncOutcome): GmailSyncOutcome {
@@ -353,10 +411,11 @@ class WatchdogRepository(
     suspend fun removeGmailAccount(email: String) {
         val token = (gmailAuth.authorize(gmailAuth.account(email)) as? GmailAuth.Granted)?.accessToken
         if (token != null) gmailApi.revoke(token)
-        setNeedsConsent(email, false)
         val remaining = gmailAccounts - email
         prefs.edit(commit = true) {
             putStringSet(KEY_GMAIL_ACCOUNTS, remaining.toSet())
+            // Dropped in the same write as the account, so no sync can re-flag it in between.
+            putStringSet(KEY_GMAIL_CONSENT, prefs.getStringSet(KEY_GMAIL_CONSENT, null).orEmpty() - email)
             clearCursors(email)
             if (remaining.isEmpty()) putBoolean(KEY_GMAIL_ENABLED, false)
         }
@@ -369,6 +428,8 @@ class WatchdogRepository(
         remove(key(KEY_GMAIL_SYNC, account))
         remove(key(KEY_GMAIL_BACKFILL, account))
         remove(key(KEY_GMAIL_SLICES, account))
+        remove(key(KEY_GMAIL_CATCHUP_BEFORE, account))
+        remove(key(KEY_GMAIL_CATCHUP_TARGET, account))
     }
 
     /**
@@ -383,7 +444,9 @@ class WatchdogRepository(
         val sourceParser = if (channel == EventSource.GMAIL) mailParser else parser
         for (sms in messages) {
             val event = sourceParser.parse(sms) ?: continue
-            if (channel == EventSource.SMS && !event.worthKeepingFromSms()) continue
+            // Payment-app notifications announce every payment ("You paid ... to ..."), exactly as
+            // bank SMS does, so they get the same rule. Mail is the exception: a receipt is the point.
+            if (channel != EventSource.GMAIL && !event.worthKeepingFromSms()) continue
             val atMillis = sms.receivedAt.toMillis()
             val known = knownByMerchant.getOrPut(event.merchantId) {
                 dao.eventsForMerchant(event.merchantId)
@@ -521,9 +584,91 @@ class WatchdogRepository(
 
     fun isManual(key: String) = key.startsWith(MANUAL_PREFIX)
 
+    /**
+     * Notification-listener bookkeeping, kept as counts only (never any text) so a silent
+     * failure — wrong package name, notices that never arrive — can be told apart from "nothing
+     * happened yet". [recordNotificationSeen] runs for every allowlisted post, before any filter.
+     */
+    @Synchronized
+    fun recordNotificationSeen(packageName: String) = prefs.edit {
+        putInt("notif_seen:$packageName", prefs.getInt("notif_seen:$packageName", 0) + 1)
+        putLong("notif_last:$packageName", System.currentTimeMillis())
+    }
+
+    /** A notification from [packageName] turned into a payment event that was new. */
+    @Synchronized
+    fun recordNotificationFound(packageName: String) =
+        prefs.edit { putInt("notif_found:$packageName", prefs.getInt("notif_found:$packageName", 0) + 1) }
+
+    fun notificationStats(): List<NotificationStat> =
+        prefs.all.keys.filter { it.startsWith("notif_seen:") }.map { it.removePrefix("notif_seen:") }
+            .map { pkg ->
+                NotificationStat(
+                    pkg, prefs.getInt("notif_seen:$pkg", 0), prefs.getInt("notif_found:$pkg", 0),
+                    prefs.getLong("notif_last:$pkg", 0L),
+                )
+            }
+            .sortedByDescending { it.lastSeenMillis }
+
+    /**
+     * What the user answered when a reminder asked "still using it?", per renewal. Kept in prefs
+     * beside [reminderStage] rather than the database: an answer belongs to one renewal date and is
+     * worthless afterwards. Written with commit() because the notification buttons that call this
+     * run in a receiver, and the process may be gone before an async write lands.
+     */
+    fun reminderState(key: String, date: LocalDate) = ReminderState(
+        answer = prefs.getString("reminder_answer:$key:$date", null)?.let { runCatching { ReminderAnswer.valueOf(it) }.getOrNull() },
+        snoozedUntil = prefs.getString("reminder_snooze:$key:$date", null)?.let { runCatching { LocalDate.parse(it) }.getOrNull() },
+        lastStage = reminderStage(key, date),
+        followedUp = prefs.getBoolean("reminder_followup:$key:$date", false),
+    )
+
+    fun answerReminder(key: String, date: LocalDate, answer: ReminderAnswer) =
+        prefs.edit(commit = true) { putString("reminder_answer:$key:$date", answer.name) }
+
+    /** Quiet until [until], when the reminder may be shown again (so the stage already shown is forgotten). */
+    fun snoozeReminder(key: String, date: LocalDate, until: LocalDate) = prefs.edit(commit = true) {
+        putString("reminder_snooze:$key:$date", until.toString())
+        remove("reminder_stage:$key:$date")
+    }
+
+    /** Renewals the user said they would cancel before, as (subscription key, renewal date). */
+    fun plannedCancellations(): List<Pair<String, LocalDate>> =
+        prefs.all.filter { (k, v) -> k.startsWith("reminder_answer:") && v == ReminderAnswer.CANCEL_PLANNED.name }
+            .mapNotNull { (k, _) ->
+                val rest = k.removePrefix("reminder_answer:")
+                val date = runCatching { LocalDate.parse(rest.substringAfterLast(':')) }.getOrNull() ?: return@mapNotNull null
+                rest.substringBeforeLast(':') to date
+            }
+
+    /**
+     * Calls [onChange] whenever a reminder answer, snooze or shown stage changes, from any
+     * writer in this process. Returns the call that stops it. The listener is held by the returned
+     * lambda: SharedPreferences keeps listeners only weakly, so an unreferenced one stops firing.
+     */
+    fun watchReminderAnswers(onChange: () -> Unit): () -> Unit {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == null || key.startsWith("reminder_")) onChange()
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        return { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
+    fun wasChargeAlerted(key: String, date: LocalDate) = prefs.getBoolean("charge_alerted:$key:$date", false)
+    fun setChargeAlerted(key: String, date: LocalDate) = prefs.edit(commit = true) { putBoolean("charge_alerted:$key:$date", true) }
+
     /** Remembers which reminders were sent so each renewal is announced once. */
-    fun wasNotified(key: String, date: LocalDate) = prefs.getBoolean("notified:$key:$date", false)
-    fun setNotified(key: String, date: LocalDate) = prefs.edit { putBoolean("notified:$key:$date", true) }
+    /**
+     * The latest stage a reminder was shown for, per renewal. Older builds stored a plain
+     * "notified" flag instead; it is not read, so a renewal already reminded about once may get
+     * one more reminder after an update, which is harmless.
+     */
+    fun reminderStage(key: String, date: LocalDate): Int? =
+        prefs.getInt("reminder_stage:$key:$date", -1).takeIf { it >= 0 }
+
+    fun setFollowUpSent(key: String, date: LocalDate) = prefs.edit(commit = true) { putBoolean("reminder_followup:$key:$date", true) }
+
+    fun setReminderStage(key: String, date: LocalDate, stage: Int) = prefs.edit(commit = true) { putInt("reminder_stage:$key:$date", stage) }
 
     private fun smsKey(sms: Sms) = "${sms.sender}|${sms.receivedAt.toLocalDate()}|${sms.body.hashCode()}"
     private fun manualKey(id: Long) = "$MANUAL_PREFIX$id"
@@ -535,6 +680,8 @@ class WatchdogRepository(
         private const val KEY_GMAIL_SYNC = "last_gmail_sync_millis"
         private const val KEY_GMAIL_BACKFILL = "gmail_backfill_before_millis"
         private const val KEY_GMAIL_SLICES = "gmail_backfill_slices"
+        private const val KEY_GMAIL_CATCHUP_BEFORE = "gmail_catchup_before_millis"
+        private const val KEY_GMAIL_CATCHUP_TARGET = "gmail_catchup_target_millis"
         private const val KEY_GMAIL_ENABLED = "gmail_import_enabled"
         private const val KEY_GMAIL_ACCOUNT = "gmail_account_email"
         private const val KEY_GMAIL_ACCOUNTS = "gmail_accounts"
@@ -547,8 +694,9 @@ class WatchdogRepository(
         /**
          * 1: Play trial receipts (promo filter, "unless cancelled", merchant, trial dates).
          * 2: per-account cursors, and mail events tagged with the account that received them.
+         * 3: the query leaves out the Promotions tab (results should not change; re-reads to time the faster fetch).
          */
-        private const val GMAIL_CLASSIFIER_VERSION = 2
+        private const val GMAIL_CLASSIFIER_VERSION = 3
 
         /**
          * Bump whenever a change to [com.aasif.watchdog.core.parser.SmsParser] or

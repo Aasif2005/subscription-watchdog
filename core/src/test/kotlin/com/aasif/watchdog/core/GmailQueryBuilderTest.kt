@@ -26,8 +26,8 @@ class GmailQueryBuilderTest {
     }
 
     @Test
-    fun `promotions are not excluded, since Gmail files some real receipts there`() {
-        assertFalse(query.contains("category:promotions"), query)
+    fun `the promotions tab is excluded, since the mapper drops those messages anyway`() {
+        assertTrue(query.contains("-category:promotions"), query)
     }
 
     @Test

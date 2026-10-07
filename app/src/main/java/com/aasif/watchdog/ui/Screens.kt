@@ -46,11 +46,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.aasif.watchdog.core.engine.canSnoozeReminder
 import com.aasif.watchdog.core.engine.monthlyTotal
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
@@ -58,8 +60,11 @@ import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.data.ChargeSource
+import com.aasif.watchdog.data.EventSource
 import com.aasif.watchdog.data.EvidenceItem
 import com.aasif.watchdog.data.GmailAccountStatus
+import com.aasif.watchdog.data.NotificationStat
+import com.aasif.watchdog.data.toLocalDateTime
 import com.aasif.watchdog.data.WatchdogRepository
 import java.math.BigDecimal
 import java.time.LocalDate
@@ -87,6 +92,10 @@ fun DashboardScreen(
     onSaveUserFact: (key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) -> Unit,
     onDismissUserFact: (key: String) -> Unit,
     onHide: (key: String) -> Unit,
+    pendingQuestions: List<Subscription>,
+    onKeep: (Subscription) -> Unit,
+    onPlanCancel: (Subscription) -> Unit,
+    onSnooze: (Subscription) -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -115,6 +124,10 @@ fun DashboardScreen(
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            // First, because this is the point of the app: a charge is coming, and it is not too late.
+            // Not "ask:": a renewal that is due and still needs input is in both lists, and a
+            // shared key makes LazyColumn throw.
+            items(pendingQuestions, key = { "question:${it.key}" }) { sub -> RenewalQuestionCard(sub, onKeep, onPlanCancel, onSnooze) }
             item { SummaryCard(subscriptions) }
             if (smsSupported && !hasSmsAccess) {
                 item {
@@ -347,6 +360,8 @@ fun DetailScreen(
     onUndoCancel: () -> Unit,
     onHide: () -> Unit,
     onDelete: () -> Unit,
+    plannedCancelDate: LocalDate?,
+    onKeepAfterAll: (plannedFor: LocalDate) -> Unit,
 ) {
     val uriHandler = LocalUriHandler.current
     Scaffold(
@@ -361,6 +376,9 @@ fun DetailScreen(
             Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            if (plannedCancelDate != null && sub.isLive) {
+                CancellationGuide(sub, plannedCancelDate, onMarkCancelled, onKeep = { onKeepAfterAll(plannedCancelDate) })
+            }
             val amountLabel = if (sub.amountKnown) formatMoney(sub.amount) else "Amount unknown"
             val frequencyLabel = if (sub.frequencyKnown) sub.frequency.label else "frequency unknown"
             Text("$amountLabel · $frequencyLabel", style = MaterialTheme.typography.headlineSmall)
@@ -488,6 +506,83 @@ fun DetailScreen(
     }
 }
 
+/** The dashboard's copy of the renewal reminder, so a notification that was ignored is not lost. */
+@Composable
+private fun RenewalQuestionCard(
+    sub: Subscription,
+    onKeep: (Subscription) -> Unit,
+    onPlanCancel: (Subscription) -> Unit,
+    onSnooze: (Subscription) -> Unit,
+) {
+    val today = LocalDate.now()
+    val renewal = sub.nextRenewal ?: return
+    val (title, _) = sub.reminderText(renewal)
+    val price = if (sub.amountKnown) " · ${formatMoney(sub.amount)}" else ""
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("$title$price", fontWeight = FontWeight.SemiBold)
+            Text("Still using it? You can still cancel before it is charged.", style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onKeep(sub) }) { Text("Keep") }
+                OutlinedButton(onClick = { onPlanCancel(sub) }) { Text("Cancel") }
+                // Snoozing past the charge would only hide the warning that matters.
+                if (canSnoozeReminder(renewal, today)) TextButton(onClick = { onSnooze(sub) }) { Text("Tomorrow") }
+            }
+        }
+    }
+}
+
+/**
+ * What "Cancel" on a reminder leads to: the steps that actually stop the charge, in order. Only
+ * steps the app can really offer are shown; with none, it says so rather than showing dead buttons.
+ */
+@Composable
+private fun CancellationGuide(sub: Subscription, before: LocalDate, onCancelled: () -> Unit, onKeep: () -> Unit) {
+    val uriHandler = LocalUriHandler.current
+    val context = LocalContext.current
+    // Only apps that are installed, and only the payment ones that hold AutoPay mandates.
+    val upiApps = remember {
+        EventSource.paymentApps.filter { (pkg, _) -> context.packageManager.getLaunchIntentForPackage(pkg) != null }
+    }
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("You planned to cancel before ${formatDate(before)}", style = MaterialTheme.typography.titleMedium)
+            val cancelUrl = sub.cancelUrl
+            if (cancelUrl != null) {
+                Text("1. Cancel it with ${if (sub.sharedBilling) "the store" else sub.name}", fontWeight = FontWeight.SemiBold)
+                Button(onClick = { uriHandler.openUri(cancelUrl) }, Modifier.fillMaxWidth()) {
+                    Text(if (sub.sharedBilling) "Open the store's subscriptions" else "Open ${sub.name}'s cancel page")
+                }
+            } else {
+                Text(
+                    "1. Cancel it inside the ${sub.name} app or website — the app doesn't know its cancel page.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Text("2. Stop the AutoPay, if it is paid that way", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Cancelling in the service does not always revoke the UPI mandate. Open AutoPay in your UPI app and revoke it there.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            upiApps.forEach { (pkg, label) ->
+                OutlinedButton(
+                    onClick = { context.packageManager.getLaunchIntentForPackage(pkg)?.let(context::startActivity) },
+                    Modifier.fillMaxWidth(),
+                ) { Text("Open $label") }
+            }
+            Text("3. Tell the app", fontWeight = FontWeight.SemiBold)
+            Button(onClick = onCancelled, Modifier.fillMaxWidth()) { Text("I've cancelled it") }
+            TextButton(onClick = onKeep, Modifier.fillMaxWidth()) { Text("Changed my mind — keep it") }
+        }
+    }
+}
+
 // ---- Profile --------------------------------------------------------------------------------------
 
 @Composable
@@ -500,6 +595,10 @@ fun ProfileScreen(
     onRemoveAccount: (String) -> Unit,
     smsSupported: Boolean,
     onForceFullRescan: () -> Unit,
+    hasNotificationAccess: Boolean,
+    notificationStats: List<NotificationStat>,
+    onGrantNotificationAccess: () -> Unit,
+    onOpenReminderSettings: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -510,7 +609,7 @@ fun ProfileScreen(
         },
     ) { padding ->
         Column(
-            Modifier.fillMaxSize().padding(padding).padding(16.dp),
+            Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("Gmail", style = MaterialTheme.typography.titleMedium)
@@ -550,6 +649,49 @@ fun ProfileScreen(
                 }
             }
 
+            Text("Renewal reminders", style = MaterialTheme.typography.titleMedium)
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Reminders appear as a banner over whatever you are doing. If they only reach the notification " +
+                            "shade, check that banners and pop-ups are allowed for this app. Unanswered reminders also " +
+                            "stay at the top of the dashboard.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedButton(onClick = onOpenReminderSettings) { Text("Open reminder settings") }
+                }
+            }
+
+            Text("Payment app notifications", style = MaterialTheme.typography.titleMedium)
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (hasNotificationAccess) {
+                        Text(
+                            "Access is on. Counts only — what the notifications say is never stored.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (notificationStats.isEmpty()) {
+                            Text("No notification from a payment app has arrived yet.", style = MaterialTheme.typography.bodyMedium)
+                        }
+                        notificationStats.forEach { stat ->
+                            Column {
+                                Text(EventSource.paymentApps[stat.packageName] ?: "Debug shell", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "${stat.seen} seen, ${stat.found} new payment alert${if (stat.found == 1) "" else "s"} found" +
+                                        if (stat.lastSeenMillis > 0) ", last " + stat.lastSeenMillis.toLocalDateTime().toLocalDate() else "",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                        }
+                    } else {
+                        Text(
+                            "Off. Allow notification access to catch AutoPay alerts that UPI apps show as notifications.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        OutlinedButton(onClick = onGrantNotificationAccess) { Text("Allow notification access") }
+                    }
+                }
+            }
 
             if (smsSupported) {
                 Text("SMS scan", style = MaterialTheme.typography.titleMedium)

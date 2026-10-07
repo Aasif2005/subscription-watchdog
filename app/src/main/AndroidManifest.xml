@@ -9,6 +9,22 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Lets the cancellation guide offer to open the UPI apps that are installed, nothing else. -->
+    <queries>
+        <package android:name="com.google.android.apps.nbu.paisa.user" />
+        <package android:name="com.phonepe.app" />
+        <package android:name="net.one97.paytm" />
+        <package android:name="in.org.npci.upiapp" />
+        <package android:name="com.dreamplug.androidapp" />
+        <package android:name="com.mobikwik_new" />
+        <package android:name="com.naviapp" />
+        <package android:name="com.sbi.lotusintouch" />
+        <package android:name="com.csam.icici.bank.imobile" />
+        <package android:name="com.snapwork.hdfc" />
+        <package android:name="com.axis.mobile" />
+        <package android:name="com.msf.kbank.mobile" />
+    </queries>
+
     <application
         android:name=".WatchdogApp"
         android:allowBackup="false"
@@ -19,14 +35,23 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
+        <!--
+          singleTop: a reminder's "Cancel" button opens this activity, and without it a second copy
+          was stacked on top of the running one instead of reaching onNewIntent.
+        -->
         <activity
             android:name=".ui.MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <receiver
+            android:name=".work.ReminderActionReceiver"
+            android:exported="false" />
 
         <service
             android:name=".data.notification.PaymentNotificationListener"

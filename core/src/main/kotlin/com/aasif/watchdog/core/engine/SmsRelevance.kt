@@ -5,7 +5,7 @@ import com.aasif.watchdog.core.merchant.MerchantCatalog
 import com.aasif.watchdog.core.model.PaymentEvent
 
 /**
- * Whether an event read from a bank SMS is worth keeping.
+ * Whether an event read from a bank SMS, or from a payment-app notification, is worth keeping.
  *
  * A bank texts about every debit, and nearly all of them are one-off spending. SMS earns its place
  * for the things only it carries: mandate registrations and revocations, pre-debit notices, and

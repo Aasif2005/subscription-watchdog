@@ -9,7 +9,7 @@ room = "2.8.5"
 work = "2.11.2"
 coreKtx = "1.19.1"
 coroutines = "1.11.0"
-playServicesAuth = "21.3.0"
+playServicesAuth = "21.4.0"
 junit = "6.1.3"
 
 [libraries]

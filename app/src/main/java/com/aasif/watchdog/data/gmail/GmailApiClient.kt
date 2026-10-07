@@ -1,9 +1,13 @@
 package com.aasif.watchdog.data.gmail
 
+import android.os.SystemClock
 import android.util.Log
 import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.core.model.Sms
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -33,13 +37,14 @@ sealed interface GmailFetch {
 }
 
 /**
- * The slice of the Gmail REST API this app needs, over `HttpURLConnection` — a few sequential
- * calls on a background worker do not justify a networking library.
+ * The slice of the Gmail REST API this app needs, over `HttpURLConnection` — a few small calls
+ * on a background worker do not justify a networking library.
  */
 class GmailApiClient {
 
     suspend fun fetch(accessToken: String, query: String, maxMessages: Int): GmailFetch =
         withContext(Dispatchers.IO) {
+            val startedAt = SystemClock.elapsedRealtime()
             val ids = mutableListOf<String>()
             var pageToken: String? = null
             do {
@@ -64,36 +69,53 @@ class GmailApiClient {
                 }
             } while (pageToken != null && ids.size < maxMessages)
 
+            val listedAt = SystemClock.elapsedRealtime()
             val messages = mutableListOf<Sms>()
             var oldestScanned: Long? = null
             var throttled = false
-            for (id in ids) {
+            // A few messages in flight at once: one at a time is dominated by round-trip latency,
+            // and Gmail allows far more concurrency than this per mailbox.
+            for (chunk in ids.chunked(CONCURRENCY)) {
                 coroutineContext.ensureActive()
-                when (val message = get("$BASE/messages/$id?format=full", accessToken)) {
-                    is Response.Ok -> {
-                        // Tracked for every message, not just the ones that parse, so the backfill
-                        // frontier keeps moving even through a run of unrelated mail.
-                        message.body.optString("internalDate").toLongOrNull()?.let {
-                            oldestScanned = minOf(oldestScanned ?: it, it)
-                        }
-                        GmailMessageMapper.toSms(message.body)?.let(messages::add)
-                    }
-                    Response.Auth -> return@withContext GmailFetch.AuthRevoked
-                    // Messages are read newest first, so the ones already in hand form a complete
-                    // stretch of the window. Keeping them lets the caller bank the ground covered
-                    // instead of re-reading it — and re-reading it is what exhausts the quota.
-                    Response.Rate -> {
-                        throttled = true
-                        break
-                    }
-                    // One unreadable message should not throw away everything already fetched.
-                    Response.Fail -> Unit
+                val results = coroutineScope {
+                    chunk.map { id -> async { get("$BASE/messages/$id?format=full", accessToken) } }.awaitAll()
                 }
+                // Read in list order and stop at the first throttled message: results after it are
+                // discarded so the ones kept are an unbroken newest stretch. Keeping a later one
+                // would let the backfill frontier step over the throttled message and lose it.
+                for (message in results) {
+                    when (message) {
+                        is Response.Ok -> {
+                            // Tracked for every message, not just the ones that parse, so the backfill
+                            // frontier keeps moving even through a run of unrelated mail.
+                            message.body.optString("internalDate").toLongOrNull()?.let {
+                                oldestScanned = minOf(oldestScanned ?: it, it)
+                            }
+                            GmailMessageMapper.toSms(message.body)?.let(messages::add)
+                        }
+                        Response.Auth -> return@withContext GmailFetch.AuthRevoked
+                        // Messages are read newest first, so the ones already in hand form a complete
+                        // stretch of the window. Keeping them lets the caller bank the ground covered
+                        // instead of re-reading it — and re-reading it is what exhausts the quota.
+                        Response.Rate -> {
+                            throttled = true
+                            break
+                        }
+                        // One unreadable message should not throw away everything already fetched.
+                        Response.Fail -> Unit
+                    }
+                }
+                if (throttled) break
             }
             // Nothing was read, so there is no progress to report and nothing to bank.
             if (throttled && oldestScanned == null) return@withContext GmailFetch.RateLimited
             if (BuildConfig.DEBUG) {
-                Log.i(TAG, "q=[$query] listed=${ids.size} parsed=${messages.size} throttled=$throttled")
+                val done = SystemClock.elapsedRealtime()
+                Log.i(
+                    TAG,
+                    "q=[$query] listed=${ids.size} parsed=${messages.size} throttled=$throttled " +
+                        "listMs=${listedAt - startedAt} getMs=${done - listedAt}",
+                )
             }
             GmailFetch.Ok(
                 messages, oldestScanned,
@@ -104,9 +126,9 @@ class GmailApiClient {
         }
 
     /**
-     * Tells Google to drop this token's grant. There is no SDK call for this (checked directly
-     * against play-services-auth 21.3.0: `AuthorizationClient` has no revoke method), so
-     * disconnecting is this one HTTP call plus clearing what the app remembers locally.
+     * Tells Google to drop this token's grant, through the token endpoint. (`AuthorizationClient`
+     * gained `revokeAccess` in play-services-auth 21.4.0; this predates that.) Disconnecting is
+     * this one HTTP call plus clearing what the app remembers locally.
      * Best-effort: a failure here still leaves the app's own state cleared, which is what a user
      * pressing "Disconnect" actually cares about.
      */
@@ -179,6 +201,9 @@ class GmailApiClient {
         const val BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
         const val REVOKE_URL = "https://oauth2.googleapis.com/revoke"
         const val PAGE_SIZE = 100
+
+        /** Gets in flight at once; Gmail documents a per-mailbox concurrency ceiling far above this. */
+        const val CONCURRENCY = 4
         const val TOO_MANY_REQUESTS = 429
 
         /** Google's quota errors carry a long help payload; the first lines say which limit. */

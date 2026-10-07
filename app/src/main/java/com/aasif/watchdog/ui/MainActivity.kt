@@ -1,8 +1,8 @@
 package com.aasif.watchdog.ui
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
-import android.Manifest
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
@@ -15,6 +15,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -27,15 +28,37 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.aasif.watchdog.data.notification.PaymentNotificationListener
+import com.aasif.watchdog.work.ReminderActions
+import com.aasif.watchdog.work.ReminderChannel
+import java.time.LocalDate
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
+    private val vm: MainViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             WatchdogTheme { App() }
         }
+        // Only on a fresh start: after process death Android re-creates the activity with the
+        // original intent, extras included, and the plan would be recorded a second time.
+        if (savedInstanceState == null) handleReminderAction(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleReminderAction(intent)
+    }
+
+    /** The "Cancel it" button on a renewal reminder arrives as extras on the launch intent. */
+    private fun handleReminderAction(intent: Intent) {
+        val key = intent.getStringExtra(ReminderActions.EXTRA_CANCEL_KEY) ?: return
+        val date = intent.getStringExtra(ReminderActions.EXTRA_DATE)?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+        // Consumed, so rotating the screen or returning to the app does not record it a second time.
+        intent.removeExtra(ReminderActions.EXTRA_CANCEL_KEY)
+        if (date != null) vm.planCancellation(key, date, intent.getIntExtra(ReminderActions.EXTRA_NOTIFICATION_ID, key.hashCode()))
     }
 }
 
@@ -57,7 +80,7 @@ private fun App(vm: MainViewModel = viewModel()) {
         }
     }
     val connectGmail = { chooseGmailAccount.launch(vm.chooseGmailAccountIntent()) }
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState() }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState(); vm.refreshNotificationStats() }
     // Renewal reminders are notifications; asked for once on launch.
     val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     LaunchedEffect(Unit) {
@@ -101,7 +124,11 @@ private fun App(vm: MainViewModel = viewModel()) {
             gmailNeedsConsent = vm.gmailNeedsConsent,
             gmailBackfillComplete = vm.gmailBackfillComplete,
             onConnectGmail = connectGmail,
-            onOpenProfile = { vm.open(Screen.Profile) },
+            onOpenProfile = { vm.refreshNotificationStats(); vm.open(Screen.Profile) },
+            pendingQuestions = subscriptions?.let(vm::pendingQuestions).orEmpty(),
+            onKeep = vm::keepSubscription,
+            onPlanCancel = vm::planCancelOf,
+            onSnooze = vm::snoozeSubscription,
             onSaveUserFact = vm::setUserFact,
             onDismissUserFact = vm::dismissUserFact,
             onHide = vm::hide,
@@ -115,6 +142,10 @@ private fun App(vm: MainViewModel = viewModel()) {
             onRemoveAccount = vm::removeGmailAccount,
             smsSupported = vm.smsSupported,
             onForceFullRescan = vm::forceFullRescan,
+            hasNotificationAccess = hasNotificationAccess,
+            notificationStats = vm.notificationStats,
+            onGrantNotificationAccess = { openNotificationAccessSettings(context) },
+            onOpenReminderSettings = { openReminderSettings(context) },
         )
         is Screen.Detail -> {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }
@@ -134,10 +165,25 @@ private fun App(vm: MainViewModel = viewModel()) {
                     onUndoCancel = { vm.undoMark(sub.key) },
                     onHide = { vm.hide(sub.key) },
                     onDelete = { vm.deleteManual(sub.key) },
+                    plannedCancelDate = vm.plannedCancelDate(sub.key),
+                    onKeepAfterAll = { planned -> vm.keepAfterAll(sub.key, planned) },
                 )
             }
         }
         Screen.AddManual -> AddManualScreen(onBack = { vm.back() }, onSave = vm::addManual)
+    }
+}
+
+/** This app's reminder channel in system settings, where banners, sound and lock-screen display are chosen. */
+private fun openReminderSettings(context: Context) {
+    val channel = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+        .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+        .putExtra(Settings.EXTRA_CHANNEL_ID, ReminderChannel.ID)
+    // Some OEM builds lack the per-channel page; the app's own notification page always exists.
+    try {
+        context.startActivity(channel)
+    } catch (_: ActivityNotFoundException) {
+        context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
     }
 }
 

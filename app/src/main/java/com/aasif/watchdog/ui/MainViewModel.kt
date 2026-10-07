@@ -6,27 +6,32 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.WatchdogApp
+import com.aasif.watchdog.core.engine.ReminderAnswer
+import com.aasif.watchdog.core.engine.pendingQuestions
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.data.ChargeSource
 import com.aasif.watchdog.data.EvidenceItem
 import com.aasif.watchdog.data.GmailAccountStatus
+import com.aasif.watchdog.data.NotificationStat
 import com.aasif.watchdog.data.gmail.GmailAuth
 import com.aasif.watchdog.data.notification.PaymentNotificationListener
 import com.aasif.watchdog.work.Workers
+import java.math.BigDecimal
+import java.time.LocalDate
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import java.math.BigDecimal
-import java.time.LocalDate
 
 sealed interface Screen {
     data object Dashboard : Screen
@@ -55,6 +60,14 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     /** True once a sync came back needing the scope re-approved — otherwise the import card just goes quiet. */
     var gmailNeedsConsent: Boolean by mutableStateOf(repo.gmailNeedsConsent)
         private set
+
+    /** Per-app counts from the notification listener, for the profile page. */
+    var notificationStats: List<NotificationStat> by mutableStateOf(repo.notificationStats())
+        private set
+
+    fun refreshNotificationStats() {
+        notificationStats = repo.notificationStats()
+    }
 
     /** Every connected account with its own import status, for the profile page. */
     var gmailAccounts: List<GmailAccountStatus> by mutableStateOf(repo.gmailAccountStatuses())
@@ -168,6 +181,69 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             if (repo.gmailAccounts.isEmpty()) Workers.cancelGmailWork(app)
             refreshGmailState()
         }
+    }
+
+    /** Bumped on every answer so [pendingQuestions] and [plannedCancelDate] are re-read by the screens. */
+    private var answersVersion by mutableIntStateOf(0)
+
+    /**
+     * Answers given on the notification itself are written by a receiver, outside this view model;
+     * without this the dashboard card kept asking a question that had just been answered.
+     */
+    private val stopWatchingAnswers = repo.watchReminderAnswers { answersVersion++ }
+
+    override fun onCleared() {
+        stopWatchingAnswers()
+        super.onCleared()
+    }
+
+    /** Renewals the dashboard should still ask "still using it?" about. */
+    fun pendingQuestions(subscriptions: List<Subscription>): List<Subscription> {
+        answersVersion // read, so a change recomposes the caller
+        return subscriptions.pendingQuestions(LocalDate.now(), repo.reminderLeadDays) { sub, date -> repo.reminderState(sub.key, date) }
+    }
+
+    /** The renewal the user said they would cancel before, if they did and have not yet cancelled. */
+    fun plannedCancelDate(key: String): LocalDate? {
+        answersVersion
+        return repo.plannedCancellations().filter { it.first == key }.maxOfOrNull { it.second }
+    }
+
+    fun keepSubscription(sub: Subscription) = answer(sub) { repo.answerReminder(sub.key, it, ReminderAnswer.KEEP) }
+
+    /**
+     * "Changed my mind" in the cancellation guide. Answered for the renewal the plan was made for,
+     * which is not necessarily the one predicted now: once that date passes the prediction moves
+     * on, and answering the new date would leave the old plan, and the guide, in place for good.
+     */
+    fun keepAfterAll(key: String, plannedFor: LocalDate) {
+        repo.answerReminder(key, plannedFor, ReminderAnswer.KEEP)
+        answersVersion++
+    }
+    fun snoozeSubscription(sub: Subscription) = answer(sub) { repo.snoozeReminder(sub.key, it, LocalDate.now().plusDays(1)) }
+
+    fun planCancelOf(sub: Subscription) {
+        answer(sub) { repo.answerReminder(sub.key, it, ReminderAnswer.CANCEL_PLANNED) }
+        open(Screen.Detail(sub.key))
+    }
+
+    private fun answer(sub: Subscription, write: (LocalDate) -> Unit) {
+        val date = sub.nextRenewal ?: return
+        write(date)
+        NotificationManagerCompat.from(app).cancel(sub.key.hashCode())
+        answersVersion++
+    }
+
+    /**
+     * "Cancel it" on a renewal reminder: records the plan, so the app can warn if a charge lands
+     * anyway, and lands on the screen that has the cancel page. The reminder is dismissed here
+     * because a notification button does not do it by itself.
+     */
+    fun planCancellation(key: String, date: LocalDate, notificationId: Int) {
+        repo.answerReminder(key, date, ReminderAnswer.CANCEL_PLANNED)
+        NotificationManagerCompat.from(app).cancel(notificationId)
+        answersVersion++
+        open(Screen.Detail(key))
     }
 
     fun open(target: Screen) {

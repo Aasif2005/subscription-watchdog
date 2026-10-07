@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import com.google.android.gms.auth.api.identity.AuthorizationRequest
 import com.google.android.gms.auth.api.identity.AuthorizationResult
+import com.google.android.gms.auth.api.identity.ClearTokenRequest
 import com.google.android.gms.auth.api.identity.Identity
 import com.google.android.gms.common.api.Scope
 import com.google.android.gms.tasks.Task
@@ -31,11 +32,10 @@ sealed interface GmailAuth {
  * tokens itself. Nothing is persisted here on purpose: no access or refresh token is ever
  * written to disk by this app.
  *
- * The Authorization API has no revoke call ([AuthorizationClient] exposes only `authorize` and
- * reading a result back out of an intent — checked directly against play-services-auth 21.3.0),
- * so "disconnect" in [com.aasif.watchdog.data.WatchdogRepository] means clearing what this app
- * remembers locally and asking Google's token endpoint to drop the grant, not calling an SDK
- * method that does not exist.
+ * "Disconnect" in [com.aasif.watchdog.data.WatchdogRepository] clears what this app remembers
+ * locally and asks Google's token endpoint to drop the grant. Play-services-auth 21.4.0 added
+ * `AuthorizationClient.revokeAccess`, which could replace that HTTP call; 21.3.0, which this was
+ * first written against, had no revoke method.
  */
 class GmailAuthManager(private val context: Context) {
     private val client get() = Identity.getAuthorizationClient(context)
@@ -60,6 +60,20 @@ class GmailAuthManager(private val context: Context) {
         throw e
     } catch (_: Exception) {
         GmailAuth.Unavailable
+    }
+
+    /**
+     * Drops a token Gmail rejected from Play Services' cache. Without this, [authorize] keeps
+     * handing back the same dead access token until it expires on its own.
+     */
+    suspend fun clearToken(token: String) {
+        try {
+            client.clearToken(ClearTokenRequest.builder().setToken(token).build()).await()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Best effort: the retry that follows simply fails the same way and asks for consent.
+        }
     }
 
     /** Reads the token back out of the consent screen's result. */

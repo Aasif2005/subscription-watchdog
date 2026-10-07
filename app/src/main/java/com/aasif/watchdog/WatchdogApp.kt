@@ -3,6 +3,7 @@ package com.aasif.watchdog
 import android.app.Application
 import com.aasif.watchdog.data.WatchdogRepository
 import com.aasif.watchdog.data.db.WatchdogDatabase
+import com.aasif.watchdog.work.ReminderChannel
 import com.aasif.watchdog.work.Workers
 
 class WatchdogApp : Application() {
@@ -13,5 +14,6 @@ class WatchdogApp : Application() {
     override fun onCreate() {
         super.onCreate()
         Workers.schedulePeriodic(this)
+        ReminderChannel.ensure(this)
     }
 }

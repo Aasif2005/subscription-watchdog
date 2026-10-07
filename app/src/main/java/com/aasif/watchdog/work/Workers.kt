@@ -19,22 +19,32 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequest
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.R
 import com.aasif.watchdog.WatchdogApp
+import com.aasif.watchdog.core.engine.EVENING_HOUR
+import com.aasif.watchdog.core.engine.FINAL_STAGE
+import com.aasif.watchdog.core.engine.canSnoozeReminder
+import com.aasif.watchdog.core.engine.chargedDespiteCancelPlan
 import com.aasif.watchdog.core.engine.dueForReminder
+import com.aasif.watchdog.core.engine.reminderStage
+import com.aasif.watchdog.core.engine.shouldFollowUp
+import com.aasif.watchdog.core.engine.shouldRemind
+import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.data.GmailSyncOutcome
-import com.aasif.watchdog.core.model.RenewalSource
-import com.aasif.watchdog.core.model.SubscriptionStatus
+import com.aasif.watchdog.data.WatchdogRepository
 import com.aasif.watchdog.ui.MainActivity
+import com.aasif.watchdog.ui.formatDate
 import com.aasif.watchdog.ui.formatMoney
+import com.aasif.watchdog.ui.reminderText
 import java.time.Duration
 import java.time.LocalDate
 import java.time.LocalDateTime
-import java.time.temporal.ChronoUnit
 import java.util.concurrent.TimeUnit
 
 object Workers {
@@ -46,9 +56,10 @@ object Workers {
     /** The backfill's own continuation, kept off [GMAIL_NOW] so it cannot cancel its own run. */
     private const val GMAIL_MORE = "gmail-more"
     private const val REMINDERS = "reminders-daily"
+    private const val REMINDERS_EVENING = "reminders-evening"
     private const val REMINDER_HOUR = 9
 
-    /** Gmail's quota is per minute, so the next slice waits one out rather than racing it. */
+    /** Gmail's quota is per minute, so after a throttled slice the next one waits a window out. */
     private val slicePause: Duration = Duration.ofSeconds(70)
 
     private val online = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
@@ -79,16 +90,22 @@ object Workers {
                 .setBackoffCriteria(BackoffPolicy.LINEAR, 30, TimeUnit.SECONDS)
                 .build(),
         )
-        // Daily reminder pass, aligned to the morning.
+        // Two daily reminder passes. The morning one covers "a few days ahead" and the renewal day;
+        // the evening one is when the day-before reminder is allowed out (see EVENING_HOUR), so an
+        // early-morning AutoPay debit still has a whole night's warning. Periodic work is not
+        // exact: either can run late, especially under battery saving.
+        wm.enqueueUniquePeriodicWork(REMINDERS, ExistingPeriodicWorkPolicy.KEEP, reminderPass(REMINDER_HOUR))
+        wm.enqueueUniquePeriodicWork(REMINDERS_EVENING, ExistingPeriodicWorkPolicy.KEEP, reminderPass(EVENING_HOUR))
+    }
+
+    /** A daily [ReminderWorker] whose first run is at the next [hour]:00. */
+    private fun reminderPass(hour: Int): PeriodicWorkRequest {
         val now = LocalDateTime.now()
-        var nextRun = now.toLocalDate().atTime(REMINDER_HOUR, 0)
+        var nextRun = now.toLocalDate().atTime(hour, 0)
         if (!nextRun.isAfter(now)) nextRun = nextRun.plusDays(1)
-        wm.enqueueUniquePeriodicWork(
-            REMINDERS, ExistingPeriodicWorkPolicy.KEEP,
-            PeriodicWorkRequestBuilder<ReminderWorker>(1, TimeUnit.DAYS)
-                .setInitialDelay(Duration.between(now, nextRun))
-                .build(),
-        )
+        return PeriodicWorkRequestBuilder<ReminderWorker>(1, TimeUnit.DAYS)
+            .setInitialDelay(Duration.between(now, nextRun))
+            .build()
     }
 
     /** Re-check reminders now, e.g. when a pre-debit notice just arrived with only ~24h warning. */
@@ -114,10 +131,25 @@ object Workers {
             .enqueue()
     }
 
-    /** Next slice of the backfill, spaced so the quota window has reset by the time it runs. */
-    fun gmailSyncNextSlice(context: Context) {
+    /**
+     * Next slice of the backfill. It follows straight on unless Gmail throttled the last one, in
+     * which case it waits so the quota window has reset by the time it runs.
+     */
+    fun gmailSyncNextSlice(context: Context, afterThrottle: Boolean) {
         WorkManager.getInstance(context)
-            .enqueueUniqueWork(GMAIL_MORE, ExistingWorkPolicy.REPLACE, gmailSync(slicePause))
+            .enqueueUniqueWork(GMAIL_MORE, ExistingWorkPolicy.REPLACE, gmailSync(if (afterThrottle) slicePause else Duration.ZERO))
+    }
+
+    /**
+     * The one repeat of a final-day reminder that was swiped away. Unique per renewal, so a
+     * second swipe cannot queue a second one.
+     */
+    fun scheduleFollowUp(context: Context, key: String, date: LocalDate, delay: Duration) {
+        val request = OneTimeWorkRequestBuilder<ReminderWorker>()
+            .setInitialDelay(delay)
+            .setInputData(workDataOf(ReminderWorker.FOLLOW_UP_KEY to key, ReminderWorker.FOLLOW_UP_DATE to date.toString()))
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork("reminder-followup:$key:$date", ExistingWorkPolicy.KEEP, request)
     }
 
     /** Stops every Gmail work item, e.g. right after the user disconnects from the profile page. */
@@ -148,8 +180,8 @@ class GmailSyncWorker(context: Context, params: WorkerParameters) : CoroutineWor
             GmailSyncOutcome.DONE -> Result.success()
             // This slice landed, so the run succeeded; the next one is paced rather than retried,
             // because retry backoff grows with every attempt and a backfill is many slices long.
-            GmailSyncOutcome.MORE -> {
-                Workers.gmailSyncNextSlice(applicationContext)
+            GmailSyncOutcome.MORE, GmailSyncOutcome.MORE_AFTER_THROTTLE -> {
+                Workers.gmailSyncNextSlice(applicationContext, afterThrottle = outcome == GmailSyncOutcome.MORE_AFTER_THROTTLE)
                 Result.success()
             }
             // Nothing was read at all, so let WorkManager's backoff decide when to try again.
@@ -176,57 +208,106 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
     override suspend fun doWork(): Result {
         val repo = (applicationContext as WatchdogApp).repository
         repo.purgeSmsIfUnsupported()
-        val today = LocalDate.now()
-        val due = repo.currentSubscriptions().dueForReminder(today, repo.reminderLeadDays)
-        if (due.isEmpty() || !canNotify()) return Result.success()
+        if (!canNotify()) return Result.success()
+        val now = LocalDateTime.now()
+        val today = now.toLocalDate()
+        val subscriptions = repo.currentSubscriptions()
+        ReminderChannel.ensure(applicationContext)
 
-        ensureChannel()
+        // The user said they would cancel, and a charge landed anyway. Worth saying so once.
+        for ((key, planned) in repo.plannedCancellations()) {
+            val sub = subscriptions.firstOrNull { it.key == key } ?: continue
+            if (!chargedDespiteCancelPlan(sub, planned) || repo.wasChargeAlerted(key, planned)) continue
+            val price = if (sub.amountKnown) formatMoney(sub.amount) else "A payment"
+            notify(
+                key.hashCode() + 1, "${sub.name} charged you anyway",
+                "$price was charged although you planned to cancel before ${formatDate(planned)}. Open the app to cancel it or check the mandate.",
+                openApp(key.hashCode() + 1),
+            )
+            repo.setChargeAlerted(key, planned)
+        }
+
+        postFollowUp(repo, subscriptions, today)
+
+        val due = subscriptions.dueForReminder(today, repo.reminderLeadDays)
         for (sub in due) {
             val date = sub.nextRenewal ?: continue
-            if (repo.wasNotified(sub.key, date)) continue
-            val days = ChronoUnit.DAYS.between(today, date)
-            val whenText = when (days) {
-                0L -> "today"
-                1L -> "tomorrow"
-                else -> "in $days days"
-            }
-            // An amount nothing ever stated would otherwise read as a confident "₹0.00 will be
-            // charged"; the reminder is still worth sending, just without inventing a figure.
-            val price = if (sub.amountKnown) formatMoney(sub.amount) else null
-            val (title, text) = when {
-                sub.status == SubscriptionStatus.TRIAL ->
-                    "${sub.name} free trial ends $whenText" to
-                        (price?.let { "$it will be charged unless you cancel before $date." } ?: "Cancel before $date to avoid being charged.")
-                // A plan length read off a receipt is an end date, not a confirmed auto-renewal.
-                sub.renewalSource == RenewalSource.PLAN_EXPIRY ->
-                    "${sub.name} plan ends $whenText" to
-                        (price?.let { "$it plan ends on $date. Renew it if you want to keep it." } ?: "Your plan ends on $date.")
-                else ->
-                    "${sub.name} renews $whenText" to
-                        (price?.let { "$it (${sub.frequency.label.lowercase()}) will be charged on $date." } ?: "Renews on $date.")
-            }
-            notify(sub.key.hashCode(), title, text)
-            repo.setNotified(sub.key, date)
+            if (!shouldRemind(now, date, repo.reminderState(sub.key, date))) continue
+            val (title, text) = sub.reminderText(date, now)
+            // The app cannot know whether a subscription is being used, so it asks.
+            val stage = reminderStage(date, today)
+            notify(
+                sub.key.hashCode(), title, "$text Still using it?", openApp(sub.key.hashCode()), actions(sub.key, date, today),
+                // Only the last one is watched: it is the one a swipe leaves no time to recover from.
+                onDismiss = if (stage == FINAL_STAGE) dismissIntent(sub.key, date) else null,
+            )
+            repo.setReminderStage(sub.key, date, stage)
         }
         return Result.success()
+    }
+
+    /** Runs only for the work item [Workers.scheduleFollowUp] queued, and only if it is still due. */
+    private fun postFollowUp(repo: WatchdogRepository, subscriptions: List<Subscription>, today: LocalDate) {
+        val key = inputData.getString(FOLLOW_UP_KEY) ?: return
+        val date = inputData.getString(FOLLOW_UP_DATE)?.let { runCatching { LocalDate.parse(it) }.getOrNull() } ?: return
+        if (!shouldFollowUp(today, date, repo.reminderState(key, date))) return
+        val sub = subscriptions.firstOrNull { it.key == key } ?: return
+        val price = if (sub.amountKnown) formatMoney(sub.amount) else "This renewal"
+        // Marked first: whatever happens next, this is the only repeat.
+        repo.setFollowUpSent(key, date)
+        notify(
+            key.hashCode(), "${sub.name} is due today",
+            "You dismissed the reminder. $price is due today unless you cancel it. Still using it?",
+            openApp(key.hashCode()), actions(key, date, today),
+        )
+    }
+
+    private fun dismissIntent(key: String, date: LocalDate) = PendingIntent.getBroadcast(
+        applicationContext, key.hashCode() * 4,
+        Intent(applicationContext, ReminderActionReceiver::class.java).setAction(ReminderActions.DISMISSED)
+            .putExtra(ReminderActions.EXTRA_KEY, key).putExtra(ReminderActions.EXTRA_DATE, date.toString()),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
+    private fun openApp(requestCode: Int) = PendingIntent.getActivity(
+        applicationContext, requestCode, Intent(applicationContext, MainActivity::class.java),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
+    /** Keep and Snooze are handled in the background; Cancel opens the screen that has the cancel link. */
+    private fun actions(key: String, date: LocalDate, today: LocalDate): List<NotificationCompat.Action> {
+        val id = key.hashCode()
+        fun broadcast(action: String, offset: Int) = PendingIntent.getBroadcast(
+            applicationContext, id * 4 + offset,
+            Intent(applicationContext, ReminderActionReceiver::class.java).setAction(action)
+                .putExtra(ReminderActions.EXTRA_KEY, key).putExtra(ReminderActions.EXTRA_DATE, date.toString())
+                .putExtra(ReminderActions.EXTRA_NOTIFICATION_ID, id),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val cancel = PendingIntent.getActivity(
+            applicationContext, id * 4 + 3,
+            Intent(applicationContext, MainActivity::class.java)
+                .putExtra(ReminderActions.EXTRA_CANCEL_KEY, key).putExtra(ReminderActions.EXTRA_DATE, date.toString())
+                .putExtra(ReminderActions.EXTRA_NOTIFICATION_ID, id),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return listOfNotNull(
+            NotificationCompat.Action(0, "Keep", broadcast(ReminderActions.KEEP, 1)),
+            NotificationCompat.Action(0, "Cancel", cancel),
+            // Snoozing past the charge would only hide the warning that matters.
+            NotificationCompat.Action(0, "Tomorrow", broadcast(ReminderActions.SNOOZE, 2)).takeIf { canSnoozeReminder(date, today) },
+        )
     }
 
     private fun canNotify(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
-    private fun ensureChannel() {
-        val channel = NotificationChannel(CHANNEL_ID, applicationContext.getString(R.string.channel_renewals), NotificationManager.IMPORTANCE_DEFAULT)
-            .apply { description = applicationContext.getString(R.string.channel_renewals_desc) }
-        applicationContext.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-    }
-
     @Suppress("MissingPermission") // checked in canNotify()
-    private fun notify(id: Int, title: String, text: String) {
-        val open = PendingIntent.getActivity(
-            applicationContext, 0, Intent(applicationContext, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
+    private fun notify(
+        id: Int, title: String, text: String, open: PendingIntent,
+        actions: List<NotificationCompat.Action> = emptyList(), onDismiss: PendingIntent? = null,
+    ) {
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle(title)
@@ -234,11 +315,50 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setContentIntent(open)
             .setAutoCancel(true)
+            .setDeleteIntent(onDismiss)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setOnlyAlertOnce(true)
+            // On the lock screen the amount stays hidden; the full text shows once unlocked.
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                NotificationCompat.Builder(applicationContext, CHANNEL_ID)
+                    .setSmallIcon(R.drawable.ic_launcher)
+                    .setContentTitle("Subscription reminder")
+                    .setContentText("Unlock to see which renewal is coming up.")
+                    .build(),
+            )
+            .apply { actions.forEach(::addAction) }
             .build()
         NotificationManagerCompat.from(applicationContext).notify(id, notification)
     }
 
     companion object {
-        private const val CHANNEL_ID = "renewals"
+        const val FOLLOW_UP_KEY = "follow_up_key"
+        const val FOLLOW_UP_DATE = "follow_up_date"
+        private const val CHANNEL_ID = ReminderChannel.ID
+    }
+}
+
+/** The one notification channel the app posts reminders on. */
+object ReminderChannel {
+    const val ID = "renewals_urgent"
+
+    /** Default importance, so it never showed as a banner. Replaced by [ID]. */
+    private const val OLD_ID = "renewals"
+
+    /**
+     * `IMPORTANCE_HIGH` is what lets a reminder drop over the home screen as a banner. A channel's
+     * importance cannot be changed once created, which is why this is a new channel; the old one
+     * is deleted so system settings do not show a dead entry next to it. Created at app start, not
+     * only before the first reminder, so the settings button always has a page to open.
+     */
+    fun ensure(context: Context) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(ID, context.getString(R.string.channel_renewals), NotificationManager.IMPORTANCE_HIGH)
+                .apply { description = context.getString(R.string.channel_renewals_desc) },
+        )
+        manager.deleteNotificationChannel(OLD_ID)
     }
 }

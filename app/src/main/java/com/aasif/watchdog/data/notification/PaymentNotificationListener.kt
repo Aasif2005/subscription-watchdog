@@ -27,14 +27,22 @@ import kotlinx.coroutines.launch
 class PaymentNotificationListener : NotificationListenerService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** Notification key plus a hash of its words, for the last [COUNTED_LIMIT] posts counted. */
+    private val countedOnce: MutableSet<String> = java.util.Collections.newSetFromMap(
+        object : LinkedHashMap<String, Boolean>() {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?) = size > COUNTED_LIMIT
+        },
+    )
+
     override fun onListenerConnected() {
-        // Alerts already in the shade when access was granted.
-        val existing = activeNotifications?.mapNotNull(::toMessage).orEmpty()
+        // Alerts already in the shade when access was granted. Not counted as "seen": the same
+        // ones would be counted again on every reconnect.
+        val existing = activeNotifications?.mapNotNull { toMessage(it, count = false) }.orEmpty()
         if (existing.isNotEmpty()) ingest(existing)
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
-        toMessage(sbn)?.let { ingest(listOf(it)) }
+        toMessage(sbn, count = true)?.let { ingest(listOf(it)) }
     }
 
     override fun onDestroy() {
@@ -45,11 +53,19 @@ class PaymentNotificationListener : NotificationListenerService() {
     private fun ingest(messages: List<Sms>) {
         val app = applicationContext as WatchdogApp
         scope.launch {
-            if (app.repository.ingest(messages, EventSource.APP)) Workers.remindNow(app)
+            // One message at a time, so a new event can be credited to the app that posted it.
+            var any = false
+            for (message in messages) {
+                if (app.repository.ingest(listOf(message), EventSource.APP)) {
+                    any = true
+                    app.repository.recordNotificationFound(message.sender)
+                }
+            }
+            if (any) Workers.remindNow(app)
         }
     }
 
-    private fun toMessage(sbn: StatusBarNotification): Sms? {
+    private fun toMessage(sbn: StatusBarNotification, count: Boolean): Sms? {
         if (sbn.packageName !in allowedPackages) return null
         val notification = sbn.notification
         if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return null
@@ -57,12 +73,19 @@ class PaymentNotificationListener : NotificationListenerService() {
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))
             ?.toString().orEmpty()
+        // Apps re-post one notification as it changes ("processing" → "successful"), and a re-post
+        // with the same words is not a new alert. Only a hash is kept, never the text.
+        if (count && countedOnce.add("${sbn.key}|${(title + text).hashCode()}")) {
+            (applicationContext as WatchdogApp).repository.recordNotificationSeen(sbn.packageName)
+        }
         val body = listOf(title, text).filter { it.isNotBlank() }.joinToString(" ")
         if (text.isBlank() || SmsClassifier.isPromotional(body)) return null
         return Sms(sender = sbn.packageName, body = body, receivedAt = sbn.postTime.toLocalDateTime())
     }
 
     companion object {
+        private const val COUNTED_LIMIT = 200
+
         // Debug builds also accept `adb shell cmd notification post`, which posts as the shell.
         private val allowedPackages = EventSource.paymentApps.keys.let {
             if (BuildConfig.DEBUG) it + "com.android.shell" else it
