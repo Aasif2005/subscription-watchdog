@@ -184,6 +184,33 @@ class SmsParserTest {
     }
 
     @Test
+    fun `a revocation keeps the mandate's amount, so it can be matched to the right mandate`() {
+        // Bank-style wording; Google Play is the payee for many apps, so the amount is what tells them apart.
+        val e = assertIs<PaymentEvent.MandateRevoked>(parse(
+            "Your UPI AutoPay mandate of Rs.1,999.00 towards Google Play has been revoked successfully. -IOB",
+            sender = "VA-IOBCHN-S",
+        ))
+        assertEquals("googleplay", e.merchantId)
+        assertEquals(Money(BigDecimal("1999.00")), e.amount)
+        assertNull(e.activeUntil)
+    }
+
+    @Test
+    fun `a revocation without an amount still parses, with no amount`() {
+        val e = assertIs<PaymentEvent.MandateRevoked>(parse("Your UPI AutoPay mandate for Netflix has been revoked successfully. -Paytm Payments Bank"))
+        assertNull(e.amount)
+    }
+
+    @Test
+    fun `a cancellation that says when access ends keeps that date`() {
+        // Synthetic wording in the shape services describe; no real cancellation mail was seen.
+        val e = assertIs<PaymentEvent.MandateRevoked>(parse(
+            "Your Spotify Premium subscription has been cancelled. You can keep using Premium until 12 Nov 2026.",
+        ))
+        assertEquals(date(2026, 11, 12), e.activeUntil)
+    }
+
+    @Test
     fun `ignores OTPs, failures, credits and personal numbers`() {
         assertNull(parse("123456 is your OTP for mandate registration of Rs 649 towards Netflix. Do not share."))
         assertNull(parse("Your AutoPay payment of Rs 649 to Netflix failed due to insufficient balance."))

@@ -52,8 +52,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.aasif.watchdog.core.engine.ReplacementQuestion
 import com.aasif.watchdog.core.engine.canSnoozeReminder
 import com.aasif.watchdog.core.engine.monthlyTotal
+import com.aasif.watchdog.core.merchant.PlanPrices
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Money
@@ -96,6 +98,12 @@ fun DashboardScreen(
     onKeep: (Subscription) -> Unit,
     onPlanCancel: (Subscription) -> Unit,
     onSnooze: (Subscription) -> Unit,
+    replacementQuestions: List<ReplacementQuestion>,
+    onReplaces: (ReplacementQuestion) -> Unit,
+    onDifferentApp: (ReplacementQuestion) -> Unit,
+    revocationQuestions: List<Subscription>,
+    onRevocationYes: (Subscription) -> Unit,
+    onRevocationNo: (Subscription) -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -113,8 +121,9 @@ fun DashboardScreen(
             Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
             return@Scaffold
         }
-        val live = subscriptions.filter { it.isLive }
-        val ended = subscriptions.filterNot { it.isLive }
+        // A plan whose AutoPay is off but whose paid time has not run out is still in use.
+        val live = subscriptions.filter { it.isInUse }
+        val ended = subscriptions.filterNot { it.isInUse }
         // Cleared once a fact is saved (renewalSource flips to USER_SUPPLIED), so a card leaves
         // this list the moment it stops needing anything, without a separate "resolved" flag.
         val needsInput = live.filter { it.needsInput }
@@ -128,6 +137,8 @@ fun DashboardScreen(
             // Not "ask:": a renewal that is due and still needs input is in both lists, and a
             // shared key makes LazyColumn throw.
             items(pendingQuestions, key = { "question:${it.key}" }) { sub -> RenewalQuestionCard(sub, onKeep, onPlanCancel, onSnooze) }
+            items(replacementQuestions, key = { "replace:${it.older.key}|${it.newer.key}" }) { q -> ReplacementCard(q, onReplaces, onDifferentApp) }
+            items(revocationQuestions, key = { "revoked:${it.key}" }) { sub -> RevocationCard(sub, onRevocationYes, onRevocationNo) }
             item { SummaryCard(subscriptions) }
             if (smsSupported && !hasSmsAccess) {
                 item {
@@ -242,7 +253,10 @@ private fun NeedsInputCard(
     var expanded by remember { mutableStateOf(false) }
     var amountText by remember { mutableStateOf(if (sub.amountKnown) sub.amount.amount.toPlainString() else "") }
     var dateText by remember { mutableStateOf(sub.nextRenewal?.toString() ?: "") }
-    var frequency by remember { mutableStateOf(if (sub.frequencyKnown) sub.frequency else Frequency.MONTHLY) }
+    // Nothing stated the period: the price list may suggest one, for the user to check. Without
+    // a suggestion, monthly is only the default chip, said as such below.
+    val suggestion = if (!sub.frequencyKnown && sub.amountKnown) PlanPrices.suggest(sub.merchantId, sub.amount) else null
+    var frequency by remember { mutableStateOf(if (sub.frequencyKnown) sub.frequency else suggestion?.frequency ?: Frequency.MONTHLY) }
 
     val missing = buildString {
         if (sub.nextRenewal == null) append("Renewal date")
@@ -262,6 +276,13 @@ private fun NeedsInputCard(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 )
                 Text("How often", style = MaterialTheme.typography.labelLarge)
+                if (!sub.frequencyKnown) {
+                    Text(
+                        suggestion?.let { "${formatMoney(sub.amount)} matches ${sub.name} ${it.label} (${it.frequency.label.lowercase()}) — check it's yours." }
+                            ?: "Nothing said how often this is charged. Pick the plan you chose.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     manualFrequencies.forEach { f ->
                         FilterChip(selected = frequency == f, onClick = { frequency = f }, label = { Text(f.label) })
@@ -362,6 +383,8 @@ fun DetailScreen(
     onDelete: () -> Unit,
     plannedCancelDate: LocalDate?,
     onKeepAfterAll: (plannedFor: LocalDate) -> Unit,
+    onPlanLength: (Frequency) -> Unit,
+    onStillActive: () -> Unit,
 ) {
     val uriHandler = LocalUriHandler.current
     Scaffold(
@@ -387,6 +410,29 @@ fun DetailScreen(
                 Text("${sub.category} · about ${formatMoney(sub.monthlyCost)} a month, ${formatMoney(yearly)} a year")
             } else {
                 Text(sub.category)
+            }
+
+            if (sub.status == SubscriptionStatus.ENDING && sub.activeUntil == null) {
+                PlanLengthQuestion(sub, onPlanLength)
+            }
+            sub.missedChargeOn?.takeIf { sub.status == SubscriptionStatus.LAPSED }?.let { missed ->
+                Card(
+                    Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+                ) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Is this still active?", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Its AutoPay was due on ${formatDate(missed)}, but no pre-debit notice and no charge arrived. " +
+                                "It may have stopped, or been replaced by a new plan.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = onMarkCancelled) { Text("It stopped") }
+                            OutlinedButton(onClick = onStillActive) { Text("Still active") }
+                        }
+                    }
+                }
             }
 
             Card(Modifier.fillMaxWidth()) {
@@ -501,6 +547,95 @@ fun DetailScreen(
                 TextButton(onClick = onDelete, Modifier.fillMaxWidth()) { Text("Delete") }
             } else {
                 TextButton(onClick = onHide, Modifier.fillMaxWidth()) { Text("Not a subscription — hide it") }
+            }
+        }
+    }
+}
+
+/**
+ * A cancelled plan that was paid for, but nothing said for how long: the user is the only source
+ * left, and the answer is what dates the end of their access.
+ */
+@Composable
+private fun PlanLengthQuestion(sub: Subscription, onAnswer: (Frequency) -> Unit) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("How long was this plan?", fontWeight = FontWeight.SemiBold)
+            Text(
+                "The AutoPay is cancelled, but your last payment${sub.lastCharged?.let { " on ${formatDate(it)}" } ?: ""} " +
+                    "still covers some time. Tell the app the plan length to see when it ends.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            // Only a suggestion: the user's tap is what is saved.
+            val suggestion = if (sub.amountKnown) PlanPrices.suggest(sub.merchantId, sub.amount) else null
+            val lengths = listOf(Frequency.MONTHLY to "1 month", Frequency.QUARTERLY to "3 months", Frequency.YEARLY to "1 year")
+            if (suggestion != null) {
+                Text(
+                    "${formatMoney(sub.amount)} matches ${sub.name} ${suggestion.label} (${suggestion.frequency.label.lowercase()}). Is that it?",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                lengths.forEach { (f, label) ->
+                    if (f == suggestion?.frequency) Button(onClick = { onAnswer(f) }) { Text(label) }
+                    else OutlinedButton(onClick = { onAnswer(f) }) { Text(label) }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A new AutoPay on Google Play next to an older live one. The bank texts look the same for a plan
+ * change and for a second app, so the user is asked once instead of being shown two charges for
+ * one subscription.
+ */
+@Composable
+private fun ReplacementCard(q: ReplacementQuestion, onReplaces: (ReplacementQuestion) -> Unit, onDifferentApp: (ReplacementQuestion) -> Unit) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val newer = if (q.newer.amountKnown) formatMoney(q.newer.amount) else "a new amount"
+            val older = if (q.older.amountKnown) formatMoney(q.older.amount) else "the older one"
+            Text("New ${q.newer.name} AutoPay of $newer", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Does it replace the $older AutoPay (you changed your plan), or is it a different app?",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onReplaces(q) }) { Text("Replaces it") }
+                OutlinedButton(onClick = { onDifferentApp(q) }) { Text("Different app") }
+            }
+        }
+    }
+}
+
+/**
+ * A bank text said an AutoPay was cancelled but not which, and this is one of the live ones on that
+ * payee. Neither the mandate number, the amount nor a mail could place it, so the user decides.
+ */
+@Composable
+private fun RevocationCard(sub: Subscription, onYes: (Subscription) -> Unit, onNo: (Subscription) -> Unit) {
+    val on = sub.unplacedRevocationOn ?: return
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val price = if (sub.amountKnown) " (${formatMoney(sub.amount)})" else ""
+            Text("Did you cancel ${sub.name}$price?", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Your bank texted on ${formatDate(on)} that an AutoPay was cancelled, but not which one.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onYes(sub) }) { Text("Yes, cancelled") }
+                OutlinedButton(onClick = { onNo(sub) }) { Text("Still active") }
             }
         }
     }

@@ -61,8 +61,11 @@ fun relativeDays(date: LocalDate, today: LocalDate = LocalDate.now()): String =
 fun Subscription.renewalLine(): String {
     val next = nextRenewal
     return when {
+        status == SubscriptionStatus.ENDING -> activeUntil?.let { "Active until ${formatDate(it)} · AutoPay cancelled — won't renew" }
+            ?: "AutoPay cancelled · access end date unknown"
         status == SubscriptionStatus.CANCELLED -> "Cancelled"
-        status == SubscriptionStatus.LAPSED -> "No recent charges — probably ended"
+        status == SubscriptionStatus.LAPSED -> missedChargeOn?.let { "No charge seen on ${formatDate(it)} — probably stopped" }
+            ?: "No recent charges — probably ended"
         next == null && frequency.hasSchedule && needsInput -> "Renewal date unknown — tell the app"
         next == null -> "Charged whenever the merchant bills (no fixed date)"
         status == SubscriptionStatus.TRIAL -> "Trial ends ${relativeDays(next)} · ${formatDate(next)}"

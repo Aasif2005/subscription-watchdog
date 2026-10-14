@@ -28,9 +28,12 @@ fun PaymentEvent.isLikelyDuplicateOf(other: PaymentEvent): Boolean {
             other is PaymentEvent.MandateCreated && startDate == other.startDate &&
                 frequency == other.frequency && sameAmount(amount, other.amount)
 
+        // Two amounts that disagree are two mandates (two Google Play apps revoked the same
+        // morning), not one revocation reported twice. An unstated amount still matches.
         is PaymentEvent.MandateRevoked ->
             other is PaymentEvent.MandateRevoked &&
-                abs(ChronoUnit.DAYS.between(receivedOn, other.receivedOn)) <= REVOKE_WINDOW_DAYS
+                abs(ChronoUnit.DAYS.between(receivedOn, other.receivedOn)) <= REVOKE_WINDOW_DAYS &&
+                (amount == null || other.amount == null || sameAmount(amount, other.amount))
     }
 }
 

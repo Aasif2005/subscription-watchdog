@@ -39,6 +39,9 @@ interface WatchdogDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun setUserFact(fact: UserFactEntity)
 
+    @Query("DELETE FROM user_facts WHERE subscriptionKey = :key")
+    suspend fun clearUserFact(key: String)
+
     @Query("SELECT * FROM user_facts")
     fun userFacts(): Flow<List<UserFactEntity>>
 

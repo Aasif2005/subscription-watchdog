@@ -7,9 +7,14 @@ import androidx.core.content.edit
 import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.core.engine.ReminderAnswer
 import com.aasif.watchdog.core.engine.ReminderState
+import com.aasif.watchdog.core.engine.SourcedEvent
 import com.aasif.watchdog.core.engine.StampedEvent
 import com.aasif.watchdog.core.engine.SubscriptionEngine
 import com.aasif.watchdog.core.engine.isDuplicateOfAny
+import com.aasif.watchdog.core.engine.nameChannelEvents
+import com.aasif.watchdog.core.engine.channelRekeyTarget
+import com.aasif.watchdog.core.engine.stoppedRenewing
+import com.aasif.watchdog.core.engine.withoutEndedChannelPlans
 import com.aasif.watchdog.core.engine.worthKeepingFromSms
 import com.aasif.watchdog.core.gmail.CatchUpCursor
 import com.aasif.watchdog.core.gmail.CatchUpStep
@@ -155,6 +160,7 @@ class WatchdogRepository(
         val (messages, newest) = reader.readSince(since)
         ingest(messages, EventSource.SMS)
         prefs.edit { putLong(KEY_LAST_SCAN, newest) }
+        rekeyChannelEntries()
     }
 
     /**
@@ -171,6 +177,37 @@ class WatchdogRepository(
             remove(KEY_LAST_SCAN)
             putInt(KEY_CLASSIFIER_VERSION, CLASSIFIER_VERSION)
         }
+    }
+
+    /**
+     * Moves names and marks saved under a bare billing-channel key ("googleplay") to the plan they
+     * were meant for, now that each app on a channel is its own plan ("googleplay#1999"). Without
+     * this the "Claude Pro" a user typed would silently stop applying. Runs until it has placed
+     * everything: right after an update the SMS are being read again, and until they are there is
+     * no plan to move a name to.
+     */
+    suspend fun rekeyChannelEntries() {
+        if (prefs.getBoolean(KEY_CHANNEL_REKEYED, false)) return
+        val channels = MerchantCatalog.all.filter { it.sharedBilling }.map { it.id }.toSet()
+        val facts = dao.userFacts().first().filter { it.subscriptionKey in channels }
+        val marks = dao.marks().first().filter { it.subscriptionKey in channels }
+        var placedAll = true
+        if (facts.isNotEmpty() || marks.isNotEmpty()) {
+            val subs = engine.build(namedEvents(dao.events().first()).map { it.second }, LocalDate.now())
+            for (fact in facts) {
+                val target = channelRekeyTarget(fact.subscriptionKey, subs) ?: run { placedAll = false; null } ?: continue
+                if (target == fact.subscriptionKey) continue
+                dao.setUserFact(fact.copy(subscriptionKey = target))
+                dao.clearUserFact(fact.subscriptionKey)
+            }
+            for (mark in marks) {
+                val target = channelRekeyTarget(mark.subscriptionKey, subs) ?: run { placedAll = false; null } ?: continue
+                if (target == mark.subscriptionKey) continue
+                dao.setMark(mark.copy(subscriptionKey = target))
+                dao.clearMark(mark.subscriptionKey)
+            }
+        }
+        if (placedAll) prefs.edit(commit = true) { putBoolean(KEY_CHANNEL_REKEYED, true) }
     }
 
     /** The Profile page's manual escape hatch: re-derive every SMS event now, then scan again. */
@@ -231,6 +268,7 @@ class WatchdogRepository(
             val outcome = syncAccount(account)
             if (outcome.priority > result.priority) result = outcome
         }
+        rekeyChannelEntries()
         return result
     }
 
@@ -299,8 +337,40 @@ class WatchdogRepository(
                 GmailFetch.Failed -> return GmailSyncOutcome.DONE
             }
         }
-        return backfillStep(account, token, now)
+        val history = backfillStep(account, token, now)
+        // Once the history is in, look for "welcome to Premium" mail too: it is what names the
+        // app behind a Google Play AutoPay when no receipt does.
+        return if (history == GmailSyncOutcome.DONE) welcomeStep(account, token, now) else history
     }
+
+    /**
+     * Reads mail from catalogued services saying a plan started, since the last time this ran
+     * (the first run looks back as far as the backfill). Such mail is rare, so one capped read
+     * per run is enough; a throttled one is simply tried again later.
+     */
+    private suspend fun welcomeStep(account: String, token: String, now: Long): GmailSyncOutcome {
+        val cursorKey = key(KEY_GMAIL_WELCOME, account)
+        val after = prefs.getLong(cursorKey, -1L).takeIf { it > 0 }
+            ?: LocalDate.now().minusDays(FIRST_SCAN_DAYS).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val query = GmailQueryBuilder.buildSubscriptionStarted(welcomeSenders, after / 1000)
+        return when (val fetched = fetchMail(account, token, query, MAX_WELCOME_MESSAGES).first) {
+            is GmailFetch.Ok -> {
+                ingest(fetched.messages, EventSource.GMAIL, account)
+                if (fetched.throttled) GmailSyncOutcome.MORE_AFTER_THROTTLE
+                else {
+                    prefs.edit(commit = true) { putLong(cursorKey, now) }
+                    GmailSyncOutcome.DONE
+                }
+            }
+            GmailFetch.RateLimited -> GmailSyncOutcome.RETRY
+            GmailFetch.AuthRevoked -> GmailSyncOutcome.NEEDS_CONSENT
+            GmailFetch.Failed -> GmailSyncOutcome.DONE
+        }
+    }
+
+    /** Every spelling of every subscription service the catalog knows, except billing channels and prepaid telecom. */
+    private val welcomeSenders: List<String> =
+        MerchantCatalog.all.filter { !it.sharedBilling && !it.autopayOnly }.flatMap { it.aliases }
 
     /**
      * One slice of one account's history, newest slice first.
@@ -430,6 +500,7 @@ class WatchdogRepository(
         remove(key(KEY_GMAIL_SLICES, account))
         remove(key(KEY_GMAIL_CATCHUP_BEFORE, account))
         remove(key(KEY_GMAIL_CATCHUP_TARGET, account))
+        remove(key(KEY_GMAIL_WELCOME, account))
     }
 
     /**
@@ -461,21 +532,32 @@ class WatchdogRepository(
         return entities.isNotEmpty()
     }
 
-    /** Where each charge of a merchant was spotted, keyed by [chargeKey]. */
-    suspend fun chargeSources(merchantId: String): Map<String, ChargeSource> =
-        dao.eventsForMerchant(merchantId).mapNotNull { row ->
-            val debit = row.toEvent() as? PaymentEvent.Debit ?: return@mapNotNull null
+    /**
+     * The stored rows behind [sub], paired with the event each one parses to. Read through the
+     * same Gmail-based naming as [subscriptions], since a Google Play bank text that mail
+     * named as Claude is a `claude` event there but still a `googleplay` row on disk.
+     */
+    private suspend fun rowsOf(sub: Subscription): List<Pair<EventEntity, PaymentEvent>> {
+        val own = sub.events.toSet()
+        if (own.isEmpty()) return emptyList()
+        return namedEvents(dao.events().first()).filter { (_, event) -> event in own }
+    }
+
+    /** Where each charge of [sub] was spotted, keyed by [chargeKey]. */
+    suspend fun chargeSources(sub: Subscription): Map<String, ChargeSource> =
+        rowsOf(sub).mapNotNull { (row, event) ->
+            val debit = event as? PaymentEvent.Debit ?: return@mapNotNull null
             chargeKey(debit.date, debit.amount) to ChargeSource(EventSource.label(row.source), row.receivedAtMillis)
         }.toMap()
 
     /**
-     * Everything stored for a merchant, newest first, as the proof the subscription is real. Only
+     * The proof [sub] is real: exactly the texts and mails it was built from, newest first. Only
      * the extracted fields exist (the message text is never kept), but kind, amount, source and
      * the exact arrival time are enough to tell the user which bank text or mail it came from.
+     * Another plan's texts used to appear here too — every Google Play mandate under any app.
      */
-    suspend fun evidence(merchantId: String): List<EvidenceItem> =
-        dao.eventsForMerchant(merchantId).mapNotNull { row ->
-            val event = row.toEvent() ?: return@mapNotNull null
+    suspend fun evidence(sub: Subscription): List<EvidenceItem> =
+        rowsOf(sub).map { (row, event) ->
             val kind = when (event) {
                 is PaymentEvent.MandateCreated -> "AutoPay mandate created"
                 is PaymentEvent.MandateRevoked -> "AutoPay mandate cancelled"
@@ -486,38 +568,29 @@ class WatchdogRepository(
                 is PaymentEvent.MandateCreated -> event.amount
                 is PaymentEvent.PreDebitNotice -> event.amount
                 is PaymentEvent.Debit -> event.amount
-                is PaymentEvent.MandateRevoked -> null
+                is PaymentEvent.MandateRevoked -> event.amount
             }
             EvidenceItem(kind, amount, EventSource.label(row.source), row.receivedAtMillis, event.receivedOn)
         }.sortedWith(compareByDescending<EvidenceItem> { it.date }.thenByDescending { it.atMillis })
 
     /**
-     * A bank text can only name the billing channel ("Google Play"), never the app behind it. Mail
-     * can: a Play receipt for the same amount a day or two earlier or later says which app. When
-     * exactly one mail names it, the bank event is filed under that app instead of the channel, so
-     * the two stop appearing as a mystery "Google Play subscription" next to the real one.
+     * Stored rows as the events the engine works on, with Google Play bank texts filed under the
+     * app that mail names (see [nameChannelEvents]). Pairs each event with its row, in order, so
+     * the detail screen can still say which text or mail it came from.
      */
-    private fun nameChannelEventsFromMail(rows: List<EventEntity>): List<EventEntity> {
-        val channels = MerchantCatalog.all.filter { it.sharedBilling }.map { it.id }.toSet()
-        val mail = rows.filter { it.source.startsWith("gmail:") && it.merchantId !in channels }
-        if (mail.isEmpty()) return rows
-        return rows.map { row ->
-            if (row.merchantId !in channels || row.source.startsWith("gmail:")) return@map row
-            val day = LocalDate.parse(row.receivedOn)
-            val candidates = mail.filter { m ->
-                m.type == row.type && kotlin.math.abs(java.time.temporal.ChronoUnit.DAYS.between(day, LocalDate.parse(m.receivedOn))) <= 1 &&
-                    (row.type != "MANDATE" || (row.amount != null && m.amount != null && BigDecimal(row.amount).compareTo(BigDecimal(m.amount)) == 0))
-            }
-            val named = candidates.map { it.merchantId }.distinct().singleOrNull() ?: return@map row
-            row.copy(merchantId = named, merchantName = candidates.first { it.merchantId == named }.merchantName)
-        }
+    private fun namedEvents(rows: List<EventEntity>): List<Pair<EventEntity, PaymentEvent>> {
+        val parsed = rows.mapNotNull { row -> row.toEvent()?.let { row to it } }
+        val named = nameChannelEvents(parsed.map { (row, event) -> SourcedEvent(event, row.source.startsWith("gmail:")) }, channelIds)
+        return parsed.map { it.first }.zip(named)
     }
+
+    private val channelIds = MerchantCatalog.all.filter { it.sharedBilling }.map { it.id }.toSet()
 
     /** All subscriptions, recomputed whenever events, manual entries, user marks or facts change. */
     fun subscriptions(): Flow<List<Subscription>> =
         combine(dao.events(), dao.manual(), dao.marks(), dao.userFacts()) { events, manual, marks, facts ->
             val today = LocalDate.now()
-            val detected = engine.build(nameChannelEventsFromMail(events).mapNotNull { it.toEvent() }, today)
+            val detected = engine.build(namedEvents(events).map { it.second }, today).withoutEndedChannelPlans()
             val added = manual.map {
                 engine.manual(
                     key = manualKey(it.id), name = it.name, amount = Money(BigDecimal(it.amount)),
@@ -527,11 +600,13 @@ class WatchdogRepository(
             }
             val markByKey = marks.associate { it.subscriptionKey to it.mark }
             val factByKey = facts.filterNot { it.dismissed }.associateBy { it.subscriptionKey }
+            // Facts before marks: "I've cancelled this" needs the period the user stated to know
+            // how long the paid time still runs.
             (detected + added)
-                .filter { markByKey[it.key] != UserMarkEntity.HIDDEN }
-                .map { if (markByKey[it.key] == UserMarkEntity.CANCELLED) it.copy(status = SubscriptionStatus.CANCELLED, nextRenewal = null) else it }
-                .map { sub -> factByKey[sub.key]?.let { applyUserFact(sub, it) } ?: sub }
-                .sortedWith(compareBy<Subscription> { !it.isLive }.thenBy { it.nextRenewal ?: LocalDate.MAX })
+                .filter { markByKey[it.key] != UserMarkEntity.HIDDEN && markByKey[it.key] != UserMarkEntity.REPLACED }
+                .map { sub -> factByKey[sub.key]?.let { applyUserFact(sub, it, today) } ?: sub }
+                .map { if (markByKey[it.key] == UserMarkEntity.CANCELLED) it.stoppedRenewing(today) else it }
+                .sortedWith(compareBy<Subscription> { !it.isInUse }.thenBy { !it.isLive }.thenBy { it.nextRenewal ?: it.activeUntil ?: LocalDate.MAX })
         }
 
     /**
@@ -539,16 +614,25 @@ class WatchdogRepository(
      * a date like a NordVPN renewal, which lives inside that app and nowhere else on the phone,
      * can ever come from.
      */
-    private fun applyUserFact(sub: Subscription, fact: UserFactEntity): Subscription = sub.copy(
-        name = fact.name?.takeIf { it.isNotBlank() } ?: sub.name,
-        amount = fact.amount?.let { Money(BigDecimal(it), fact.currency ?: sub.amount.currency) } ?: sub.amount,
-        amountKnown = sub.amountKnown || fact.amount != null,
-        frequency = fact.frequency?.let(Frequency::valueOf) ?: sub.frequency,
-        frequencyKnown = sub.frequencyKnown || fact.frequency != null,
-        nextRenewal = fact.nextRenewal?.let(LocalDate::parse) ?: sub.nextRenewal,
-        renewalSource = if (fact.nextRenewal != null) RenewalSource.USER_SUPPLIED else sub.renewalSource,
-        confidence = if (fact.nextRenewal != null) Confidence.HIGH else sub.confidence,
-    )
+    private fun applyUserFact(sub: Subscription, fact: UserFactEntity, today: LocalDate): Subscription {
+        val stated = sub.copy(
+            name = fact.name?.takeIf { it.isNotBlank() } ?: sub.name,
+            amount = fact.amount?.let { Money(BigDecimal(it), fact.currency ?: sub.amount.currency) } ?: sub.amount,
+            amountKnown = sub.amountKnown || fact.amount != null,
+            frequency = fact.frequency?.let(Frequency::valueOf) ?: sub.frequency,
+            frequencyKnown = sub.frequencyKnown || fact.frequency != null,
+            nextRenewal = fact.nextRenewal?.let(LocalDate::parse) ?: sub.nextRenewal,
+            renewalSource = if (fact.nextRenewal != null) RenewalSource.USER_SUPPLIED else sub.renewalSource,
+            confidence = if (fact.nextRenewal != null) Confidence.HIGH else sub.confidence,
+        )
+        // A cancelled plan whose period nothing stated: the user's answer is what dates its end.
+        val periodNowKnown = sub.status == SubscriptionStatus.ENDING && sub.activeUntil == null && fact.frequency != null
+        if (periodNowKnown) return stated.stoppedRenewing(today)
+        // "Still active" on a plan whose charge went unseen: the user's next date is the evidence.
+        val confirmedLive = sub.status == SubscriptionStatus.LAPSED && sub.missedChargeOn != null &&
+            fact.nextRenewal?.let { !LocalDate.parse(it).isBefore(today) } == true
+        return if (confirmedLive) stated.copy(status = SubscriptionStatus.ACTIVE, missedChargeOn = null) else stated
+    }
 
     /** Saves what the user typed for a subscription the app couldn't fully work out on its own. */
     suspend fun setUserFact(key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) =
@@ -564,11 +648,40 @@ class WatchdogRepository(
         dao.setUserFact(current.copy(name = name.trim().ifBlank { null }))
     }
 
+    /** "How long was this plan?" for a cancelled plan: only the period, keeping anything else already saved. */
+    suspend fun setPlanLength(key: String, frequency: Frequency) {
+        val current = existingFact(key) ?: UserFactEntity(key, null, null, null, null)
+        dao.setUserFact(current.copy(frequency = frequency.name, dismissed = false))
+    }
+
     private suspend fun existingFact(key: String): UserFactEntity? = dao.userFacts().first().firstOrNull { it.subscriptionKey == key }
 
     suspend fun currentSubscriptions(): List<Subscription> = subscriptions().first()
 
     suspend fun markCancelled(key: String) = dao.setMark(UserMarkEntity(key, UserMarkEntity.CANCELLED))
+
+    /** "Replaces it": the older AutoPay was the same app on a plan the user has since changed. */
+    suspend fun markReplaced(key: String) = dao.setMark(UserMarkEntity(key, UserMarkEntity.REPLACED))
+
+    /** "Different app": do not ask about this pair again. */
+    fun dismissReplacement(olderKey: String, newerKey: String) = prefs.edit(commit = true) {
+        putStringSet(KEY_REPLACE_DISMISSED, replacementDismissals() + "$olderKey|$newerKey")
+    }
+
+    fun replacementDismissals(): Set<String> = prefs.getStringSet(KEY_REPLACE_DISMISSED, null).orEmpty()
+
+    /** "Still active" for a cancellation text nothing could place: do not ask about that text again. */
+    fun dismissRevocationQuestion(key: String, date: LocalDate) = prefs.edit(commit = true) {
+        putStringSet(KEY_REVOKE_DISMISSED, revocationDismissals() + "$key|$date")
+    }
+
+    fun revocationDismissals(): Set<String> = prefs.getStringSet(KEY_REVOKE_DISMISSED, null).orEmpty()
+
+    /** "Still active" on a plan whose stated billing date passed unseen: it renews next on [next]. */
+    suspend fun confirmStillActive(key: String, next: LocalDate) {
+        val current = existingFact(key) ?: UserFactEntity(key, null, null, null, null)
+        dao.setUserFact(current.copy(nextRenewal = next.toString(), dismissed = false))
+    }
 
     /** "Not a subscription": hide it for good. */
     suspend fun hide(key: String) = dao.setMark(UserMarkEntity(key, UserMarkEntity.HIDDEN))
@@ -682,6 +795,7 @@ class WatchdogRepository(
         private const val KEY_GMAIL_SLICES = "gmail_backfill_slices"
         private const val KEY_GMAIL_CATCHUP_BEFORE = "gmail_catchup_before_millis"
         private const val KEY_GMAIL_CATCHUP_TARGET = "gmail_catchup_target_millis"
+        private const val KEY_GMAIL_WELCOME = "gmail_welcome_sync_millis"
         private const val KEY_GMAIL_ENABLED = "gmail_import_enabled"
         private const val KEY_GMAIL_ACCOUNT = "gmail_account_email"
         private const val KEY_GMAIL_ACCOUNTS = "gmail_accounts"
@@ -690,22 +804,29 @@ class WatchdogRepository(
         private const val KEY_CLASSIFIER_VERSION = "classifier_version"
         private const val KEY_SMS_PURGED = "sms_events_purged"
         private const val KEY_GMAIL_CLASSIFIER_VERSION = "gmail_classifier_version"
+        private const val KEY_CHANNEL_REKEYED = "channel_keys_split"
+        private const val KEY_REPLACE_DISMISSED = "replace_question_dismissed"
+        private const val KEY_REVOKE_DISMISSED = "revoke_question_dismissed"
 
         /**
          * 1: Play trial receipts (promo filter, "unless cancelled", merchant, trial dates).
          * 2: per-account cursors, and mail events tagged with the account that received them.
          * 3: the query leaves out the Promotions tab (results should not change; re-reads to time the faster fetch).
+         * 4: revocations keep their amount and stated end of access.
+         * 5: mail keeps the mandate number it states, which ties it to a bank text.
          */
-        private const val GMAIL_CLASSIFIER_VERSION = 3
+        private const val GMAIL_CLASSIFIER_VERSION = 5
 
         /**
          * Bump whenever a change to [com.aasif.watchdog.core.parser.SmsParser] or
          * [com.aasif.watchdog.core.merchant.MerchantCatalog] would classify already-scanned SMS
          * differently — see [reclassifyIfNeeded]. 2: SMS now keeps only what a subscription can be
          * built on ([worthKeepingFromSms]). 3: a mandate re-created after a revocation is kept instead
-         * of dropped as a duplicate of the first.
+         * of dropped as a duplicate of the first. 4: revocations keep their amount (which of several
+         * mandates to one payee ended) and any stated end of access. 5: every mandate text keeps
+         * a hash of the mandate number it carries, which ties a revocation to its mandate.
          */
-        private const val CLASSIFIER_VERSION = 3
+        private const val CLASSIFIER_VERSION = 5
 
         /** Frontier value meaning the whole [FIRST_SCAN_DAYS] window has been covered. */
         private const val BACKFILL_DONE = 0L
@@ -718,6 +839,9 @@ class WatchdogRepository(
 
         /** A capped run is safe to repeat: the duplicate check absorbs whatever it re-reads. */
         private const val MAX_GMAIL_MESSAGES = 500
+
+        /** Plan-started mail is a handful a year per person; this caps the first look-back. */
+        private const val MAX_WELCOME_MESSAGES = 100
 
         /**
          * Gmail's per-minute quota stops a full-format read at roughly a hundred messages, so a

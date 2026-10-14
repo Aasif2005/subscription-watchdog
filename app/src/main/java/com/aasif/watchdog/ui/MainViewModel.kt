@@ -16,7 +16,10 @@ import androidx.lifecycle.viewModelScope
 import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.engine.ReminderAnswer
+import com.aasif.watchdog.core.engine.ReplacementQuestion
 import com.aasif.watchdog.core.engine.pendingQuestions
+import com.aasif.watchdog.core.engine.replacementQuestions
+import com.aasif.watchdog.core.engine.revocationQuestions
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.data.ChargeSource
@@ -97,7 +100,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         private set
 
     init {
-        viewModelScope.launch { repo.purgeSmsIfUnsupported() }
+        viewModelScope.launch {
+            repo.purgeSmsIfUnsupported()
+            repo.rekeyChannelEntries()
+        }
         // Pick up anything that arrived while the app was closed.
         if (hasSmsAccess()) Workers.scanNow(app)
         // An update that changed how mail is read only reaches old mail by re-reading it, so
@@ -209,6 +215,45 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         return repo.plannedCancellations().filter { it.first == key }.maxOfOrNull { it.second }
     }
 
+    /** Newer Google Play AutoPays next to older live ones, minus the pairs already answered. */
+    fun replacementQuestions(subscriptions: List<Subscription>): List<ReplacementQuestion> {
+        answersVersion
+        val dismissed = repo.replacementDismissals()
+        return subscriptions.replacementQuestions().filter { "${it.older.key}|${it.newer.key}" !in dismissed }
+    }
+
+    /** Live Google Play plans next to a cancellation text that could not say which AutoPay it ended. */
+    fun revocationQuestions(subscriptions: List<Subscription>): List<Subscription> {
+        answersVersion
+        val dismissed = repo.revocationDismissals()
+        return subscriptions.revocationQuestions().filter { "${it.key}|${it.unplacedRevocationOn}" !in dismissed }
+    }
+
+    fun revocationWasThisOne(sub: Subscription) {
+        viewModelScope.launch { repo.markCancelled(sub.key) }
+    }
+
+    fun revocationWasNot(sub: Subscription) {
+        val date = sub.unplacedRevocationOn ?: return
+        repo.dismissRevocationQuestion(sub.key, date)
+        answersVersion++
+    }
+
+    fun replacesIt(q: ReplacementQuestion) {
+        viewModelScope.launch { repo.markReplaced(q.older.key) }
+    }
+
+    fun differentApp(q: ReplacementQuestion) {
+        repo.dismissReplacement(q.older.key, q.newer.key)
+        answersVersion++
+    }
+
+    fun confirmStillActive(sub: Subscription) {
+        val missed = sub.missedChargeOn ?: return
+        val next = sub.frequency.nextOnOrAfter(missed, LocalDate.now())
+        viewModelScope.launch { repo.confirmStillActive(sub.key, next) }
+    }
+
     fun keepSubscription(sub: Subscription) = answer(sub) { repo.answerReminder(sub.key, it, ReminderAnswer.KEEP) }
 
     /**
@@ -251,12 +296,12 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         screen = target
     }
 
-    fun loadChargeSources(merchantId: String) {
+    fun loadChargeSources(sub: Subscription) {
         chargeSources = emptyMap()
         evidence = emptyList()
         viewModelScope.launch {
-            chargeSources = repo.chargeSources(merchantId)
-            evidence = repo.evidence(merchantId)
+            chargeSources = repo.chargeSources(sub)
+            evidence = repo.evidence(sub)
         }
     }
 
@@ -306,6 +351,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     /** What the user typed on a "Needs your input" card. Nulls are left as whatever was already known. */
     fun setUserFact(key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) {
         viewModelScope.launch { repo.setUserFact(key, frequency, nextRenewal, amount, currency) }
+    }
+
+    fun setPlanLength(key: String, frequency: Frequency) {
+        viewModelScope.launch { repo.setPlanLength(key, frequency) }
     }
 
     fun nameSubscription(key: String, name: String) {

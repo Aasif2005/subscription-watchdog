@@ -36,10 +36,16 @@ class SmsParser(
     private val endContext = Regex("""(till|until|upto|up\s+to|valid|validity|expir\w*|end)(\s+(date|on|till|upto))?\W*$""")
 
     fun parse(sms: Sms): PaymentEvent? {
+        val event = parseEvent(sms) ?: return null
+        val ref = Extractors.mandateRef(sms.body.replace('\n', ' '), allowBare = !fromEmail)
+        return if (ref == null) event else event.withMandateRef(ref)
+    }
+
+    private fun parseEvent(sms: Sms): PaymentEvent? {
         if (!allowPersonalSenders && phoneNumber.matches(sms.sender.trim())) return null
         val body = sms.body.replace('\n', ' ')
         val received = sms.receivedAt.toLocalDate()
-        if (fromEmail && !readableAsPayment(sms, body)) return null
+        if (fromEmail && !readableAsPayment(sms, body)) return subscriptionStarted(sms, body, received)
         val m = merchant(sms, body)
         if (fromEmail) trialReceipt(m, body, received)?.let { return it }
 
@@ -47,9 +53,41 @@ class SmsParser(
             SmsKind.MANDATE_CREATED -> mandateCreated(m, body, received)
             SmsKind.PRE_DEBIT -> preDebit(m, body, received)
             SmsKind.DEBIT -> debit(m, body, received)
-            SmsKind.MANDATE_REVOKED -> PaymentEvent.MandateRevoked(m.id, m.name, received)
+            SmsKind.MANDATE_REVOKED -> mandateRevoked(m, body, received)
             SmsKind.IRRELEVANT -> null
         }
+    }
+
+    private fun PaymentEvent.withMandateRef(ref: String): PaymentEvent = when (this) {
+        is PaymentEvent.MandateCreated -> copy(mandateRef = ref)
+        is PaymentEvent.PreDebitNotice -> copy(mandateRef = ref)
+        is PaymentEvent.Debit -> copy(mandateRef = ref)
+        is PaymentEvent.MandateRevoked -> copy(mandateRef = ref)
+    }
+
+    /**
+     * "Welcome to Spotify Premium" with no charge in it: worth keeping only when a signed mail
+     * from a service the catalog knows says a paid plan started. It carries the merchant, the day
+     * and any plan length the mail states, and no amount, which is what marks it as an
+     * announcement rather than a payment.
+     */
+    private fun subscriptionStarted(sms: Sms, body: String, received: LocalDate): PaymentEvent.MandateCreated? {
+        if (sms.verifiedDomain == null || !SmsClassifier.isSubscriptionStarted(body)) return null
+        val known = normalizer.findKnownIn(senderIdentity(sms)) ?: return null
+        if (known.sharedBilling) return null
+        val m = normalizer.resolve(known.aliases.first())
+        val duration = Extractors.planDuration(body)
+        return PaymentEvent.MandateCreated(
+            merchantId = m.id,
+            merchantName = m.name,
+            receivedOn = received,
+            amount = null,
+            frequency = Extractors.frequency(body)?.takeIf { it.hasSchedule } ?: duration?.let(Extractors::frequencyOf),
+            startDate = null,
+            validTill = null,
+            receivedAt = sms.receivedAt,
+            fromMail = true,
+        )
     }
 
     /** A free-trial receipt: nothing was charged, but the mail states the day paying begins. */
@@ -65,6 +103,7 @@ class SmsParser(
             startDate = trial.firstCharge,
             validTill = null,
             autoRenews = true,
+            fromMail = true,
         )
     }
 
@@ -90,6 +129,20 @@ class SmsParser(
             startDate = start,
             validTill = validTill,
             autoRenews = Extractors.autoRenews(body),
+            fromMail = fromEmail,
+        )
+    }
+
+    private fun mandateRevoked(m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.MandateRevoked {
+        val amounts = if (fromEmail) Extractors.paidAmounts(body) else Extractors.amounts(body)
+        // Only a date that reads as an end ("until", "valid till", "will end on"), and only a
+        // future one: the day the cancellation happened is not when access stops.
+        val activeUntil = Extractors.dates(body, received)
+            .firstOrNull { endContext.containsMatchIn(it.before) && it.date.isAfter(received) }?.date
+        return PaymentEvent.MandateRevoked(
+            m.id, m.name, received,
+            amount = amounts.firstOrNull { it > TOKEN_AMOUNT } ?: amounts.firstOrNull(),
+            activeUntil = activeUntil,
         )
     }
 

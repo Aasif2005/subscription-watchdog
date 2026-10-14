@@ -30,4 +30,22 @@ object GmailQueryBuilder {
         beforeEpochSeconds?.let { append(" before:").append(it) }
         append(" -in:spam -in:trash -category:promotions")
     }
+
+    private val startedTerms = listOf(
+        "welcome", "subscribed", "\"thanks for subscribing\"", "\"thank you for subscribing\"",
+        "\"membership has started\"", "\"subscription is active\"", "\"plan is active\"",
+    )
+
+    /**
+     * Mail from the services in [senders] saying a plan started ("Welcome to Spotify Premium").
+     * Searched separately because such mail is often filed under Promotions, which [build] leaves
+     * out, and may never say "subscription". Limited to known senders, so the welcome mail of
+     * every newsletter the user ever joined is not downloaded.
+     */
+    fun buildSubscriptionStarted(senders: List<String>, afterEpochSeconds: Long): String = buildString {
+        append('(').append(startedTerms.joinToString(" OR ")).append(')')
+        append(" (").append(senders.distinct().joinToString(" OR ") { "from:$it" }).append(')')
+        append(" after:").append(afterEpochSeconds)
+        append(" -in:spam -in:trash")
+    }
 }

@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [EventEntity::class, ManualSubscriptionEntity::class, UserMarkEntity::class, UserFactEntity::class],
-    version = 4,
+    version = 5,
     exportSchema = false,
 )
 abstract class WatchdogDatabase : RoomDatabase() {
@@ -54,9 +54,16 @@ abstract class WatchdogDatabase : RoomDatabase() {
             }
         }
 
+        /** Ties a revocation to the mandate it ends, by the mandate number's hash. */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE events ADD COLUMN mandateRef TEXT")
+            }
+        }
+
         fun create(context: Context): WatchdogDatabase =
             Room.databaseBuilder(context, WatchdogDatabase::class.java, "watchdog.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                 .build()
     }
 }

@@ -129,6 +129,12 @@ private fun App(vm: MainViewModel = viewModel()) {
             onKeep = vm::keepSubscription,
             onPlanCancel = vm::planCancelOf,
             onSnooze = vm::snoozeSubscription,
+            replacementQuestions = subscriptions?.let(vm::replacementQuestions).orEmpty(),
+            onReplaces = vm::replacesIt,
+            onDifferentApp = vm::differentApp,
+            revocationQuestions = subscriptions?.let(vm::revocationQuestions).orEmpty(),
+            onRevocationYes = vm::revocationWasThisOne,
+            onRevocationNo = vm::revocationWasNot,
             onSaveUserFact = vm::setUserFact,
             onDismissUserFact = vm::dismissUserFact,
             onHide = vm::hide,
@@ -153,7 +159,8 @@ private fun App(vm: MainViewModel = viewModel()) {
                 // Hidden or deleted while open; the list no longer has it.
                 LaunchedEffect(screen.key) { vm.back() }
             } else {
-                LaunchedEffect(sub.merchantId) { vm.loadChargeSources(sub.merchantId) }
+                // Keyed on the events, so new texts arriving while it is open refresh the list.
+                LaunchedEffect(sub.key, sub.events) { vm.loadChargeSources(sub) }
                 DetailScreen(
                     sub = sub,
                     isManual = vm.isManual(sub.key),
@@ -167,6 +174,8 @@ private fun App(vm: MainViewModel = viewModel()) {
                     onDelete = { vm.deleteManual(sub.key) },
                     plannedCancelDate = vm.plannedCancelDate(sub.key),
                     onKeepAfterAll = { planned -> vm.keepAfterAll(sub.key, planned) },
+                    onPlanLength = { vm.setPlanLength(sub.key, it) },
+                    onStillActive = { vm.confirmStillActive(sub) },
                 )
             }
         }

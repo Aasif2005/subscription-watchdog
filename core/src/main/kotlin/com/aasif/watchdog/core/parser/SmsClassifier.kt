@@ -48,6 +48,21 @@ object SmsClassifier {
 
     fun isRecurring(body: String): Boolean = recurringWord.containsMatchIn(body)
 
+    private val startedWord = rx(
+        """\bwelcome\s+to\b|\byou('re|\s+are)\s+(now\s+)?subscribed\b|\bthanks?\s+(you\s+)?for\s+(subscribing|joining|upgrading)\b""" +
+            """|\b(subscription|membership|plan|premium)\s+(is\s+)?(now\s+)?(active|started|has\s+started|has\s+begun)\b|\byour\s+\w+\s+(subscription|membership|plan)\s+has\s+started\b""",
+    )
+    private val paidTierWord = rx("""\b(premium|subscription|membership|plan|pro|plus|super|vip)\b""")
+
+    /**
+     * "Welcome to Spotify Premium", "Your membership has started": a service saying a paid plan
+     * just began. It names the service and often the plan length, but it is not a payment, so it
+     * only ever names or dates a plan that a bank text or receipt already shows (see
+     * `SubscriptionEngine` and `nameChannelEvents`), never creates one by itself.
+     */
+    fun isSubscriptionStarted(body: String): Boolean =
+        startedWord.containsMatchIn(body) && paidTierWord.containsMatchIn(body) && !revokedWord.containsMatchIn(conditionalCancel.replace(body, " "))
+
     /**
      * Whether the text is about money that actually moved, or is about to.
      *

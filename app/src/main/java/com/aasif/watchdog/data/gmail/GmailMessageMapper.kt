@@ -44,7 +44,13 @@ object GmailMessageMapper {
             .filter { it.isNotBlank() }
             .joinToString(" ")
             .take(MAX_BODY_CHARS)
-        if (body.isBlank() || SmsClassifier.isPromotionalMail(body)) return null
+        if (body.isBlank()) return null
+        // "Welcome to Premium" mail is sent as bulk mail, often lands in Promotions and reads like
+        // marketing, yet it is what names the app behind a Google Play charge. It is let through
+        // here and judged by the parser, which keeps it only from a signed, catalogued sender and
+        // never lets it create a subscription on its own.
+        val started = SmsClassifier.isSubscriptionStarted(body)
+        if (!started && SmsClassifier.isPromotionalMail(body)) return null
 
         val labels = message.optJSONArray("labelIds")
         val isBulkMail = bulkMailHeader.matches(header(headers, "Precedence").orEmpty()) ||
@@ -52,8 +58,8 @@ object GmailMessageMapper {
         // Marketing from a genuine merchant is still marketing: Coursera's own promotional mail
         // is signed by coursera.org and would pass a sender check, which is why this is a
         // separate rule from the DKIM one below rather than folded into it.
-        if (labelHas(labels, CATEGORY_PROMOTIONS)) return null
-        if (isBulkMail && !SmsClassifier.hasPaymentEvidence(body)) return null
+        if (!started && labelHas(labels, CATEGORY_PROMOTIONS)) return null
+        if (!started && isBulkMail && !SmsClassifier.hasPaymentEvidence(body)) return null
 
         val verifiedDomain = header(headers, "Authentication-Results")
             ?.takeIf { dkimPass.containsMatchIn(it) }

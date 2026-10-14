@@ -215,8 +215,24 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         ReminderChannel.ensure(applicationContext)
 
         // The user said they would cancel, and a charge landed anyway. Worth saying so once.
+        // The bank's own texts say the AutoPay was cancelled, and money was still taken. Only
+        // recent charges: an old one surfacing after an update is history, not news.
+        for (sub in subscriptions) {
+            val charged = sub.chargedAfterCancel ?: continue
+            if (charged.isBefore(today.minusDays(CHARGE_ALERT_DAYS)) || repo.wasChargeAlerted(sub.key, charged)) continue
+            val price = if (sub.amountKnown) formatMoney(sub.amount) else "A payment"
+            notify(
+                sub.key.hashCode() + 2, "${sub.name} charged after the AutoPay was cancelled",
+                "$price was taken on ${formatDate(charged)} although its AutoPay had been cancelled. Check the mandate in your UPI app and ask ${sub.name} for a refund.",
+                openApp(sub.key.hashCode() + 2),
+            )
+            repo.setChargeAlerted(sub.key, charged)
+        }
+
         for ((key, planned) in repo.plannedCancellations()) {
             val sub = subscriptions.firstOrNull { it.key == key } ?: continue
+            // Already reported above, from the bank's own revocation.
+            if (sub.chargedAfterCancel != null) continue
             if (!chargedDespiteCancelPlan(sub, planned) || repo.wasChargeAlerted(key, planned)) continue
             val price = if (sub.amountKnown) formatMoney(sub.amount) else "A payment"
             notify(
@@ -335,6 +351,7 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
     companion object {
         const val FOLLOW_UP_KEY = "follow_up_key"
+        private const val CHARGE_ALERT_DAYS = 7L
         const val FOLLOW_UP_DATE = "follow_up_date"
         private const val CHANNEL_ID = ReminderChannel.ID
     }

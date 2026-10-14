@@ -113,7 +113,7 @@ class SubscriptionEngineTest {
     }
 
     @Test
-    fun `a revocation on the day of a charge still cancels`() {
+    fun `a revocation on the day of a charge stops the AutoPay, and the paid month runs out`() {
         val subs = engine.build(
             listOf(
                 mandate("netflix", 649, "2026-01-10", "2026-01-10"),
@@ -122,11 +122,13 @@ class SubscriptionEngineTest {
             ),
             today = d("2026-08-25"),
         )
-        assertEquals(SubscriptionStatus.CANCELLED, subs.single().status)
+        assertEquals(SubscriptionStatus.ENDING, subs.single().status)
+        assertEquals(d("2026-09-10"), subs.single().activeUntil)
+        assertNull(subs.single().nextRenewal)
     }
 
     @Test
-    fun `revoked mandate is cancelled and counts as savings`() {
+    fun `revoked mandate stops renewing, stays usable until the paid month ends, and counts as savings`() {
         val subs = engine.build(
             listOf(
                 mandate("netflix", 649, "2026-01-10", "2026-01-10"),
@@ -135,9 +137,19 @@ class SubscriptionEngineTest {
             ),
             today = d("2026-08-25"),
         )
-        assertEquals(SubscriptionStatus.CANCELLED, subs.single().status)
+        assertEquals(SubscriptionStatus.ENDING, subs.single().status)
+        assertEquals(d("2026-09-10"), subs.single().activeUntil)
         assertNull(subs.single().nextRenewal)
         assertEquals(BigDecimal("7788.00"), subs.yearlySavings())
+        // Once the paid month is over it is simply cancelled.
+        assertEquals(SubscriptionStatus.CANCELLED, engine.build(
+            listOf(
+                mandate("netflix", 649, "2026-01-10", "2026-01-10"),
+                debit("netflix", 649, "2026-08-10"),
+                PaymentEvent.MandateRevoked("netflix", "Netflix", d("2026-08-20")),
+            ),
+            today = d("2026-09-11"),
+        ).single().status)
     }
 
     @Test

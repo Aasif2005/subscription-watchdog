@@ -308,6 +308,45 @@ internal object Extractors {
 
     fun hasUmn(body: String): Boolean = umnRegex.containsMatchIn(body)
 
+    // "<hex>@okicici": a UMN printed with its handle.
+    private val umnWithHandle = Regex("""(?<![0-9A-Za-z])([0-9a-f]{20,40})@[a-z]{2,}""", RegexOption.IGNORE_CASE)
+
+    // "UMN: x", "Mandate ID x", "UMRN x", "SI Hub ID x": a number the text itself calls the mandate's.
+    private val labelledRef = Regex(
+        """\b(?:umn|umrn|mandate\s*(?:id|ref(?:erence)?|no\.?|number)|si\s*hub\s*id)\b\W{0,4}([A-Za-z0-9]{12,40})""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    // A UUID with its dashes, as some systems print a mandate number.
+    private val dashedRef = Regex(
+        """(?<![0-9A-Za-z])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9A-Za-z])""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    // IOB and others print the number bare, after the masked account ("A/C No. ##AccNum##.795fe2..."),
+    // sometimes cut short of its 32 characters. Anywhere in the text, but hex only, with both letters
+    // and digits, and never inside a link, so an amount, phone number, account number or transaction
+    // id is not taken for one.
+    private val bareRef = Regex("""(?<![0-9A-Za-z/=?&\-])([0-9a-f]{20,40})(?![0-9A-Za-z])""", RegexOption.IGNORE_CASE)
+
+    /**
+     * The number that ties a mandate's texts together: the one in the text that creates it is the
+     * one in the text that revokes it. Returned as a short hash, so the stored event can be matched
+     * to its mandate without keeping the number, which names the mandate to the bank. Null when the
+     * text carries none.
+     */
+    fun mandateRef(body: String, allowBare: Boolean = true): String? {
+        val raw = umnWithHandle.find(body)?.groupValues?.get(1)
+            ?: labelledRef.find(body)?.groupValues?.get(1)
+            ?: dashedRef.find(body)?.groupValues?.get(1)?.replace("-", "")
+            // A mail's bare hex is mostly a tracking id; only a bank text prints the number unlabelled.
+            ?: bareRef.takeIf { allowBare }?.findAll(body)?.map { it.groupValues[1] }
+                ?.firstOrNull { t -> t.any(Char::isDigit) && t.any(Char::isLetter) }
+            ?: return null
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw.lowercase().toByteArray())
+        return digest.take(8).joinToString("") { "%02x".format(it) }
+    }
+
     /**
      * A payee that is a phone number or a person's handle: money sent to a friend, never a
      * subscription. These are what fill the repeated-amount clusters that look like plans.

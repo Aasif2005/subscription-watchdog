@@ -38,6 +38,8 @@ data class EventEntity(
     val peerToPeer: Boolean = false,
     /** The mail said this plan renews by itself, so its [validTill] is a charge, not just an end. */
     val autoRenews: Boolean = false,
+    /** Short hash of the mandate number in the text, see [PaymentEvent.MandateCreated.mandateRef]. */
+    val mandateRef: String? = null,
 )
 
 @Entity(tableName = "manual_subscriptions")
@@ -59,6 +61,12 @@ data class UserMarkEntity(
     companion object {
         const val CANCELLED = "CANCELLED"
         const val HIDDEN = "HIDDEN"
+
+        /**
+         * The user said a newer AutoPay on the same billing channel replaces this one (a plan
+         * change to the same app), so this is not a second subscription.
+         */
+        const val REPLACED = "REPLACED"
     }
 }
 
@@ -90,22 +98,24 @@ fun PaymentEvent.toEntity(smsKey: String, source: String, receivedAtMillis: Long
     is PaymentEvent.MandateCreated -> EventEntity(
         smsKey, MANDATE, merchantId, merchantName, receivedOn.toString(), amount?.amount?.toPlainString(),
         date = null, frequency = frequency?.name, startDate = startDate?.toString(), validTill = validTill?.toString(), viaMandate = true,
-        source = source, receivedAtMillis = receivedAtMillis, currency = amount?.currency ?: Money.INR, autoRenews = autoRenews,
+        source = source, receivedAtMillis = receivedAtMillis, currency = amount?.currency ?: Money.INR, autoRenews = autoRenews, mandateRef = mandateRef,
     )
     is PaymentEvent.PreDebitNotice -> EventEntity(
         smsKey, PRE_DEBIT, merchantId, merchantName, receivedOn.toString(), amount?.amount?.toPlainString(),
         date = debitDate.toString(), frequency = null, startDate = null, validTill = null, viaMandate = true,
-        source = source, receivedAtMillis = receivedAtMillis, currency = amount?.currency ?: Money.INR,
+        source = source, receivedAtMillis = receivedAtMillis, currency = amount?.currency ?: Money.INR, mandateRef = mandateRef,
     )
     is PaymentEvent.Debit -> EventEntity(
         smsKey, DEBIT, merchantId, merchantName, receivedOn.toString(), amount.amount.toPlainString(),
         date = date.toString(), frequency = null, startDate = null, validTill = null, viaMandate = viaMandate,
-        source = source, receivedAtMillis = receivedAtMillis, currency = amount.currency, peerToPeer = peerToPeer,
+        source = source, receivedAtMillis = receivedAtMillis, currency = amount.currency, peerToPeer = peerToPeer, mandateRef = mandateRef,
     )
+    // The revocation's own end-of-access date is kept in validTill, which a revocation otherwise
+    // has no use for, so no migration was needed to add it.
     is PaymentEvent.MandateRevoked -> EventEntity(
-        smsKey, REVOKED, merchantId, merchantName, receivedOn.toString(), amount = null,
-        date = null, frequency = null, startDate = null, validTill = null, viaMandate = true,
-        source = source, receivedAtMillis = receivedAtMillis,
+        smsKey, REVOKED, merchantId, merchantName, receivedOn.toString(), amount?.amount?.toPlainString(),
+        date = null, frequency = null, startDate = null, validTill = activeUntil?.toString(), viaMandate = true,
+        source = source, receivedAtMillis = receivedAtMillis, currency = amount?.currency ?: Money.INR, mandateRef = mandateRef,
     )
 }
 
@@ -117,10 +127,16 @@ fun EventEntity.toEvent(): PaymentEvent? {
             merchantId, merchantName, received, amt,
             frequency?.let(Frequency::valueOf), startDate?.let(LocalDate::parse), validTill?.let(LocalDate::parse), autoRenews,
             receivedAt = receivedAtMillis.takeIf { it > 0 }?.toLocalDateTime(),
+            // Where it was read is already stored, so no column is needed for it.
+            fromMail = source.startsWith("gmail:"),
+            mandateRef = mandateRef,
         )
-        PRE_DEBIT -> PaymentEvent.PreDebitNotice(merchantId, merchantName, received, amt, LocalDate.parse(date ?: return null))
-        DEBIT -> PaymentEvent.Debit(merchantId, merchantName, received, amt ?: return null, LocalDate.parse(date ?: return null), viaMandate, peerToPeer)
-        REVOKED -> PaymentEvent.MandateRevoked(merchantId, merchantName, received, receivedAtMillis.takeIf { it > 0 }?.toLocalDateTime())
+        PRE_DEBIT -> PaymentEvent.PreDebitNotice(merchantId, merchantName, received, amt, LocalDate.parse(date ?: return null), mandateRef)
+        DEBIT -> PaymentEvent.Debit(merchantId, merchantName, received, amt ?: return null, LocalDate.parse(date ?: return null), viaMandate, peerToPeer, mandateRef)
+        REVOKED -> PaymentEvent.MandateRevoked(
+            merchantId, merchantName, received, receivedAtMillis.takeIf { it > 0 }?.toLocalDateTime(),
+            amount = amt, activeUntil = validTill?.let(LocalDate::parse), mandateRef = mandateRef,
+        )
         else -> null
     }
 }

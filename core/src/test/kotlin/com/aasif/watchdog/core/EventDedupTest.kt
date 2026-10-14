@@ -92,4 +92,14 @@ class EventDedupTest {
         assertFalse(debit().isLikelyDuplicateOf(notice))
         assertFalse(notice.isLikelyDuplicateOf(debit()))
     }
+
+    @Test
+    fun `two revocations of different amounts on one morning are two mandates`() {
+        val a = PaymentEvent.MandateRevoked("googleplay", "Google Play", sep5, amount = money("139"))
+        val b = PaymentEvent.MandateRevoked("googleplay", "Google Play", sep5, amount = money("149"))
+        assertFalse(a.isLikelyDuplicateOf(b))
+        assertTrue(a.isLikelyDuplicateOf(PaymentEvent.MandateRevoked("googleplay", "Google Play", sep5, amount = money("139.00"))))
+        // One side not stating it is still the same revocation reported twice.
+        assertTrue(a.isLikelyDuplicateOf(PaymentEvent.MandateRevoked("googleplay", "Google Play", sep5.plusDays(1))))
+    }
 }
