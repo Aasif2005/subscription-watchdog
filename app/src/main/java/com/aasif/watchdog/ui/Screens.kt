@@ -411,6 +411,10 @@ fun DetailScreen(
             } else {
                 Text(sub.category)
             }
+            sub.changedFrom?.takeIf { sub.isInUse }?.let { before ->
+                val was = listOfNotNull(formatMoney(before.amount), before.frequency?.label).joinToString(" · ")
+                Text("Changed on ${formatDate(before.changedOn)} from $was", style = MaterialTheme.typography.bodyMedium)
+            }
 
             if (sub.status == SubscriptionStatus.ENDING && sub.activeUntil == null) {
                 PlanLengthQuestion(sub, onPlanLength)

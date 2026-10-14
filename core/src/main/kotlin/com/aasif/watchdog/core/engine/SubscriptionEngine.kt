@@ -5,6 +5,7 @@ import com.aasif.watchdog.core.merchant.MerchantCatalog
 import com.aasif.watchdog.core.merchant.NonSubscriptionCatalog
 import com.aasif.watchdog.core.model.Charge
 import com.aasif.watchdog.core.model.Confidence
+import com.aasif.watchdog.core.model.EarlierPlan
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
@@ -242,6 +243,7 @@ class SubscriptionEngine(
             activeUntil = prediction.activeUntil,
             missedChargeOn = prediction.missedOn,
             chargedAfterCancel = chargedAfterCancel(plan),
+            changedFrom = changedFrom(plan),
             unplacedRevocationOn = plan.unplaced.takeIf { prediction.status.let { s -> s == SubscriptionStatus.ACTIVE || s == SubscriptionStatus.TRIAL } }
                 ?.filter { revocation -> plan.mandate?.let { revocation.followsMandate(it) } ?: true }
                 ?.maxOfOrNull { it.receivedOn },
@@ -254,14 +256,55 @@ class SubscriptionEngine(
      * did not agree to.
      */
     private fun chargedAfterCancel(plan: Plan): LocalDate? {
-        val debits = (plan.series?.debits.orEmpty() + plan.mandateDebits).map { it.date }.sorted()
+        val all = plan.series?.debits.orEmpty() + plan.mandateDebits
         for (revocation in plan.revocations) {
+            // The old AutoPay of a plan change must have stopped too, but only a debit of its own
+            // amount says it did not: the new plan's charges are expected.
+            val superseded = supersedes(plan, revocation)
+            val stated = revocation.amount?.let(::bucket)
+            if (superseded && stated == null) continue
+            val debits = all.filter { !superseded || bucket(it.amount) == stated }.map { it.date }.sorted()
             val after = debits.firstOrNull { it.isAfter(revocation.receivedOn) } ?: continue
+            if (superseded) return after
             val resubscribed = plan.mandates.any { !it.receivedOn.isBefore(revocation.receivedOn) && !it.receivedOn.isAfter(after) &&
                 (it.receivedOn != revocation.receivedOn || (it.receivedAt != null && revocation.receivedAt != null && it.receivedAt.isAfter(revocation.receivedAt))) }
             if (!resubscribed) return after
         }
         return null
+    }
+
+    /**
+     * A revocation that provably ends an earlier mandate of this plan and not its newest: the user
+     * changed plan, and the old AutoPay being cancelled — even in a text that arrives after the new
+     * mandate was set up — says nothing against the new one. Proof is the mandate's own number,
+     * else the amount the text states.
+     */
+    private fun supersedes(plan: Plan, r: MandateRevoked): Boolean {
+        val latest = plan.mandate ?: return false
+        val latestAmount = latest.amount?.let(::bucket) ?: return false
+        val earlier = plan.mandates.filter { it !== latest && !it.announcementOnly }
+        // Only a mandate at another amount is a different plan; a bank text and a mail describing
+        // the same mandate share its amount, and the number on the bank's one is the latest's own.
+        val other = earlier.filter { it.amount != null && bucket(it.amount) != latestAmount }
+        if (other.isEmpty()) return false
+        if (r.mandateRef != null) {
+            val own = (earlier - other.toSet()).mapNotNull { it.mandateRef } + listOfNotNull(latest.mandateRef)
+            if (r.mandateRef in own) return false
+            if (other.any { it.mandateRef == r.mandateRef }) return true
+        }
+        val stated = r.amount?.let(::bucket) ?: return false
+        return stated != latestAmount && other.any { bucket(it.amount!!) == stated }
+    }
+
+    /** The AutoPay at another amount that this service's newest one followed, if the texts show one. */
+    private fun changedFrom(plan: Plan): EarlierPlan? {
+        val latest = plan.mandate ?: return null
+        val amount = latest.amount?.let(::bucket) ?: return null
+        val before = plan.mandates.lastOrNull {
+            it !== latest && !it.announcementOnly && !it.receivedOn.isAfter(latest.receivedOn) &&
+                it.amount != null && bucket(it.amount) != amount
+        } ?: return null
+        return EarlierPlan(before.amount!!, before.frequency?.takeIf { it.hasSchedule }, latest.receivedOn)
     }
 
     /**
@@ -321,7 +364,7 @@ class SubscriptionEngine(
         // mandate the order of the two decides it (a plan change or a retried setup sends "revoked"
         // and "created" within minutes); with no times to go on, a same-day pair counts as the
         // mandate replacing the old one. On a charge day, a revocation still cancels.
-        val revoked = plan.revocations.maxWithOrNull(compareBy({ it.receivedOn }, { it.receivedAt }))
+        val revoked = plan.revocations.filterNot { supersedes(plan, it) }.maxWithOrNull(compareBy({ it.receivedOn }, { it.receivedAt }))
         if (revoked != null && revocationEndsPlan(revoked, mandate, lastCharge, lastActivity)) {
             // The AutoPay is off, but what was already paid for still runs to the end of its period.
             val end = paidUntil(revoked, mandate, statedFrequency, lastCharge, known)

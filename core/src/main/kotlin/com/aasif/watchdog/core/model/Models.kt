@@ -167,6 +167,9 @@ enum class SubscriptionStatus {
 
 data class Charge(val date: LocalDate, val amount: Money)
 
+/** The AutoPay a service's plan had before the newest one: what a plan change moved away from. */
+data class EarlierPlan(val amount: Money, val frequency: Frequency?, val changedOn: LocalDate)
+
 data class Subscription(
     /** Stable key: merchant id plus amount bucket, so one merchant can have several plans. */
     val key: String,
@@ -216,6 +219,12 @@ data class Subscription(
      * not ended on a guess; the user is asked.
      */
     val unplacedRevocationOn: LocalDate? = null,
+    /**
+     * Set when this service had an AutoPay at another amount before its newest one (a plan change,
+     * or a price change). Only for a service the texts name; on a billing channel the bank's text
+     * cannot say whether a new amount is the same app, so nothing is linked there.
+     */
+    val changedFrom: EarlierPlan? = null,
 ) {
     val lastCharged: LocalDate? get() = charges.maxOfOrNull { it.date }
     val monthlyCost: Money get() = Money(frequency.monthlyEquivalent(amount.amount), amount.currency)
