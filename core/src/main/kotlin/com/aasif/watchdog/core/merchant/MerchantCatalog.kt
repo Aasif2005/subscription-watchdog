@@ -95,7 +95,7 @@ object MerchantCatalog {
         KnownMerchant("microsoft", "Microsoft 365", CLOUD, listOf("microsoft", "msbill", "office365", "xboxgamepass"), trialDays = 30),
         KnownMerchant("adobe", "Adobe", CLOUD, listOf("adobe"), trialDays = 7),
         KnownMerchant("canva", "Canva Pro", CLOUD, listOf("canva"), trialDays = 30),
-        KnownMerchant("chatgpt", "ChatGPT Plus", CLOUD, listOf("openai", "chatgpt")),
+        KnownMerchant("chatgpt", "ChatGPT", CLOUD, listOf("openai", "chatgpt")),
         KnownMerchant("claude", "Claude", CLOUD, listOf("anthropic", "claudeai")),
         KnownMerchant("linkedin", "LinkedIn Premium", CLOUD, listOf("linkedin"), trialDays = 30),
         KnownMerchant("dropbox", "Dropbox", CLOUD, listOf("dropbox")),

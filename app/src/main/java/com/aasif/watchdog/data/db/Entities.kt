@@ -40,6 +40,8 @@ data class EventEntity(
     val autoRenews: Boolean = false,
     /** Short hash of the mandate number in the text, see [PaymentEvent.MandateCreated.mandateRef]. */
     val mandateRef: String? = null,
+    /** What the service's own receipt calls the plan, see [PaymentEvent.MandateCreated.planName]. */
+    val planName: String? = null,
 )
 
 @Entity(tableName = "manual_subscriptions")
@@ -98,7 +100,7 @@ fun PaymentEvent.toEntity(smsKey: String, source: String, receivedAtMillis: Long
     is PaymentEvent.MandateCreated -> EventEntity(
         smsKey, MANDATE, merchantId, merchantName, receivedOn.toString(), amount?.amount?.toPlainString(),
         date = null, frequency = frequency?.name, startDate = startDate?.toString(), validTill = validTill?.toString(), viaMandate = true,
-        source = source, receivedAtMillis = receivedAtMillis, currency = amount?.currency ?: Money.INR, autoRenews = autoRenews, mandateRef = mandateRef,
+        source = source, receivedAtMillis = receivedAtMillis, currency = amount?.currency ?: Money.INR, autoRenews = autoRenews, mandateRef = mandateRef, planName = planName,
     )
     is PaymentEvent.PreDebitNotice -> EventEntity(
         smsKey, PRE_DEBIT, merchantId, merchantName, receivedOn.toString(), amount?.amount?.toPlainString(),
@@ -130,6 +132,7 @@ fun EventEntity.toEvent(): PaymentEvent? {
             // Where it was read is already stored, so no column is needed for it.
             fromMail = source.startsWith("gmail:"),
             mandateRef = mandateRef,
+            planName = planName,
         )
         PRE_DEBIT -> PaymentEvent.PreDebitNotice(merchantId, merchantName, received, amt, LocalDate.parse(date ?: return null), mandateRef)
         DEBIT -> PaymentEvent.Debit(merchantId, merchantName, received, amt ?: return null, LocalDate.parse(date ?: return null), viaMandate, peerToPeer, mandateRef)

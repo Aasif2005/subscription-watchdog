@@ -401,6 +401,39 @@ internal object Extractors {
     fun orderRef(body: String): String? =
         playOrder.find(body)?.let { shortHash("order:" + it.groupValues[1].uppercase()) }
 
+    // A store receipt's table: "Item Price Premium Standard (Spotify: Music and Podcasts) ₹119.00/month". Play prints
+    // every item as "<the developer's plan title> (<app name>)", so the bracket names the platform and the title is
+    // free text ("Individual Offer", "Premium Career Monthly").
+    private val receiptItem = Regex("""\bItem\s+Price\s+([^()₹$€£\n]{2,60}?)\s*\(([^()]{2,60})\)""", RegexOption.IGNORE_CASE)
+    private val appTail = Regex("""\s*(:|\s-\s|\sby\s).*$""", RegexOption.IGNORE_CASE)
+    private val nameChars = Regex("""[A-Za-z0-9][A-Za-z0-9 &+.\-]*""")
+
+    /** Words that really name a tier of a service; the rest of a plan title is the developer's own wording. */
+    private val tierWords = listOf("Premium", "Pro", "Plus", "Go", "Max", "Ultra", "Super", "Lite", "Family", "Duo", "Student")
+
+    /**
+     * What to call the plan a store receipt is for: the platform the receipt's bracket names, then any real
+     * tier word of its title. "ChatGPT Go (ChatGPT)" is "ChatGPT Go", "Premium Standard (Spotify: Music and
+     * Podcasts)" is "Spotify Premium", "Individual Offer (Apple Music)" is "Apple Music". The bracket only counts
+     * when [isPlatform] agrees it is the service the mail is from; otherwise [catalogName] stands in. Null when
+     * the mail has no item line, so the caller keeps the catalog name.
+     */
+    fun itemName(body: String, catalogName: String, isPlatform: (String) -> Boolean): String? {
+        val match = receiptItem.find(body) ?: return null
+        val title = match.groupValues[1].trim()
+        val app = appTail.replace(match.groupValues[2].trim(), "").trim()
+        val squash = { t: String -> t.lowercase().filter { it.isLetterOrDigit() } }
+        var platform = app.takeIf { it.length in 2..30 && nameChars.matches(it) && isPlatform(it) } ?: catalogName
+        // "Sony LIV" and "Zee 5" are the catalog's "SonyLIV" and "ZEE5": one service, one spelling.
+        if (squash(platform) == squash(catalogName)) platform = catalogName
+        val have = platform.lowercase().split(' ').toSet()
+        val tiers = title.split(Regex("""[\s&+/\-]+""")).mapNotNull { w -> tierWords.firstOrNull { it.equals(w, ignoreCase = true) } }
+            .distinct().filter { it.lowercase() !in have }.take(2)
+        // No tier in the title: "LinkedIn" alone would drop the "Premium" the catalog knows it to be.
+        if (tiers.isEmpty() && catalogName.length > platform.length && catalogName.startsWith("$platform ", ignoreCase = true)) return catalogName
+        return (listOf(platform) + tiers).joinToString(" ")
+    }
+
     /**
      * A payee that is a phone number or a person's handle: money sent to a friend, never a
      * subscription. These are what fill the repeated-amount clusters that look like plans.

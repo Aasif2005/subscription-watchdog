@@ -178,6 +178,7 @@ class SmsParser(
             autoRenews = Extractors.autoRenews(body),
             receivedAt = sms.receivedAt,
             fromMail = true,
+            planName = Extractors.itemName(body, m.name) { normalizer.findKnownIn(it)?.id == m.id },
         )
     }
 
@@ -196,6 +197,7 @@ class SmsParser(
             autoRenews = true,
             receivedAt = sms.receivedAt,
             fromMail = true,
+            planName = Extractors.itemName(body, m.name) { normalizer.findKnownIn(it)?.id == m.id },
         )
     }
 
@@ -213,6 +215,7 @@ class SmsParser(
             validTill = null,
             autoRenews = true,
             fromMail = true,
+            planName = Extractors.itemName(body, m.name) { normalizer.findKnownIn(it)?.id == m.id },
         )
     }
 

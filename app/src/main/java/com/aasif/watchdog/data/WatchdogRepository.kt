@@ -853,7 +853,7 @@ class WatchdogRepository(
          * 13: renewal notices, cancellations and expiries from a service's own mail; the query also searches subjects.
          * 7-10: the signing domain is read from `header.i` when `header.d` is absent (Google's own mail).
          */
-        private const val GMAIL_CLASSIFIER_VERSION = 15
+        private const val GMAIL_CLASSIFIER_VERSION = 18
         private const val AUDIT_PROBE_VERSION = 1
 
         /**

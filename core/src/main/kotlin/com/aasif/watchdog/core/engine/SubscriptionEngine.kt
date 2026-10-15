@@ -53,6 +53,9 @@ class SubscriptionEngine(
     ) {
         val amount: Money? get() = series?.latestAmount ?: mandate?.amount ?: notices.lastOrNull()?.amount
 
+        /** The plan's name as its own receipt states it, newest first; beats the catalog's generic name. */
+        val planName: String? get() = mandates.lastOrNull { it.planName != null }?.planName
+
         /** Exactly what this plan was built from: the "Why this is here" list, and nothing else. */
         val events: List<PaymentEvent>
             get() = series?.debits.orEmpty() + mandateDebits + mandates + notices + revocations
@@ -226,7 +229,7 @@ class SubscriptionEngine(
         return Subscription(
             key = key,
             merchantId = plan.merchantId,
-            name = known?.name ?: plan.merchantName,
+            name = plan.planName ?: known?.name ?: plan.merchantName,
             category = known?.category ?: "Other",
             amount = plan.amount ?: Money(BigDecimal.ZERO),
             frequency = frequency,

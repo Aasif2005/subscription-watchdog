@@ -71,6 +71,8 @@ sealed interface PaymentEvent {
          * way to say which of several mandates to one payee a text is about.
          */
         val mandateRef: String? = null,
+        /** What the service's own receipt calls the plan ("ChatGPT Go"); shown instead of the catalog's name. */
+        val planName: String? = null,
     ) : PaymentEvent {
         /** A "subscription started" mail with no amount: names and dates a plan, never makes one. */
         val announcementOnly: Boolean get() = fromMail && amount == null
