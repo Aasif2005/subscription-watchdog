@@ -79,6 +79,21 @@ internal object Extractors {
 
     private data class FoundAmount(val money: Money, val paid: Boolean, val priceTag: Boolean)
 
+    /**
+     * The amount written right after a label, like "Next payment ₹139.00/month". The label is what
+     * says what the number is, so the price-tag shape that [paidAmounts] rejects is fine here.
+     */
+    fun amountAfter(body: String, label: Regex): Money? =
+        label.findAll(body).firstNotNullOfOrNull { at ->
+            found(body.substring(at.range.last + 1).take(24)).firstOrNull()?.money
+        }
+
+    /** The first date written right after a label, like "Payment date 15 Aug 2026". */
+    fun dateAfter(body: String, label: Regex, received: LocalDate): LocalDate? =
+        label.findAll(body).firstNotNullOfOrNull { at ->
+            dates(body.substring(at.range.last + 1).take(32), received).firstOrNull()?.date
+        }
+
     private fun found(body: String): List<FoundAmount> =
         amountRegex.findAll(body).mapNotNull { m ->
             val before = body.substring(maxOf(0, m.range.first - 40), m.range.first)
@@ -192,6 +207,29 @@ internal object Extractors {
             found(body.substring(m.range.last + 1).take(30)).firstOrNull()?.money
         }
         return TrialTerms(date, price)
+    }
+
+    /** An introductory price that gives way to the real one: [price] per [frequency] from [firstCharge]. */
+    data class IntroTerms(val price: Money, val frequency: Frequency?, val firstCharge: LocalDate)
+
+    private val introThen = Regex(
+        """\bcharged\s+\S{1,15}\s+for\s+\d{1,2}\s+(?:days?|weeks?|months?|years?),?\s+then\b[\s(:,]{0,4}""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val startingOn = Regex("""\bstarting\s+(?:on\s+)?""", RegexOption.IGNORE_CASE)
+
+    /**
+     * "You will be automatically charged ₹99.00 for 2 months, then ₹139.00/month starting on 15 Aug
+     * 2026": what is paid now is the introductory price, and the plan that renews is the second one.
+     * Like [trialTerms], the renewal price is in the shape [paidAmounts] rejects, so it is read here.
+     */
+    fun introTerms(body: String, received: LocalDate): IntroTerms? {
+        val then = introThen.find(body) ?: return null
+        val tail = body.substring(then.range.last + 1).take(70)
+        val price = found(tail).firstOrNull()?.money ?: return null
+        val starts = startingOn.find(tail) ?: return null
+        val date = dates(tail.substring(starts.range.last + 1).take(30), received).firstOrNull()?.date ?: return null
+        return IntroTerms(price, frequency(tail.substring(0, starts.range.first)), date)
     }
 
     // ---- Plan length ------------------------------------------------------------------------
@@ -343,9 +381,25 @@ internal object Extractors {
             ?: bareRef.takeIf { allowBare }?.findAll(body)?.map { it.groupValues[1] }
                 ?.firstOrNull { t -> t.any(Char::isDigit) && t.any(Char::isLetter) }
             ?: return null
-        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw.lowercase().toByteArray())
+        return shortHash(raw.lowercase())
+    }
+
+    private fun shortHash(raw: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
         return digest.take(8).joinToString("") { "%02x".format(it) }
     }
+
+    // "Order number: GPA.1234-5678-9012-34567" (Google One orders start SOP.): a renewal's "..0" suffix is left out, so every charge
+    // of one purchase names the purchase.
+    private val playOrder = Regex("""\border\s*(?:number|id|no\.?)\W{0,3}([A-Z]{3}\.\d{4}-\d{4}-\d{4}-\d{5})""", RegexOption.IGNORE_CASE)
+
+    /**
+     * The store order a mail is about, as a short hash like [mandateRef] (the number itself is never
+     * kept). A store's receipt and its cancellation mail carry the same one, which is what says which
+     * purchase a cancellation ends. Hashed with a prefix, so it can never equal a mandate number.
+     */
+    fun orderRef(body: String): String? =
+        playOrder.find(body)?.let { shortHash("order:" + it.groupValues[1].uppercase()) }
 
     /**
      * A payee that is a phone number or a person's handle: money sent to a friend, never a

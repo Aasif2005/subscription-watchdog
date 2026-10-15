@@ -11,6 +11,9 @@ data class SourcedEvent(val event: PaymentEvent, val fromMail: Boolean)
 /** How far apart a bank text and the mail about the same purchase can arrive. */
 private const val NAMING_WINDOW_DAYS = 1L
 
+/** A store's receipt follows the bank's mandate text within minutes; 30 leaves room for slow mail. */
+private const val LINK_WINDOW_MINUTES = 30L
+
 private const val UNKNOWN_MERCHANT = "u:unknown"
 
 /**
@@ -41,9 +44,29 @@ private fun nameByTime(events: List<SourcedEvent>, channels: Set<String>, mail: 
                 abs(ChronoUnit.DAYS.between(event.receivedOn, m.receivedOn)) <= NAMING_WINDOW_DAYS &&
                 amountsAgree(m, event)
         }
-        val named = candidates.map { it.merchantId }.distinct().singleOrNull() ?: return@map event
+        val named = candidates.map { it.merchantId }.distinct().singleOrNull()
+            ?: nearInTime(event, candidates)
+            ?: return@map event
         event.withMerchant(named, candidates.first { it.merchantId == named }.merchantName)
     }
+}
+
+/**
+ * Two apps at the same price on the same day: the receipt arrives minutes after the mandate it
+ * belongs to, so the one app whose mail is within [LINK_WINDOW_MINUTES] wins. Only a tie-breaker:
+ * time alone never names a text, and with no arrival times nothing is named.
+ */
+private fun nearInTime(event: PaymentEvent, candidates: List<PaymentEvent>): String? {
+    val at = event.arrivedAt() ?: return null
+    return candidates
+        .filter { c -> c.arrivedAt()?.let { abs(java.time.Duration.between(at, it).toMinutes()) <= LINK_WINDOW_MINUTES } == true }
+        .map { it.merchantId }.distinct().singleOrNull()
+}
+
+private fun PaymentEvent.arrivedAt(): java.time.LocalDateTime? = when (this) {
+    is PaymentEvent.MandateCreated -> receivedAt
+    is PaymentEvent.MandateRevoked -> receivedAt
+    else -> null
 }
 
 /**

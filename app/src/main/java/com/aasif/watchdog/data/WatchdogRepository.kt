@@ -41,6 +41,8 @@ import com.aasif.watchdog.data.gmail.GmailApiClient
 import com.aasif.watchdog.data.gmail.GmailAuth
 import com.aasif.watchdog.data.gmail.GmailAuthManager
 import com.aasif.watchdog.data.gmail.GmailFetch
+import com.aasif.watchdog.data.gmail.MailAudit
+import com.aasif.watchdog.data.sms.SmsAudit
 import com.aasif.watchdog.data.sms.SmsReader
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -340,7 +342,15 @@ class WatchdogRepository(
         val history = backfillStep(account, token, now)
         // Once the history is in, look for "welcome to Premium" mail too: it is what names the
         // app behind a Google Play AutoPay when no receipt does.
+        if (BuildConfig.DEBUG && history == GmailSyncOutcome.DONE) auditProbe(account, token)
         return if (history == GmailSyncOutcome.DONE) welcomeStep(account, token, now) else history
+    }
+
+    /** Debug only: once per [AUDIT_PROBE_VERSION], see [MailAudit.probe]. */
+    private suspend fun auditProbe(account: String, token: String) {
+        val probeKey = key("audit_probe_version", account)
+        if (prefs.getInt(probeKey, 0) >= AUDIT_PROBE_VERSION) return
+        if (MailAudit.probe(gmailApi, token)) prefs.edit(commit = true) { putInt(probeKey, AUDIT_PROBE_VERSION) }
     }
 
     /**
@@ -513,20 +523,41 @@ class WatchdogRepository(
         val entities = mutableListOf<EventEntity>()
         val knownByMerchant = mutableMapOf<String, MutableList<StampedEvent>>()
         val sourceParser = if (channel == EventSource.GMAIL) mailParser else parser
+        var unparsed = 0
+        var notWorth = 0
+        var duplicates = 0
         for (sms in messages) {
-            val event = sourceParser.parse(sms) ?: continue
+            val audit = BuildConfig.DEBUG && channel == EventSource.GMAIL
+            val smsAudit = BuildConfig.DEBUG && channel != EventSource.GMAIL
+            val event = sourceParser.parse(sms) ?: run {
+                if (audit) MailAudit.parsed(sms, "parser-null", mailParser.assessMail(sms))
+                if (smsAudit) { unparsed++; SmsAudit.message(sms, channel, "parser-null") }
+                null
+            } ?: continue
             // Payment-app notifications announce every payment ("You paid ... to ..."), exactly as
             // bank SMS does, so they get the same rule. Mail is the exception: a receipt is the point.
-            if (channel != EventSource.GMAIL && !event.worthKeepingFromSms()) continue
+            if (channel != EventSource.GMAIL && !event.worthKeepingFromSms()) {
+                if (smsAudit) { notWorth++; SmsAudit.message(sms, channel, "not-worth-keeping:${event::class.simpleName}") }
+                continue
+            }
             val atMillis = sms.receivedAt.toMillis()
             val known = knownByMerchant.getOrPut(event.merchantId) {
                 dao.eventsForMerchant(event.merchantId)
                     .mapNotNull { row -> row.toEvent()?.let { StampedEvent(it, row.receivedAtMillis) } }
                     .toMutableList()
             }
-            if (event.isDuplicateOfAny(atMillis, known)) continue
+            if (event.isDuplicateOfAny(atMillis, known)) {
+                if (audit) MailAudit.parsed(sms, "duplicate:${event::class.simpleName}", mailParser.assessMail(sms))
+                if (smsAudit) { duplicates++; SmsAudit.message(sms, channel, "duplicate:${event::class.simpleName}") }
+                continue
+            }
+            if (audit) MailAudit.parsed(sms, "stored:${event::class.simpleName}", mailParser.assessMail(sms))
+            if (smsAudit) SmsAudit.message(sms, channel, "stored:${event::class.simpleName}")
             known += StampedEvent(event, atMillis)
             entities += event.toEntity(smsKey(sms), EventSource.of(channel, account?.let { "$it|${sms.sender}" } ?: sms.sender), atMillis)
+        }
+        if (BuildConfig.DEBUG && channel != EventSource.GMAIL) {
+            SmsAudit.summary(channel, messages.size, entities.size, unparsed, notWorth, duplicates)
         }
         if (entities.isNotEmpty()) dao.insertEvents(entities)
         return entities.isNotEmpty()
@@ -814,8 +845,16 @@ class WatchdogRepository(
          * 3: the query leaves out the Promotions tab (results should not change; re-reads to time the faster fetch).
          * 4: revocations keep their amount and stated end of access.
          * 5: mail keeps the mandate number it states, which ties it to a bank text.
+         * 6: Play receipts with an introductory price, Play cancellation mails, and the store order
+         *    number (as a hash) that ties a receipt to its cancellation.
+         * 11-12: re-read to run the debug mail audit (no parsing change).
+         * 15: a store order receipt is a purchase (app, amount, period), not a renewal notice.
+         * 14: a declined payment that warns "will be cancelled", and legal notices, are no longer read as cancellations.
+         * 13: renewal notices, cancellations and expiries from a service's own mail; the query also searches subjects.
+         * 7-10: the signing domain is read from `header.i` when `header.d` is absent (Google's own mail).
          */
-        private const val GMAIL_CLASSIFIER_VERSION = 5
+        private const val GMAIL_CLASSIFIER_VERSION = 15
+        private const val AUDIT_PROBE_VERSION = 1
 
         /**
          * Bump whenever a change to [com.aasif.watchdog.core.parser.SmsParser] or

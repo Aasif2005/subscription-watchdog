@@ -21,11 +21,24 @@ object GmailQueryBuilder {
     )
 
     /**
+     * Words a notice about an existing plan puts in its *subject* ("Your Premium plan has been
+     * cancelled", "Your trial ends soon", "Next payment on 15 Aug"). Matched against the subject only:
+     * a newsletter that merely mentions "trial" in its body would otherwise be downloaded, and the
+     * quota is what limits an import.
+     */
+    private val subjectTerms = listOf(
+        "cancelled", "canceled", "cancellation", "expired", "expiring", "expires", "renew", "renews", "renewal",
+        "trial", "\"will end\"", "\"has ended\"", "\"introductory price\"", "\"next payment\"", "\"payment failed\"",
+        "\"auto-renew\"", "\"plan change\"", "upgraded", "downgraded",
+    )
+
+    /**
      * [beforeEpochSeconds] bounds the newest end of the window. Gmail lists newest first, so the
      * historical backfill walks backwards by moving that bound, one run at a time.
      */
     fun build(afterEpochSeconds: Long, beforeEpochSeconds: Long? = null): String = buildString {
-        append('(').append(terms.joinToString(" OR ")).append(')')
+        append('(').append(terms.joinToString(" OR "))
+        append(" OR subject:(").append(subjectTerms.joinToString(" OR ")).append("))")
         append(" after:").append(afterEpochSeconds)
         beforeEpochSeconds?.let { append(" before:").append(it) }
         append(" -in:spam -in:trash -category:promotions")

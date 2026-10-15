@@ -28,6 +28,8 @@ data class Sms(
      * notifications, which have no equivalent, and for mail with no usable signature.
      */
     val verifiedDomain: String? = null,
+    /** A mail's subject (already inside [body]); templates keep their subject stable, so it says what kind of mail this is. */
+    val subject: String? = null,
 )
 
 /**

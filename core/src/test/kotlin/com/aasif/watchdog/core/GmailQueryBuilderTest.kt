@@ -15,6 +15,13 @@ class GmailQueryBuilderTest {
     }
 
     @Test
+    fun `notices about an existing plan are found by subject, still inside the one OR group`() {
+        assertTrue(query.contains("subject:("), query)
+        for (word in listOf("cancelled", "canceled", "expired", "renews", "trial", "\"next payment\"")) assertTrue(query.contains(word), word)
+        assertTrue(query.indexOf("subject:(") < query.indexOf(") after:"), query)
+    }
+
+    @Test
     fun `the cursor is passed through as an epoch bound`() {
         assertTrue(query.contains("after:1759000000"), query)
     }

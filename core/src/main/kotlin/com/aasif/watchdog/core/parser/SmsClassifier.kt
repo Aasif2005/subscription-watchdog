@@ -27,6 +27,9 @@ object SmsClassifier {
     private val creditWord = rx("""\bcredited\b""")
     private val promoWord = rx("""\b(cashback|offers?|rewards?|coupons?|discount|scratch\s+card|win|refer|invite|hurry|limited\s+time)\b|%\s*off|save\s+up\s+to|\bget\s+(rs\.?|inr|₹)""")
 
+    /** A store receipt's footer, "View the Google Play Refund Policy": a link, not a refund. */
+    private val refundPolicy = rx("""\brefund\s+(policy|policies)\b""")
+
     /** "unless cancelled", "until cancelled": terms of a live plan, not news that it ended. */
     private val conditionalCancel = rx("""\b(unless|until|before|if)\s+(\w+\s+){0,2}(cancell?ed|paused|stopped|terminated|deactivated|deleted)\b""")
 
@@ -39,7 +42,7 @@ object SmsClassifier {
             recurring && revoked -> SmsKind.MANDATE_REVOKED
             recurring && createdWord.containsMatchIn(body) -> SmsKind.MANDATE_CREATED
             preDebitWord.containsMatchIn(body) && (recurring || debit) -> SmsKind.PRE_DEBIT
-            failedWord.containsMatchIn(body) -> SmsKind.IRRELEVANT
+            failedWord.containsMatchIn(refundPolicy.replace(body, " ")) -> SmsKind.IRRELEVANT
             debit -> SmsKind.DEBIT
             creditWord.containsMatchIn(body) -> SmsKind.IRRELEVANT
             else -> SmsKind.IRRELEVANT
@@ -62,6 +65,15 @@ object SmsClassifier {
      */
     fun isSubscriptionStarted(body: String): Boolean =
         startedWord.containsMatchIn(body) && paidTierWord.containsMatchIn(body) && !revokedWord.containsMatchIn(conditionalCancel.replace(body, " "))
+
+    private val playCancelled = rx("""\bsubscription\b[^.]{0,80}?\bon\s+google\s+play\s+has\s+been\s+cancell?ed\b""")
+
+    /**
+     * "Your <app> subscription ... on Google Play has been cancelled", with the order number that
+     * says which purchase. It states no amount; the parser believes it only when Google signed it.
+     */
+    fun isStoreCancellation(body: String): Boolean =
+        playCancelled.containsMatchIn(body) && Extractors.orderRef(body) != null
 
     /**
      * Whether the text is about money that actually moved, or is about to.

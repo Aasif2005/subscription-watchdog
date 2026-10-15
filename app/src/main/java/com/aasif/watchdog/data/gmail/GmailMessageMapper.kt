@@ -1,6 +1,7 @@
 package com.aasif.watchdog.data.gmail
 
 import android.util.Base64
+import com.aasif.watchdog.BuildConfig
 import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.parser.HtmlText
 import com.aasif.watchdog.core.parser.SmsClassifier
@@ -33,24 +34,30 @@ object GmailMessageMapper {
     private val dkimPass = Regex("""dkim=pass""", RegexOption.IGNORE_CASE)
     private val dkimDomain = Regex("""header\.d=([A-Za-z0-9.\-]+)""", RegexOption.IGNORE_CASE)
 
+    /**
+     * Google's own mail is reported as `dkim=pass header.i=@google.com` with no `header.d`, so the
+     * signing identity is the fallback; its domain part is what names the sender.
+     */
+    private val dkimIdentity = Regex("""header\.i=(?:[^@\s;]*@)?([A-Za-z0-9.\-]+)""", RegexOption.IGNORE_CASE)
+
     fun toSms(message: JSONObject): Sms? {
         val payload = message.optJSONObject("payload") ?: return null
         val headers = payload.optJSONArray("headers")
         val from = header(headers, "From") ?: return null
         val receivedAt = message.optString("internalDate").toLongOrNull() ?: return null
 
-        val text = bodyText(payload) ?: return null
+        val text = bodyText(payload) ?: return dropped(from, "no-body", null)
         val body = listOf(header(headers, "Subject").orEmpty(), text)
             .filter { it.isNotBlank() }
             .joinToString(" ")
             .take(MAX_BODY_CHARS)
-        if (body.isBlank()) return null
+        if (body.isBlank()) return dropped(from, "blank", null)
         // "Welcome to Premium" mail is sent as bulk mail, often lands in Promotions and reads like
         // marketing, yet it is what names the app behind a Google Play charge. It is let through
         // here and judged by the parser, which keeps it only from a signed, catalogued sender and
         // never lets it create a subscription on its own.
         val started = SmsClassifier.isSubscriptionStarted(body)
-        if (!started && SmsClassifier.isPromotionalMail(body)) return null
+        if (!started && SmsClassifier.isPromotionalMail(body)) return dropped(from, "promo-words", body, header(headers, "Subject"))
 
         val labels = message.optJSONArray("labelIds")
         val isBulkMail = bulkMailHeader.matches(header(headers, "Precedence").orEmpty()) ||
@@ -58,14 +65,20 @@ object GmailMessageMapper {
         // Marketing from a genuine merchant is still marketing: Coursera's own promotional mail
         // is signed by coursera.org and would pass a sender check, which is why this is a
         // separate rule from the DKIM one below rather than folded into it.
-        if (!started && labelHas(labels, CATEGORY_PROMOTIONS)) return null
-        if (!started && isBulkMail && !SmsClassifier.hasPaymentEvidence(body)) return null
+        if (!started && labelHas(labels, CATEGORY_PROMOTIONS)) return dropped(from, "promotions-label", body, header(headers, "Subject"))
+        if (!started && isBulkMail && !SmsClassifier.hasPaymentEvidence(body)) return dropped(from, "bulk-no-payment", body, header(headers, "Subject"))
 
         val verifiedDomain = header(headers, "Authentication-Results")
             ?.takeIf { dkimPass.containsMatchIn(it) }
-            ?.let { dkimDomain.find(it)?.groupValues?.get(1)?.lowercase() }
+            ?.let { (dkimDomain.find(it) ?: dkimIdentity.find(it))?.groupValues?.get(1)?.lowercase() }
 
-        return Sms(sender = address(from), body = body, receivedAt = receivedAt.toLocalDateTime(), verifiedDomain = verifiedDomain)
+        return Sms(sender = address(from), body = body, receivedAt = receivedAt.toLocalDateTime(), verifiedDomain = verifiedDomain, subject = header(headers, "Subject"))
+    }
+
+    /** Debug builds say why a message was thrown away, see [MailAudit]. */
+    private fun dropped(from: String, reason: String, body: String?, subject: String? = null): Sms? {
+        if (BuildConfig.DEBUG) MailAudit.dropped(from, reason, body, subject)
+        return null
     }
 
     private fun labelHas(labels: JSONArray?, target: String): Boolean {

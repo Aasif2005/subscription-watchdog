@@ -125,6 +125,32 @@ class GmailApiClient {
             )
         }
 
+    /** Message ids matching [query], newest first, or null if Gmail would not answer. Debug audit only. */
+    suspend fun listIds(token: String, query: String, max: Int): List<String>? = withContext(Dispatchers.IO) {
+        val ids = mutableListOf<String>()
+        var pageToken: String? = null
+        do {
+            val url = buildString {
+                append(BASE).append("/messages?maxResults=").append(PAGE_SIZE)
+                append("&q=").append(URLEncoder.encode(query, "UTF-8"))
+                pageToken?.let { append("&pageToken=").append(URLEncoder.encode(it, "UTF-8")) }
+            }
+            val page = (get(url, token) as? Response.Ok)?.body ?: return@withContext null
+            val listed = page.optJSONArray("messages")
+            for (i in 0 until (listed?.length() ?: 0)) {
+                if (ids.size >= max) break
+                listed?.optJSONObject(i)?.optString("id")?.ifBlank { null }?.let(ids::add)
+            }
+            pageToken = page.optString("nextPageToken").ifBlank { null }
+        } while (pageToken != null && ids.size < max)
+        ids
+    }
+
+    /** One message's From and Subject headers and labels, nothing else. Debug audit only. */
+    suspend fun metadata(token: String, id: String): JSONObject? = withContext(Dispatchers.IO) {
+        (get("$BASE/messages/$id?format=metadata&metadataHeaders=From&metadataHeaders=Subject", token) as? Response.Ok)?.body
+    }
+
     /**
      * Tells Google to drop this token's grant, through the token endpoint. (`AuthorizationClient`
      * gained `revokeAccess` in play-services-auth 21.4.0; this predates that.) Disconnecting is

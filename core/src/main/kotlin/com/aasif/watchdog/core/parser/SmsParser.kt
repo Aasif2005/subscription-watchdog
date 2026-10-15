@@ -37,7 +37,10 @@ class SmsParser(
 
     fun parse(sms: Sms): PaymentEvent? {
         val event = parseEvent(sms) ?: return null
-        val ref = Extractors.mandateRef(sms.body.replace('\n', ' '), allowBare = !fromEmail)
+        val text = sms.body.replace('\n', ' ')
+        // A mail with no mandate number may carry the store's order number, which ties a receipt to
+        // the cancellation of the same purchase in the same way.
+        val ref = Extractors.mandateRef(text, allowBare = !fromEmail) ?: if (fromEmail) Extractors.orderRef(text) else null
         return if (ref == null) event else event.withMandateRef(ref)
     }
 
@@ -45,9 +48,24 @@ class SmsParser(
         if (!allowPersonalSenders && phoneNumber.matches(sms.sender.trim())) return null
         val body = sms.body.replace('\n', ' ')
         val received = sms.receivedAt.toLocalDate()
+        if (fromEmail) storeCancellation(sms, body, received)?.let { return it }
+        if (fromEmail) {
+            val assessment = assessMail(sms)
+            // A payment problem or a legal notice must never reach the payment path below, where its
+            // amount and the word "cancelled" would read as a cancellation.
+            if (assessment.kind == MailKind.PAYMENT_ISSUE || assessment.kind == MailKind.ACCOUNT_NOTICE) return null
+            serviceNotice(sms, body, received, assessment)?.let { return it }
+            if (assessment.kind == MailKind.PURCHASE && assessment.verdict == MailVerdict.EVENT) {
+                val m = merchant(sms, body)
+                (trialReceipt(m, body, received) ?: introReceipt(sms, m, body, received) ?: paidReceipt(sms, m, body, received))?.let { return it }
+            }
+        }
         if (fromEmail && !readableAsPayment(sms, body)) return subscriptionStarted(sms, body, received)
         val m = merchant(sms, body)
-        if (fromEmail) trialReceipt(m, body, received)?.let { return it }
+        if (fromEmail) {
+            trialReceipt(m, body, received)?.let { return it }
+            introReceipt(sms, m, body, received)?.let { return it }
+        }
 
         return when (SmsClassifier.classify(body)) {
             SmsKind.MANDATE_CREATED -> mandateCreated(m, body, received)
@@ -85,6 +103,97 @@ class SmsParser(
             frequency = Extractors.frequency(body)?.takeIf { it.hasSchedule } ?: duration?.let(Extractors::frequencyOf),
             startDate = null,
             validTill = null,
+            receivedAt = sms.receivedAt,
+            fromMail = true,
+        )
+    }
+
+    /**
+     * "Your <app> subscription ... on Google Play has been cancelled": the store ending one
+     * purchase. It states no amount, so what makes it usable is the order number it shares with the
+     * purchase's receipt. Only a mail signed by Google is believed, and one with no order number says
+     * nothing about which purchase it ended.
+     */
+    private fun storeCancellation(sms: Sms, body: String, received: LocalDate): PaymentEvent.MandateRevoked? {
+        val domain = sms.verifiedDomain ?: return null
+        if (domain != "google.com" && !domain.endsWith(".google.com")) return null
+        if (!SmsClassifier.isStoreCancellation(body)) return null
+        val app = normalizer.findKnownIn(body.replace(playName, " "))?.let { normalizer.resolve(it.aliases.first()) }
+            ?: MerchantNormalizer.UNKNOWN
+        return PaymentEvent.MandateRevoked(app.id, app.name, received, receivedAt = sms.receivedAt)
+    }
+
+    /** Whether this mail's signature is the named service's own, or Google's for a purchase made through Google Play. */
+    private fun signedByTrustedDomain(domain: String, merchantId: String): Boolean =
+        normalizer.findKnownIn(domain)?.id == merchantId || domain == "google.com" || domain.endsWith(".google.com")
+
+    /**
+     * What a mail is worth, for the parser and for the debug audit: its kind, whether it is believed,
+     * and which facts it states. A mail is believed about a plan only if it names a service the
+     * catalog knows by name (a billing channel's own name says nothing about which app) and was signed
+     * by that service or its store: any domain can sign its own mail.
+     */
+    fun assessMail(sms: Sms): MailAssessment {
+        val body = sms.body.replace('\n', ' ')
+        val received = sms.receivedAt.toLocalDate()
+        val m = merchant(sms, body)
+        val appNamed = m.known != null && !m.known.sharedBilling
+        val trusted = appNamed && sms.verifiedDomain?.let { signedByTrustedDomain(it, m.id) } == true
+        return MailAnalyzer.assess(sms.subject, body, received, appNamed, trusted)
+    }
+
+    /**
+     * Mail a service sends about a plan it already sold: "next payment ₹139, payment date 15 Aug",
+     * "your subscription has been cancelled", "has expired". None of them states a payment, so none
+     * would pass the payment gate; what stands in for that evidence is the sender (see [assessMail])
+     * and the label on each fact. Adverts that reuse the words give nothing.
+     */
+    private fun serviceNotice(sms: Sms, body: String, received: LocalDate, assessment: MailAssessment): PaymentEvent? {
+        if (assessment.verdict != MailVerdict.EVENT) return null
+        val m = merchant(sms, body)
+        return when (assessment.kind) {
+            MailKind.RENEWAL_NOTICE -> MailAnalyzer.renewal(body, received)
+                ?.let { PaymentEvent.PreDebitNotice(m.id, m.name, received, it.amount, it.date) }
+            MailKind.CANCELLED -> PaymentEvent.MandateRevoked(m.id, m.name, received, sms.receivedAt, activeUntil = MailAnalyzer.accessUntil(body, received))
+            MailKind.EXPIRED -> PaymentEvent.MandateRevoked(m.id, m.name, received, sms.receivedAt)
+            else -> null
+        }
+    }
+
+    /**
+     * A store receipt for a plan paid for today: "Total: ₹1,999.00/month", auto-renewing. Its amount and
+     * period are what let the bank's "mandate towards Google Play for Rs.1999.00", minutes earlier, be
+     * named after the app (see `nameChannelEvents`). The renewal it states follows from today + period.
+     */
+    private fun paidReceipt(sms: Sms, m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.MandateCreated? {
+        val amount = MailAnalyzer.purchaseAmount(body) ?: return null
+        return PaymentEvent.MandateCreated(
+            merchantId = m.id,
+            merchantName = m.name,
+            receivedOn = received,
+            amount = amount,
+            frequency = Extractors.frequency(body)?.takeIf { it.hasSchedule },
+            startDate = received,
+            validTill = null,
+            autoRenews = Extractors.autoRenews(body),
+            receivedAt = sms.receivedAt,
+            fromMail = true,
+        )
+    }
+
+    /** A purchase whose first payment is an introductory price: the plan is the price that follows. */
+    private fun introReceipt(sms: Sms, m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.MandateCreated? {
+        val intro = Extractors.introTerms(body, received) ?: return null
+        if (!intro.firstCharge.isAfter(received)) return null
+        return PaymentEvent.MandateCreated(
+            merchantId = m.id,
+            merchantName = m.name,
+            receivedOn = received,
+            amount = intro.price,
+            frequency = intro.frequency,
+            startDate = intro.firstCharge,
+            validTill = null,
+            autoRenews = true,
             receivedAt = sms.receivedAt,
             fromMail = true,
         )
