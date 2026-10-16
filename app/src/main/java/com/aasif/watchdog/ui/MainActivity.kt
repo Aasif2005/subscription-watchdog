@@ -72,7 +72,17 @@ private fun App(vm: MainViewModel = viewModel()) {
     val subscriptions by vm.subscriptions.collectAsStateWithLifecycle()
     // Notification access is granted in system Settings, so re-check whenever the user comes back.
     var hasNotificationAccess by remember { mutableStateOf(vm.hasNotificationAccess()) }
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { hasNotificationAccess = vm.hasNotificationAccess() }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        hasNotificationAccess = vm.hasNotificationAccess()
+        vm.refreshUsage(vm.subscriptions.value)
+    }
+    LaunchedEffect(subscriptions) { vm.refreshUsage(subscriptions) }
+    if (vm.usagePromptDue) {
+        UsageDisclosureDialog(
+            onOpenSettings = { vm.dismissUsagePrompt(); openUsageAccessSettings(context) },
+            onNotNow = vm::dismissUsagePrompt,
+        )
+    }
     // Google's own consent screen; it decides what the user is agreeing to, not us.
     val gmailConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
         vm.onGmailConsentResult(it.data)
@@ -133,6 +143,7 @@ private fun App(vm: MainViewModel = viewModel()) {
             onKeep = vm::keepSubscription,
             onPlanCancel = vm::planCancelOf,
             onSnooze = vm::snoozeSubscription,
+            usageHints = vm.usageHints,
             autopayDue = subscriptions?.let(vm::autopayDue).orEmpty(),
             onAutopayCancelled = vm::alreadyCancelled,
             onAutopayStillActive = vm::autopayStillActive,
@@ -159,6 +170,9 @@ private fun App(vm: MainViewModel = viewModel()) {
             notificationStats = vm.notificationStats,
             onGrantNotificationAccess = { openNotificationAccessSettings(context) },
             onOpenReminderSettings = { openReminderSettings(context) },
+            usageSupported = vm.usageSupported,
+            usageGranted = vm.usageGranted,
+            onUsageOpenSettings = { openUsageAccessSettings(context) },
         )
         is Screen.Detail -> {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }
@@ -193,6 +207,16 @@ private fun App(vm: MainViewModel = viewModel()) {
             }
         }
         Screen.AddManual -> AddManualScreen(onBack = { vm.back() }, onSave = vm::addManual)
+    }
+}
+
+/** Usage access is granted on its own Settings page, not by a dialog. */
+private fun openUsageAccessSettings(context: Context) {
+    val own = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).setData(android.net.Uri.parse("package:${context.packageName}"))
+    try {
+        context.startActivity(own)
+    } catch (_: ActivityNotFoundException) {
+        context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
     }
 }
 

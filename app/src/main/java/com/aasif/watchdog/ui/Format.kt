@@ -2,10 +2,13 @@ package com.aasif.watchdog.ui
 
 import com.aasif.watchdog.core.engine.RenewalDayKind
 import com.aasif.watchdog.core.engine.renewalDayKind
+import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.RenewalSource
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
+import com.aasif.watchdog.core.usage.UsageVerdict
+import com.aasif.watchdog.core.usage.usageHintText
 import java.math.BigDecimal
 import java.text.NumberFormat
 import java.time.Instant
@@ -125,3 +128,20 @@ fun RenewalSource.explanation(): String = when (this) {
     RenewalSource.TRIAL_ESTIMATE -> "Estimated from this service's usual free-trial length"
     RenewalSource.MANUAL -> "Added by you"
 }
+
+/** The word for one billing period, as in "do you want it for next month?". */
+fun Frequency.periodWord(): String = when (this) {
+    Frequency.DAILY -> "day"
+    Frequency.WEEKLY -> "week"
+    Frequency.FORTNIGHTLY -> "fortnight"
+    Frequency.MONTHLY -> "month"
+    Frequency.BIMONTHLY -> "2 months"
+    Frequency.QUARTERLY -> "quarter"
+    Frequency.HALF_YEARLY -> "6 months"
+    Frequency.YEARLY -> "year"
+    Frequency.AS_PRESENTED -> "period"
+}
+
+/** What the screen time since the last renewal says, ready to put after a renewal reminder; null when there is nothing to say. See [usageHintText]. */
+fun Subscription.usageHint(verdict: UsageVerdict): String? =
+    usageHintText(name, frequency.periodWord(), verdict, ::formatDate)

@@ -24,10 +24,12 @@ android {
         create("full") {
             dimension = "distribution"
             buildConfigField("boolean", "SMS_ENABLED", "true")
+            buildConfigField("boolean", "USAGE_ENABLED", "true")
         }
         create("play") {
             dimension = "distribution"
             buildConfigField("boolean", "SMS_ENABLED", "false")
+            buildConfigField("boolean", "USAGE_ENABLED", "false")
         }
     }
 

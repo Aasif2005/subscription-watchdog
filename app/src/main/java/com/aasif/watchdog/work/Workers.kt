@@ -31,6 +31,7 @@ import com.aasif.watchdog.core.engine.EVENING_HOUR
 import com.aasif.watchdog.core.engine.FINAL_STAGE
 import com.aasif.watchdog.core.engine.chargedDespiteCancelPlan
 import com.aasif.watchdog.core.engine.dueForReminder
+import com.aasif.watchdog.core.engine.reminderKeysToWithdraw
 import com.aasif.watchdog.core.engine.evidenceAfterCancelClaim
 import com.aasif.watchdog.core.engine.reminderStage
 import com.aasif.watchdog.core.engine.shouldFollowUp
@@ -44,6 +45,7 @@ import com.aasif.watchdog.ui.MainActivity
 import com.aasif.watchdog.ui.formatDate
 import com.aasif.watchdog.ui.formatMoney
 import com.aasif.watchdog.ui.reminderText
+import com.aasif.watchdog.ui.usageHint
 import java.time.Duration
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -57,6 +59,7 @@ object Workers {
 
     /** The backfill's own continuation, kept off [GMAIL_NOW] so it cannot cancel its own run. */
     private const val GMAIL_MORE = "gmail-more"
+    private const val USAGE_DAILY = "usage-daily"
     private const val REMINDERS = "reminders-daily"
     private const val REMINDERS_EVENING = "reminders-evening"
     private const val REMINDER_HOUR = 9
@@ -92,6 +95,15 @@ object Workers {
                 .setBackoffCriteria(BackoffPolicy.LINEAR, 30, TimeUnit.SECONDS)
                 .build(),
         )
+        // Android keeps daily screen time for about a week, so it is copied out often enough never to lose a day.
+        if (BuildConfig.USAGE_ENABLED) {
+            wm.enqueueUniquePeriodicWork(
+                USAGE_DAILY, ExistingPeriodicWorkPolicy.KEEP,
+                PeriodicWorkRequestBuilder<UsageSnapshotWorker>(1, TimeUnit.DAYS).build(),
+            )
+        } else {
+            wm.cancelUniqueWork(USAGE_DAILY)
+        }
         // Two daily reminder passes. The morning one covers "a few days ahead" and the renewal day;
         // the evening one is when the day-before reminder is allowed out (see EVENING_HOUR), so an
         // early-morning AutoPay debit still has a whole night's warning. Periodic work is not
@@ -206,10 +218,20 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     }
 }
 
+/** Copies the screen time Android is about to forget into the app's own table; a no-op unless usage hints are on. */
+class UsageSnapshotWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        (applicationContext as WatchdogApp).repository.snapshotUsage()
+        return Result.success()
+    }
+}
+
 class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val repo = (applicationContext as WatchdogApp).repository
         repo.purgeSmsIfUnsupported()
+        // Fresh screen time first (a no-op unless the user turned usage hints on), so the reminder below is current.
+        repo.snapshotUsage()
         if (!canNotify()) return Result.success()
         val now = LocalDateTime.now()
         val today = now.toLocalDate()
@@ -263,9 +285,10 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
         postCancelVerifications(repo, subscriptions, now)
 
-        // A reminder still in the tray for something that has since been cancelled would only mislead.
-        for (sub in subscriptions) {
-            if (!sub.isInUse) NotificationManagerCompat.from(applicationContext).cancel(sub.key.hashCode())
+        // A reminder still in the tray that no longer applies would only mislead: the AutoPay was cancelled or has
+        // ended, or the charge went through and the next renewal is a cycle away.
+        for (key in subscriptions.reminderKeysToWithdraw(today, repo.reminderLeadDays)) {
+            NotificationManagerCompat.from(applicationContext).cancel(key.hashCode())
         }
 
         postFollowUp(repo, subscriptions, today)
@@ -275,10 +298,11 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             val date = sub.nextRenewal ?: continue
             if (!shouldRemind(now, date, repo.reminderState(sub.key, date))) continue
             val (title, text) = sub.reminderText(date, now)
-            // The app cannot know whether a subscription is being used, so it asks.
+            // Where the screen time says it was barely used, say so; otherwise the app can only ask.
+            val hint = sub.usageHint(repo.usageVerdictFor(sub, date, today))
             val stage = reminderStage(date, today)
             notify(
-                sub.key.hashCode(), title, "$text Still using it?", openApp(sub.key.hashCode()), actions(sub.key, date, today),
+                sub.key.hashCode(), title, "$text ${hint ?: "Still using it?"}", openApp(sub.key.hashCode()), actions(sub.key, date, today),
                 // Only the last one is watched: it is the one a swipe leaves no time to recover from.
                 onDismiss = if (stage == FINAL_STAGE) dismissIntent(sub.key, date) else null,
             )

@@ -37,6 +37,39 @@ interface WatchdogDao {
     fun marks(): Flow<List<UserMarkEntity>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertUsage(rows: List<AppUsageDayEntity>)
+
+    @Query("SELECT * FROM app_usage_daily WHERE packageName IN (:packages) AND day >= :fromDay")
+    suspend fun usageSince(packages: List<String>, fromDay: String): List<AppUsageDayEntity>
+
+    @Query("DELETE FROM app_usage_daily")
+    suspend fun clearUsage()
+
+    @Query("DELETE FROM app_usage_daily WHERE day < :beforeDay")
+    suspend fun pruneUsage(beforeDay: String)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertSpans(rows: List<AppUsageSpanEntity>)
+
+    @Query("SELECT * FROM app_usage_span WHERE packageName IN (:packages) AND endMillis >= :fromMillis")
+    suspend fun spansSince(packages: List<String>, fromMillis: Long): List<AppUsageSpanEntity>
+
+    @Query("DELETE FROM app_usage_span")
+    suspend fun clearSpans()
+
+    @Query("DELETE FROM app_usage_daily WHERE packageName IN (:packages)")
+    suspend fun clearUsageFor(packages: List<String>)
+
+    @Query("DELETE FROM app_usage_span WHERE packageName IN (:packages)")
+    suspend fun clearSpansFor(packages: List<String>)
+
+    @Query("SELECT DISTINCT packageName FROM app_usage_span")
+    suspend fun spanPackages(): List<String>
+
+    @Query("DELETE FROM app_usage_span WHERE endMillis < :beforeMillis")
+    suspend fun pruneSpans(beforeMillis: Long)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun setUserFact(fact: UserFactEntity)
 
     @Query("DELETE FROM user_facts WHERE subscriptionKey = :key")

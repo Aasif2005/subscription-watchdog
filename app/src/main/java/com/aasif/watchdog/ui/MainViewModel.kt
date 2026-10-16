@@ -20,6 +20,8 @@ import com.aasif.watchdog.core.engine.ReplacementQuestion
 import com.aasif.watchdog.core.engine.pendingQuestions
 import com.aasif.watchdog.core.engine.replacementQuestions
 import com.aasif.watchdog.core.engine.autopayQuestions
+import com.aasif.watchdog.core.engine.dueForReminder
+import com.aasif.watchdog.core.usage.trackedApp
 import com.aasif.watchdog.core.engine.revocationQuestions
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
@@ -245,6 +247,45 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     repo.plannedCancellations().none { it.first == sub.key }
             }
             .map { it.key }.toSet()
+    }
+
+    // ---- Usage hints (full flavor): screen time of a few subscription apps, on this phone only -----------
+
+    val usageSupported: Boolean = BuildConfig.USAGE_ENABLED
+    var usageGranted by mutableStateOf(repo.usageAccessGranted())
+        private set
+
+    /** The one-time explanation is due: usage hints are available, not allowed yet, never explained, and a tracked app is subscribed. */
+    var usagePromptDue by mutableStateOf(false)
+        private set
+
+    /** Subscription key to the sentence about its low use, for the reminders the dashboard is showing. */
+    var usageHints: Map<String, String> by mutableStateOf(emptyMap())
+        private set
+
+    /**
+     * Re-reads the permission (the user may just have come back from Settings), takes the daily snapshot, and works
+     * out the hints. There is no switch: allowing Usage Access in Settings starts collection, revoking it deletes it.
+     */
+    fun refreshUsage(subscriptions: List<Subscription>?) {
+        usageGranted = repo.usageAccessGranted()
+        val subs = subscriptions ?: return
+        usagePromptDue = usageSupported && !usageGranted && !repo.usagePrompted() &&
+            subs.any { it.isInUse && it.trackedApp() != null }
+        viewModelScope.launch {
+            repo.snapshotUsage()
+            val today = LocalDate.now()
+            usageHints = subs.dueForReminder(today, repo.reminderLeadDays).mapNotNull { sub ->
+                val renewal = sub.nextRenewal ?: return@mapNotNull null
+                sub.usageHint(repo.usageVerdictFor(sub, renewal, today))?.let { sub.key to it }
+            }.toMap()
+        }
+    }
+
+    /** Either answer to the one-time explanation: it is not shown again. */
+    fun dismissUsagePrompt() {
+        repo.setUsagePrompted()
+        usagePromptDue = false
     }
 
     fun autopayStillActive(sub: Subscription) {

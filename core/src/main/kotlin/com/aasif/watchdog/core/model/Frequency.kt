@@ -41,6 +41,12 @@ enum class Frequency(
         return if (months > 0) anchor.plusMonths(months * n) else anchor.plusDays(days * n)
     }
 
+    /** The occurrence one period before [date]: where the period that ends on [date] began. */
+    fun previous(date: LocalDate): LocalDate {
+        require(hasSchedule) { "$this has no schedule" }
+        return if (months > 0) date.minusMonths(months.toLong()) else date.minusDays(days.toLong())
+    }
+
     /** First occurrence of the schedule anchored at [anchor] that falls on or after [from]. */
     fun nextOnOrAfter(anchor: LocalDate, from: LocalDate): LocalDate {
         if (!anchor.isBefore(from)) return anchor

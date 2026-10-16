@@ -44,6 +44,27 @@ data class EventEntity(
     val planName: String? = null,
 )
 
+/** Foreground minutes of one tracked app on one finished day, kept because Android only holds about a week. */
+@Entity(tableName = "app_usage_daily", primaryKeys = ["packageName", "day"])
+data class AppUsageDayEntity(
+    val packageName: String,
+    /** ISO date, in the phone's time zone. */
+    val day: String,
+    val foregroundMillis: Long,
+)
+
+/**
+ * Foreground time of one tracked app over a stretch longer than a day, taken once from the weekly, monthly or yearly totals
+ * Android still held when watching began (the part of them no daily bucket covers).
+ */
+@Entity(tableName = "app_usage_span", primaryKeys = ["packageName", "startMillis"])
+data class AppUsageSpanEntity(
+    val packageName: String,
+    val startMillis: Long,
+    val endMillis: Long,
+    val foregroundMillis: Long,
+)
+
 @Entity(tableName = "manual_subscriptions")
 data class ManualSubscriptionEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,

@@ -4,6 +4,7 @@ import com.aasif.watchdog.core.engine.SubscriptionEngine
 import com.aasif.watchdog.core.engine.autopayQuestions
 import com.aasif.watchdog.core.engine.dueForReminder
 import com.aasif.watchdog.core.engine.evidenceAfterCancelClaim
+import com.aasif.watchdog.core.engine.reminderKeysToWithdraw
 import com.aasif.watchdog.core.engine.shouldVerifyCancel
 import com.aasif.watchdog.core.engine.stoppedRenewing
 import com.aasif.watchdog.core.model.Frequency
@@ -161,5 +162,22 @@ class ReminderEligibilityTest {
         assertFalse(shouldVerifyCancel(at(28, 19), renewal, true))
         assertFalse(shouldVerifyCancel(at(27, 20), renewal, false))
         assertFalse(shouldVerifyCancel(at(29, 9), renewal, false))
+    }
+
+    @Test
+    fun `a reminder is withdrawn once the renewal has moved on or the AutoPay ended`() {
+        val gym = MandateCreated("u:gym", "Gym", d(2026, 9, 1), money("500.00"), Frequency.MONTHLY, d(2026, 9, 17), null)
+        val sep = PaymentEvent.Debit("u:gym", "Gym", d(2026, 9, 17), money("500.00"), d(2026, 9, 17), true)
+        val before = engine.build(listOf(gym, sep), d(2026, 10, 15)).single()
+        assertEquals(d(2026, 10, 17), before.nextRenewal)
+        // Due within the window: its reminder stands.
+        assertTrue(listOf(before).reminderKeysToWithdraw(d(2026, 10, 15), 3).isEmpty())
+        // The debit happened: the renewal moved a cycle on, so the old reminder goes.
+        val debited = engine.build(listOf(gym, sep, PaymentEvent.Debit("u:gym", "Gym", d(2026, 10, 17), money("500.00"), d(2026, 10, 17), true)), d(2026, 10, 17)).single()
+        assertEquals(listOf(debited.key), listOf(debited).reminderKeysToWithdraw(d(2026, 10, 17), 3))
+        // The AutoPay was revoked (paid up to a date): no longer due either.
+        val revoked = MandateRevoked("u:gym", "Gym", d(2026, 10, 15), null, amount = money("500.00"), activeUntil = d(2026, 10, 20))
+        val ending = engine.build(listOf(gym, sep, revoked), d(2026, 10, 16)).single()
+        assertEquals(listOf(ending.key), listOf(ending).reminderKeysToWithdraw(d(2026, 10, 16), 3))
     }
 }

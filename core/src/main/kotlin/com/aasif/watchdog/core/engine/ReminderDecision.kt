@@ -68,6 +68,16 @@ fun shouldRemind(now: LocalDateTime, renewal: LocalDate, state: ReminderState): 
 fun shouldVerifyCancel(now: LocalDateTime, claimedRenewal: LocalDate, alreadySent: Boolean): Boolean =
     !alreadySent && now.toLocalDate() == claimedRenewal.minusDays(1) && now.toLocalTime() >= LocalTime.of(EVENING_HOUR, 0)
 
+/**
+ * Subscriptions whose renewal reminder, if one is still on screen, no longer applies: the renewal is no longer
+ * within [leadDays], which is what a debit does (the next renewal moves a cycle on), and it is never "due" once
+ * the AutoPay is cancelled or ended. A reminder the user has answered is taken down by the answer itself.
+ */
+fun List<Subscription>.reminderKeysToWithdraw(today: LocalDate, leadDays: Int): List<String> {
+    val due = dueForReminder(today, leadDays).map { it.key }.toSet()
+    return filter { it.key !in due }.map { it.key }
+}
+
 /** The reminder stage for the day before the renewal. */
 const val DAY_BEFORE_STAGE = 2
 

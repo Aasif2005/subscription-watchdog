@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Only this flavor reads SMS; the `play` flavor declares none of it. -->
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
@@ -8,6 +9,28 @@
     <uses-permission android:name="android.permission.READ_SMS" />
     <!-- Pick up new payment SMS as they arrive. -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
+
+    <!--
+        Screen time of a short, fixed list of subscription apps, to tell the user at renewal time when one was barely
+        used. A special access the user switches on in Settings; read only after they opt in, kept on the device.
+    -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Package visibility for exactly those apps, not the whole app list. -->
+    <queries>
+        <package android:name="com.netflix.mediaclient" />
+        <package android:name="com.amazon.avod.thirdpartyclient" />
+        <package android:name="in.startv.hotstar" />
+        <package android:name="in.startv.hotstar.dplus" />
+        <package android:name="com.sonyliv" />
+        <package android:name="com.graymatrix.did" />
+        <package android:name="com.google.android.youtube" />
+        <package android:name="com.openai.chatgpt" />
+        <package android:name="com.anthropic.claude" />
+        <package android:name="com.linkedin.android" />
+    </queries>
 
     <application>
         <receiver

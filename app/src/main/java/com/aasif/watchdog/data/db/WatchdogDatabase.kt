@@ -8,8 +8,8 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [EventEntity::class, ManualSubscriptionEntity::class, UserMarkEntity::class, UserFactEntity::class],
-    version = 6,
+    entities = [EventEntity::class, ManualSubscriptionEntity::class, UserMarkEntity::class, UserFactEntity::class, AppUsageDayEntity::class, AppUsageSpanEntity::class],
+    version = 8,
     exportSchema = false,
 )
 abstract class WatchdogDatabase : RoomDatabase() {
@@ -68,9 +68,29 @@ abstract class WatchdogDatabase : RoomDatabase() {
             }
         }
 
+        /** Daily screen time of the subscription apps the user chose to watch. */
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS app_usage_daily (packageName TEXT NOT NULL, day TEXT NOT NULL, " +
+                        "foregroundMillis INTEGER NOT NULL, PRIMARY KEY(packageName, day))",
+                )
+            }
+        }
+
+        /** Weekly, monthly and yearly screen time that Android held when watching began. */
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS app_usage_span (packageName TEXT NOT NULL, startMillis INTEGER NOT NULL, " +
+                        "endMillis INTEGER NOT NULL, foregroundMillis INTEGER NOT NULL, PRIMARY KEY(packageName, startMillis))",
+                )
+            }
+        }
+
         fun create(context: Context): WatchdogDatabase =
             Room.databaseBuilder(context, WatchdogDatabase::class.java, "watchdog.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
                 .build()
     }
 }

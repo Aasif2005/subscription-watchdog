@@ -23,6 +23,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -98,6 +99,7 @@ fun DashboardScreen(
     onKeep: (Subscription) -> Unit,
     onPlanCancel: (Subscription) -> Unit,
     onSnooze: (Subscription) -> Unit,
+    usageHints: Map<String, String>,
     autopayDue: Set<String>,
     onAutopayCancelled: (Subscription) -> Unit,
     onAutopayStillActive: (Subscription) -> Unit,
@@ -139,7 +141,7 @@ fun DashboardScreen(
             // First, because this is the point of the app: a charge is coming, and it is not too late.
             // Not "ask:": a renewal that is due and still needs input is in both lists, and a
             // shared key makes LazyColumn throw.
-            items(pendingQuestions, key = { "question:${it.key}" }) { sub -> RenewalQuestionCard(sub, onKeep, onPlanCancel, onSnooze) }
+            items(pendingQuestions, key = { "question:${it.key}" }) { sub -> RenewalQuestionCard(sub, usageHints[sub.key], onKeep, onPlanCancel, onSnooze) }
             items(replacementQuestions, key = { "replace:${it.older.key}|${it.newer.key}" }) { q -> ReplacementCard(q, onReplaces, onDifferentApp) }
             items(revocationQuestions, key = { "revoked:${it.key}" }) { sub -> RevocationCard(sub, onRevocationYes, onRevocationNo) }
             item { SummaryCard(subscriptions) }
@@ -669,10 +671,48 @@ private fun AutopayStrip(sub: Subscription, onCancelled: (Subscription) -> Unit,
     }
 }
 
+/**
+ * Shown once. Allowing Usage Access in Android Settings is the switch, so this only explains what is read and points
+ * there; either answer is final and nothing about usage is shown afterwards unless it matters at renewal time.
+ */
+@Composable
+fun UsageDisclosureDialog(onOpenSettings: () -> Unit, onNotNow: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onNotNow,
+        title = { Text("Tell you when you barely use a subscription?") },
+        text = {
+            Text(
+                "To spot a subscription you hardly use, Watchdog can read how many minutes each day the app of a subscription you " +
+                    "have was open, if it is one of Netflix, YouTube, Prime Video, JioHotstar, SonyLIV, ZEE5, ChatGPT, Claude or LinkedIn, on " +
+                    "this phone, and the older daily, weekly and monthly totals Android still keeps for them. Nothing else on your phone is read and nothing leaves it. It is only used to say, before a renewal, " +
+                    "that you barely used the app. Android calls the switch \"Usage access\": allow it for Watchdog to start, and " +
+                    "turn it off there at any time, which also deletes what was saved.",
+            )
+        },
+        confirmButton = { TextButton(onClick = onOpenSettings) { Text("Open Settings") } },
+        dismissButton = { TextButton(onClick = onNotNow) { Text("Not now") } },
+    )
+}
+
+/** One quiet line in Profile while Usage Access is off; nothing at all once it is allowed. */
+@Composable
+private fun UsageAccessLine(onOpenSettings: () -> Unit) {
+    Card(Modifier.fillMaxWidth().clickable(onClick = onOpenSettings)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Low-use hints are off", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Allow Usage access for Watchdog to be told when a streaming or AI subscription was barely used before it renews.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+}
+
 /** The dashboard's copy of the renewal reminder, so a notification that was ignored is not lost. */
 @Composable
 private fun RenewalQuestionCard(
     sub: Subscription,
+    usageHint: String?,
     onKeep: (Subscription) -> Unit,
     onPlanCancel: (Subscription) -> Unit,
     onSnooze: (Subscription) -> Unit,
@@ -687,7 +727,11 @@ private fun RenewalQuestionCard(
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("$title$price", fontWeight = FontWeight.SemiBold)
-            Text("Still using it? You can still cancel before it is charged.", style = MaterialTheme.typography.bodyMedium)
+            // Screen time says it was barely used: show that instead of the plain question.
+            Text(
+                usageHint?.let { "$it You can still cancel before it is charged." } ?: "Still using it? You can still cancel before it is charged.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { onKeep(sub) }) { Text("Keep") }
                 OutlinedButton(onClick = { onPlanCancel(sub) }) { Text("Cancel") }
@@ -762,6 +806,9 @@ fun ProfileScreen(
     notificationStats: List<NotificationStat>,
     onGrantNotificationAccess: () -> Unit,
     onOpenReminderSettings: () -> Unit,
+    usageSupported: Boolean,
+    usageGranted: Boolean,
+    onUsageOpenSettings: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -775,6 +822,7 @@ fun ProfileScreen(
             Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            if (usageSupported && !usageGranted) UsageAccessLine(onUsageOpenSettings)
             Text("Gmail", style = MaterialTheme.typography.titleMedium)
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

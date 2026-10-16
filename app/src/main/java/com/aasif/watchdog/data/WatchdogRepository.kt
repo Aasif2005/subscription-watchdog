@@ -30,6 +30,17 @@ import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.core.parser.SmsParser
+import com.aasif.watchdog.core.usage.TrackedApps
+import com.aasif.watchdog.core.usage.UsageSpan
+import com.aasif.watchdog.core.usage.UsageVerdict
+import com.aasif.watchdog.core.usage.trackedApp
+import com.aasif.watchdog.core.usage.usageDayLabel
+import com.aasif.watchdog.core.usage.usagePackagesToWatch
+import com.aasif.watchdog.core.usage.usageSpan
+import com.aasif.watchdog.core.usage.usageKeepDays
+import com.aasif.watchdog.core.usage.usageVerdict
+import com.aasif.watchdog.data.db.AppUsageDayEntity
+import com.aasif.watchdog.data.db.AppUsageSpanEntity
 import com.aasif.watchdog.data.db.EventEntity
 import com.aasif.watchdog.data.db.ManualSubscriptionEntity
 import com.aasif.watchdog.data.db.UserFactEntity
@@ -37,6 +48,7 @@ import com.aasif.watchdog.data.db.UserMarkEntity
 import com.aasif.watchdog.data.db.WatchdogDao
 import com.aasif.watchdog.data.db.toEntity
 import com.aasif.watchdog.data.db.toEvent
+import com.aasif.watchdog.data.usage.UsageReader
 import com.aasif.watchdog.data.gmail.GmailApiClient
 import com.aasif.watchdog.data.gmail.GmailAuth
 import com.aasif.watchdog.data.gmail.GmailAuthManager
@@ -48,6 +60,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import java.math.BigDecimal
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -89,6 +102,7 @@ class WatchdogRepository(
     private val prefs: SharedPreferences,
     val gmailAuth: GmailAuthManager,
     private val gmailApi: GmailApiClient,
+    private val usage: UsageReader,
 ) {
     // Debug builds accept SMS from phone numbers so `adb emu sms send` can be used for testing.
     private val parser = SmsParser(allowPersonalSenders = BuildConfig.DEBUG)
@@ -723,6 +737,110 @@ class WatchdogRepository(
     fun wasCancelVerified(key: String, renewal: LocalDate) = prefs.getBoolean("cancel_verified:$key:$renewal", false)
     fun setCancelVerified(key: String, renewal: LocalDate) = prefs.edit(commit = true) { putBoolean("cancel_verified:$key:$renewal", true) }
 
+    // ---- Usage hints: screen time of a few subscription apps, kept on the device ---------------------------
+
+    /** Collection is silent: it runs whenever the user has allowed Usage Access for this app in Android Settings. */
+    fun usageAccessGranted(): Boolean = BuildConfig.USAGE_ENABLED && usage.hasAccess()
+
+    /** The one-time explanation has been shown (and answered either way). */
+    fun usagePrompted(): Boolean = prefs.getBoolean(USAGE_PROMPTED, false)
+
+    fun setUsagePrompted() = prefs.edit(commit = true) { putBoolean(USAGE_PROMPTED, true) }
+
+    /**
+     * Copies the finished days Android still holds into our own table, for the apps of active subscriptions that are installed, however many
+     * days this phone keeps (about 7 to 10). A tracked app absent from a day Android has is a real zero; a day Android no
+     * longer has stays unknown, and so does a day before the app was installed. The first time after access is allowed, the
+     * older weekly, monthly and yearly totals are stored too. With access revoked, everything saved is deleted: revoking is
+     * the off switch.
+     */
+    suspend fun snapshotUsage(today: LocalDate = LocalDate.now(), nowMillis: Long = System.currentTimeMillis()) {
+        if (!BuildConfig.USAGE_ENABLED) return
+        if (!usage.hasAccess()) {
+            dao.clearUsage()
+            dao.clearSpans()
+            prefs.edit(commit = true) { TrackedApps.packages.forEach { remove(USAGE_BACKFILLED + it) } }
+            return
+        }
+        // Rows written before days were labelled by their midpoint used another label; they are not comparable.
+        if (!prefs.getBoolean(USAGE_LABELS_V2, false)) {
+            dao.clearUsage()
+            dao.clearSpans()
+            prefs.edit(commit = true) { putBoolean(USAGE_LABELS_V2, true).remove(USAGE_BACKFILLED_ALL) }
+        }
+        // One flag for all apps used to mark the older totals as taken; carry it over to the apps that have them.
+        if (prefs.getBoolean(USAGE_BACKFILLED_ALL, false)) {
+            val have = dao.spanPackages()
+            prefs.edit(commit = true) {
+                have.forEach { putBoolean(USAGE_BACKFILLED + it, true) }
+                remove(USAGE_BACKFILLED_ALL)
+            }
+        }
+        val subs = currentSubscriptions()
+        // Only apps of subscriptions that are active: nothing is read or kept for the others, and what was kept for a
+        // subscription that is no longer active is deleted (Android still has its recent history if it comes back).
+        val watched = usagePackagesToWatch(subs)
+        val dropped = TrackedApps.packages.filter { it !in watched }
+        if (dropped.isNotEmpty()) {
+            dao.clearUsageFor(dropped)
+            dao.clearSpansFor(dropped)
+            prefs.edit(commit = true) { dropped.forEach { remove(USAGE_BACKFILLED + it) } }
+        }
+        val installed = usage.installedAt(watched)
+        if (installed.isEmpty()) return
+        val zone = ZoneId.systemDefault()
+        val histories = usage.history(installed.keys, nowMillis)
+        // Every finished daily bucket Android still has: a tracked app that is absent from one was not opened that day.
+        val days = histories.flatMap { (pkg, history) ->
+            val installedOn = Instant.ofEpochMilli(installed.getValue(pkg)).atZone(zone).toLocalDate()
+            history.dailies
+                .groupBy({ usageDayLabel(it.startMillis, zone) }, { it.millis })
+                .filterKeys { it.isAfter(installedOn) && !it.isAfter(today) }
+                .map { (day, millis) -> AppUsageDayEntity(pkg, day.toString(), millis.sum()) }
+        }
+        if (days.isNotEmpty()) dao.upsertUsage(days)
+        val keepDays = usageKeepDays(
+            subs.filter { it.trackedApp() != null && it.isLive && it.frequency.hasSchedule }
+                .map { it.frequency.approxDays },
+        )
+        // The older weekly, monthly and yearly totals are taken once per app, when its subscription is first seen active,
+        // because their leftovers move as Android drops buckets. Kept as long as the longest plan could need.
+        val keepFrom = today.minusDays(usageKeepDays(listOf(Frequency.YEARLY.approxDays))).atStartOfDay(zone).toInstant().toEpochMilli()
+        val firstTime = histories.keys.filter { !prefs.getBoolean(USAGE_BACKFILLED + it, false) }
+        if (firstTime.isNotEmpty()) {
+            val spans = firstTime.flatMap { pkg ->
+                histories.getValue(pkg).heads.filter { it.startMillis >= installed.getValue(pkg) && it.endMillis >= keepFrom }
+                    .map { AppUsageSpanEntity(pkg, it.startMillis, it.endMillis, it.millis) }
+            }
+            if (spans.isNotEmpty()) dao.upsertSpans(spans)
+            prefs.edit(commit = true) { firstTime.forEach { putBoolean(USAGE_BACKFILLED + it, true) } }
+        }
+        dao.pruneUsage(today.minusDays(keepDays).toString())
+        dao.pruneSpans(keepFrom)
+    }
+
+    /**
+     * What the screen time since the last renewal says about [sub], for its renewal on [renewal]: finished days, plus the
+     * older stretches taken from Android's weekly and monthly totals. When part of the period was out of Android's reach
+     * the verdict covers what was seen and says so.
+     */
+    suspend fun usageVerdictFor(sub: Subscription, renewal: LocalDate, today: LocalDate = LocalDate.now()): UsageVerdict {
+        val app = sub.trackedApp() ?: return UsageVerdict.NoData
+        if (!usageAccessGranted() || !sub.frequency.hasSchedule) return UsageVerdict.NoData
+        val zone = ZoneId.systemDefault()
+        val previous = sub.frequency.previous(renewal)
+        val lastRenewal = sub.lastCharged?.let { maxOf(it, previous) } ?: previous
+        val days = dao.usageSince(app.packages, lastRenewal.toString())
+            .groupBy { LocalDate.parse(it.day) }
+            .map { (day, rows) -> UsageSpan(day, 1, rows.sumOf { it.foregroundMillis }) }
+        // A stretch may begin a day or two before the renewal, so look a little earlier; the verdict filters exactly.
+        val spans = dao.spansSince(app.packages, lastRenewal.minusDays(2).atStartOfDay(zone).toInstant().toEpochMilli())
+            .groupBy { it.startMillis to it.endMillis }
+            .map { (range, rows) -> usageSpan(range.first, range.second, rows.sumOf { it.foregroundMillis }, zone) }
+        if (days.isEmpty() && spans.isEmpty()) return UsageVerdict.NoData
+        return usageVerdict(days + spans, lastRenewal, today, app.category)
+    }
+
     /** Evidence says the AutoPay lives on after all: undo the user's "cancelled". */
     suspend fun reopenCancelClaim(key: String) {
         dao.clearMark(key)
@@ -923,6 +1041,15 @@ class WatchdogRepository(
          * 13: renewal notices, cancellations and expiries from a service's own mail; the query also searches subjects.
          * 7-10: the signing domain is read from `header.i` when `header.d` is absent (Google's own mail).
          */
+        private const val USAGE_PROMPTED = "usage_prompted"
+        private const val USAGE_LABELS_V2 = "usage_labels_v2"
+        private const val USAGE_BACKFILLED_ALL = "usage_backfilled"
+        private const val USAGE_BACKFILLED = "usage_backfilled:"
+
+        /**
+         * Days back from today that Android is sure to still hold: it documents seven daily buckets, and a bucket that starts
+         * in the evening is nearly a day older than its label suggests.
+         */
         private const val CANCEL_CLAIM = "cancel_claim:"
         private const val CANCEL_RENEWAL = "cancel_renewal:"
         private const val AUTOPAY_ANSWER = "autopay_answer:"
@@ -971,7 +1098,7 @@ class WatchdogRepository(
 
         fun create(context: Context, dao: WatchdogDao) = WatchdogRepository(
             dao, SmsReader(context), context.getSharedPreferences("watchdog", Context.MODE_PRIVATE),
-            GmailAuthManager(context.applicationContext), GmailApiClient(),
+            GmailAuthManager(context.applicationContext), GmailApiClient(), UsageReader(context),
         )
     }
 }
