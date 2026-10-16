@@ -19,6 +19,7 @@ import com.aasif.watchdog.core.engine.ReminderAnswer
 import com.aasif.watchdog.core.engine.ReplacementQuestion
 import com.aasif.watchdog.core.engine.pendingQuestions
 import com.aasif.watchdog.core.engine.replacementQuestions
+import com.aasif.watchdog.core.engine.autopayQuestions
 import com.aasif.watchdog.core.engine.revocationQuestions
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
@@ -223,6 +224,37 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     /** Live Google Play plans next to a cancellation text that could not say which AutoPay it ended. */
+    /** The Detail screen asks "have you cancelled the AutoPay?" at any time while it is unanswered for this renewal. */
+    fun autopayAsk(sub: Subscription): Boolean {
+        answersVersion
+        return listOf(sub).autopayQuestions(LocalDate.now(), repo::autopayAnswered).isNotEmpty() &&
+            repo.plannedCancellations().none { it.first == sub.key }
+    }
+
+    /**
+     * Subscriptions to ask the same question about on the dashboard, as the fallback for an unanswered one: renewing
+     * within the reminder window, and not already being cancelled through the guide.
+     */
+    fun autopayDue(subscriptions: List<Subscription>): Set<String> {
+        answersVersion
+        val today = LocalDate.now()
+        val lead = repo.reminderLeadDays.toLong()
+        return subscriptions.autopayQuestions(today, repo::autopayAnswered)
+            .filter { sub ->
+                sub.nextRenewal?.let { java.time.temporal.ChronoUnit.DAYS.between(today, it) in 0..lead } == true &&
+                    repo.plannedCancellations().none { it.first == sub.key }
+            }
+            .map { it.key }.toSet()
+    }
+
+    fun autopayStillActive(sub: Subscription) {
+        sub.nextRenewal?.let { repo.setAutopayStillActive(sub.key, it) }
+        answersVersion++
+    }
+
+    /** The user, not the bank or the service, said this was cancelled. */
+    fun userCancelled(key: String): Boolean { answersVersion; return key in repo.cancelClaims() }
+
     fun revocationQuestions(subscriptions: List<Subscription>): List<Subscription> {
         answersVersion
         val dismissed = repo.revocationDismissals()
@@ -265,6 +297,14 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         repo.answerReminder(key, plannedFor, ReminderAnswer.KEEP)
         answersVersion++
     }
+
+    /** "Already cancelled the AutoPay": no more reminders; undone by itself if a charge notice follows. */
+    fun alreadyCancelled(sub: Subscription) {
+        viewModelScope.launch { repo.markCancelled(sub.key) }
+        NotificationManagerCompat.from(app).cancel(sub.key.hashCode())
+        answersVersion++
+    }
+
     fun snoozeSubscription(sub: Subscription) = answer(sub) { repo.snoozeReminder(sub.key, it, LocalDate.now().plusDays(1)) }
 
     fun planCancelOf(sub: Subscription) {

@@ -235,6 +235,9 @@ data class Subscription(
     /** Will be charged again: what reminders, totals and "renews on" are about. */
     val isLive: Boolean get() = status == SubscriptionStatus.ACTIVE || status == SubscriptionStatus.TRIAL
 
+    /** Gets renewal reminders: AutoPay not cancelled, and a date to remind about. */
+    val remindable: Boolean get() = isLive && nextRenewal != null
+
     /** Still usable today, including a cancelled plan whose paid period has not run out. */
     val isInUse: Boolean get() = isLive || status == SubscriptionStatus.ENDING
 

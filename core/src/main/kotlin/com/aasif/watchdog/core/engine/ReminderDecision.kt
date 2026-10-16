@@ -1,5 +1,6 @@
 package com.aasif.watchdog.core.engine
 
+import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.Subscription
 import java.time.Duration
 import java.time.LocalDate
@@ -57,6 +58,15 @@ fun shouldRemind(now: LocalDateTime, renewal: LocalDate, state: ReminderState): 
         (state.snoozedUntil == null || !today.isBefore(state.snoozedUntil)) &&
         (state.lastStage == null || stage > state.lastStage)
 }
+
+/**
+ * Whether to nudge "verify that you have cancelled the AutoPay": the user said it was cancelled for [claimedRenewal],
+ * and now it is the evening before that renewal. The last useful moment, since the bank's pre-debit notice comes a
+ * day ahead and a mandate can be revoked until the debit. Once per renewal; later in the evening still counts, but
+ * not once the renewal day has begun.
+ */
+fun shouldVerifyCancel(now: LocalDateTime, claimedRenewal: LocalDate, alreadySent: Boolean): Boolean =
+    !alreadySent && now.toLocalDate() == claimedRenewal.minusDays(1) && now.toLocalTime() >= LocalTime.of(EVENING_HOUR, 0)
 
 /** The reminder stage for the day before the renewal. */
 const val DAY_BEFORE_STAGE = 2
@@ -121,3 +131,17 @@ fun List<Subscription>.pendingQuestions(
     stateOf: (Subscription, LocalDate) -> ReminderState,
 ): List<Subscription> =
     dueForReminder(today, leadDays).filter { sub -> sub.nextRenewal?.let { isAwaitingAnswer(today, stateOf(sub, it)) } == true }
+
+/**
+ * The user said this was cancelled, yet a pre-debit notice came in after that day, or a debit is dated after
+ * it: the AutoPay may still be live. Returns the first such date. Strictly after, so a charge already in
+ * flight on the day of the answer is not read as contradicting it.
+ */
+fun Subscription.evidenceAfterCancelClaim(claimedOn: LocalDate): LocalDate? =
+    events.mapNotNull { event ->
+        when (event) {
+            is PaymentEvent.PreDebitNotice -> event.receivedOn
+            is PaymentEvent.Debit -> event.date
+            else -> null
+        }
+    }.filter { it.isAfter(claimedOn) }.minOrNull()

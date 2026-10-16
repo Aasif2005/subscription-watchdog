@@ -689,7 +689,73 @@ class WatchdogRepository(
 
     suspend fun currentSubscriptions(): List<Subscription> = subscriptions().first()
 
-    suspend fun markCancelled(key: String) = dao.setMark(UserMarkEntity(key, UserMarkEntity.CANCELLED))
+    /**
+     * The user says the AutoPay is cancelled: no more reminders. The day is kept so that a charge notice or
+     * charge arriving after it can be told apart from one before, see [cancelClaims].
+     */
+    suspend fun markCancelled(key: String) {
+        // Read before the mark: a cancelled subscription no longer predicts a renewal.
+        val renewal = currentSubscriptions().firstOrNull { it.key == key }?.takeIf { it.isLive }?.nextRenewal
+        prefs.edit(commit = true) {
+            putString("$CANCEL_CLAIM$key", LocalDate.now().toString())
+            putString("$AUTOPAY_ANSWER$key", AUTOPAY_CANCELLED)
+            if (renewal != null) putString("$CANCEL_RENEWAL$key", renewal.toString()) else remove("$CANCEL_RENEWAL$key")
+        }
+        dao.setMark(UserMarkEntity(key, UserMarkEntity.CANCELLED))
+    }
+
+    /** Subscriptions the user called cancelled, with the day they said so. */
+    fun cancelClaims(): Map<String, LocalDate> =
+        prefs.all.mapNotNull { (k, v) ->
+            if (!k.startsWith(CANCEL_CLAIM)) return@mapNotNull null
+            val day = (v as? String)?.let { runCatching { LocalDate.parse(it) }.getOrNull() } ?: return@mapNotNull null
+            k.removePrefix(CANCEL_CLAIM) to day
+        }.toMap()
+
+    /** The renewal each "AutoPay cancelled" answer was given for, to verify the evening before it. */
+    fun cancelRenewals(): Map<String, LocalDate> =
+        prefs.all.mapNotNull { (k, v) ->
+            if (!k.startsWith(CANCEL_RENEWAL)) return@mapNotNull null
+            val day = (v as? String)?.let { runCatching { LocalDate.parse(it) }.getOrNull() } ?: return@mapNotNull null
+            k.removePrefix(CANCEL_RENEWAL) to day
+        }.toMap()
+
+    fun wasCancelVerified(key: String, renewal: LocalDate) = prefs.getBoolean("cancel_verified:$key:$renewal", false)
+    fun setCancelVerified(key: String, renewal: LocalDate) = prefs.edit(commit = true) { putBoolean("cancel_verified:$key:$renewal", true) }
+
+    /** Evidence says the AutoPay lives on after all: undo the user's "cancelled". */
+    suspend fun reopenCancelClaim(key: String) {
+        dao.clearMark(key)
+        prefs.edit(commit = true) { remove("$CANCEL_CLAIM$key") }
+        clearAutopayAnswers(key)
+    }
+
+    /** "No, still active" to "have you cancelled the AutoPay?": for this renewal only, it may be asked again at the next. */
+    fun setAutopayStillActive(key: String, renewal: LocalDate) = prefs.edit(commit = true) {
+        putBoolean("$AUTOPAY_STILL$key:$renewal", true)
+    }
+
+    /**
+     * Whether the AutoPay question is settled for [sub]'s current renewal: the user said it was cancelled, or said
+     * it is still active for this renewal. An answer given before answers were per renewal is carried over to the
+     * renewal that is current now.
+     */
+    fun autopayAnswered(sub: Subscription): Boolean {
+        if (prefs.getString("$AUTOPAY_ANSWER${sub.key}", null) == AUTOPAY_CANCELLED) return true
+        val renewal = sub.nextRenewal ?: return false
+        if (prefs.getString("$AUTOPAY_ANSWER${sub.key}", null) == AUTOPAY_ACTIVE_LEGACY) {
+            prefs.edit(commit = true) { remove("$AUTOPAY_ANSWER${sub.key}"); putBoolean("$AUTOPAY_STILL${sub.key}:$renewal", true) }
+            return true
+        }
+        return prefs.getBoolean("$AUTOPAY_STILL${sub.key}:$renewal", false)
+    }
+
+    /** Forgets every AutoPay answer for [key], when the user undoes cancelling it or a charge says the answer was wrong. */
+    private fun clearAutopayAnswers(key: String) = prefs.edit(commit = true) {
+        remove("$AUTOPAY_ANSWER$key")
+        remove("$CANCEL_RENEWAL$key")
+        prefs.all.keys.filter { it.startsWith("$AUTOPAY_STILL$key:") }.forEach { remove(it) }
+    }
 
     /** "Replaces it": the older AutoPay was the same app on a plan the user has since changed. */
     suspend fun markReplaced(key: String) = dao.setMark(UserMarkEntity(key, UserMarkEntity.REPLACED))
@@ -717,7 +783,11 @@ class WatchdogRepository(
     /** "Not a subscription": hide it for good. */
     suspend fun hide(key: String) = dao.setMark(UserMarkEntity(key, UserMarkEntity.HIDDEN))
 
-    suspend fun clearMark(key: String) = dao.clearMark(key)
+    suspend fun clearMark(key: String) {
+        dao.clearMark(key)
+        prefs.edit(commit = true) { remove("$CANCEL_CLAIM$key") }
+        clearAutopayAnswers(key)
+    }
 
     suspend fun addManual(name: String, amount: BigDecimal, frequency: Frequency, firstCharge: LocalDate, isTrial: Boolean) =
         dao.insertManual(ManualSubscriptionEntity(name = name, amount = amount.toPlainString(), frequency = frequency.name, firstCharge = firstCharge.toString(), isTrial = isTrial))
@@ -853,6 +923,12 @@ class WatchdogRepository(
          * 13: renewal notices, cancellations and expiries from a service's own mail; the query also searches subjects.
          * 7-10: the signing domain is read from `header.i` when `header.d` is absent (Google's own mail).
          */
+        private const val CANCEL_CLAIM = "cancel_claim:"
+        private const val CANCEL_RENEWAL = "cancel_renewal:"
+        private const val AUTOPAY_ANSWER = "autopay_answer:"
+        private const val AUTOPAY_CANCELLED = "CANCELLED"
+        private const val AUTOPAY_ACTIVE_LEGACY = "ACTIVE"
+        private const val AUTOPAY_STILL = "autopay_active:"
         private const val GMAIL_CLASSIFIER_VERSION = 18
         private const val AUDIT_PROBE_VERSION = 1
 

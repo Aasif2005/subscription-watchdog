@@ -564,11 +564,34 @@ class SubscriptionEngine(
  * otherwise it is simply cancelled.
  */
 fun Subscription.stoppedRenewing(today: LocalDate): Subscription {
-    val end = activeUntil ?: lastCharged?.takeIf { frequencyKnown && frequency.hasSchedule }
-        ?.let { frequency.nextOnOrAfter(it, it.plusDays(1)) }
-    return if (end != null && end.isAfter(today)) copy(status = SubscriptionStatus.ENDING, activeUntil = end, nextRenewal = null)
-    else copy(status = SubscriptionStatus.CANCELLED, activeUntil = null, nextRenewal = null)
+    // A plan never charged yet (a free trial, an intro price) runs until its first charge would have come.
+    val last = lastCharged
+    val end = activeUntil
+        ?: last?.takeIf { frequencyKnown && frequency.hasSchedule }?.let { frequency.nextOnOrAfter(it, it.plusDays(1)) }
+        ?: nextRenewal.takeIf { last == null }
+    return when {
+        end != null && end.isAfter(today) -> copy(status = SubscriptionStatus.ENDING, activeUntil = end, nextRenewal = null)
+        // Charged lately but the period is not known: still paid for, end date unknown (the user is asked how long it was).
+        end == null && last != null && !last.isBefore(today.minusDays(STOPPED_UNKNOWN_PERIOD_DAYS)) ->
+            copy(status = SubscriptionStatus.ENDING, activeUntil = null, nextRenewal = null)
+        else -> copy(status = SubscriptionStatus.CANCELLED, activeUntil = null, nextRenewal = null)
+    }
 }
+
+/** Same grace the engine gives a revoked AutoPay whose period nothing states. */
+private const val STOPPED_UNKNOWN_PERIOD_DAYS = 31L
+
+/**
+ * Live subscriptions to ask "have you cancelled the AutoPay?" about: no answer yet, and nothing in the
+ * texts or mail says the mandate ended. Any renewal date, known or not; a manual entry is asked too. [isAnswered] is
+ * per renewal: a "no, still active" holds for that renewal only. A mandate set up today is too new to have been
+ * cancelled, and a channel plan with an unplaced cancellation text already has its own, more specific question.
+ */
+fun List<Subscription>.autopayQuestions(today: LocalDate, isAnswered: (Subscription) -> Boolean): List<Subscription> =
+    filter { sub ->
+        sub.isLive && !isAnswered(sub) && sub.unplacedRevocationOn == null &&
+            sub.events.filterIsInstance<PaymentEvent.MandateCreated>().maxOfOrNull { it.receivedOn }?.isBefore(today) != false
+    }
 
 /**
  * Where a name or mark the user saved under a bare channel key ("googleplay") belongs, now that a
@@ -635,7 +658,7 @@ fun List<Subscription>.withoutEndedChannelPlans(): List<Subscription> =
 
 /** Live subscriptions renewing within [leadDays] of [today] (inclusive), soonest first. */
 fun List<Subscription>.dueForReminder(today: LocalDate, leadDays: Int): List<Subscription> =
-    filter { it.isLive && it.nextRenewal != null }
+    filter { it.remindable }
         .filter { ChronoUnit.DAYS.between(today, it.nextRenewal) in 0..leadDays.toLong() }
         .sortedBy { it.nextRenewal }
 

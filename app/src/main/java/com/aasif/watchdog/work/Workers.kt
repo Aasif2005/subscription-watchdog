@@ -29,12 +29,14 @@ import com.aasif.watchdog.R
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.engine.EVENING_HOUR
 import com.aasif.watchdog.core.engine.FINAL_STAGE
-import com.aasif.watchdog.core.engine.canSnoozeReminder
 import com.aasif.watchdog.core.engine.chargedDespiteCancelPlan
 import com.aasif.watchdog.core.engine.dueForReminder
+import com.aasif.watchdog.core.engine.evidenceAfterCancelClaim
 import com.aasif.watchdog.core.engine.reminderStage
 import com.aasif.watchdog.core.engine.shouldFollowUp
 import com.aasif.watchdog.core.engine.shouldRemind
+import com.aasif.watchdog.core.engine.shouldVerifyCancel
+import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.data.GmailSyncOutcome
 import com.aasif.watchdog.data.WatchdogRepository
@@ -243,6 +245,29 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             repo.setChargeAlerted(key, planned)
         }
 
+        // The user said a plan was cancelled, yet a charge notice or a charge came after that day: the
+        // AutoPay may still be live. Undo the answer so reminders resume, and say so once.
+        for ((key, claimed) in repo.cancelClaims()) {
+            val sub = subscriptions.firstOrNull { it.key == key } ?: continue
+            val evidence = sub.evidenceAfterCancelClaim(claimed) ?: continue
+            if (repo.wasChargeAlerted(key, evidence)) continue
+            repo.reopenCancelClaim(key)
+            val price = if (sub.amountKnown) formatMoney(sub.amount) else "A payment"
+            notify(
+                key.hashCode() + 3, "${sub.name} may still be active",
+                "You said it was cancelled, but a charge notice or charge for $price came on ${formatDate(evidence)}. Check the mandate in your UPI app.",
+                openApp(key.hashCode() + 3),
+            )
+            repo.setChargeAlerted(key, evidence)
+        }
+
+        postCancelVerifications(repo, subscriptions, now)
+
+        // A reminder still in the tray for something that has since been cancelled would only mislead.
+        for (sub in subscriptions) {
+            if (!sub.isInUse) NotificationManagerCompat.from(applicationContext).cancel(sub.key.hashCode())
+        }
+
         postFollowUp(repo, subscriptions, today)
 
         val due = subscriptions.dueForReminder(today, repo.reminderLeadDays)
@@ -262,12 +287,35 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         return Result.success()
     }
 
+    /**
+     * The user said the AutoPay is cancelled: the evening before its renewal, nudge them to check the mandate
+     * is really off. Nothing to answer; a bank text that already says it was revoked makes it pointless.
+     */
+    private fun postCancelVerifications(repo: WatchdogRepository, subscriptions: List<Subscription>, now: LocalDateTime) {
+        for ((key, renewal) in repo.cancelRenewals()) {
+            if (!shouldVerifyCancel(now, renewal, repo.wasCancelVerified(key, renewal))) continue
+            val sub = subscriptions.firstOrNull { it.key == key } ?: continue
+            val latestMandate = sub.events.filterIsInstance<PaymentEvent.MandateCreated>().maxOfOrNull { it.receivedOn }
+            val revoked = sub.events.filterIsInstance<PaymentEvent.MandateRevoked>()
+                .any { latestMandate == null || !it.receivedOn.isBefore(latestMandate) }
+            repo.setCancelVerified(key, renewal)
+            if (revoked) continue
+            notify(
+                key.hashCode() + 4, "Verify that you have cancelled ${sub.name}'s AutoPay",
+                "It renews tomorrow. Check that the mandate is switched off in your UPI app.",
+                openDetail(key, key.hashCode() + 4),
+            )
+        }
+    }
+
     /** Runs only for the work item [Workers.scheduleFollowUp] queued, and only if it is still due. */
     private fun postFollowUp(repo: WatchdogRepository, subscriptions: List<Subscription>, today: LocalDate) {
         val key = inputData.getString(FOLLOW_UP_KEY) ?: return
         val date = inputData.getString(FOLLOW_UP_DATE)?.let { runCatching { LocalDate.parse(it) }.getOrNull() } ?: return
         if (!shouldFollowUp(today, date, repo.reminderState(key, date))) return
         val sub = subscriptions.firstOrNull { it.key == key } ?: return
+        // Cancelled since the first reminder: nothing left to warn about.
+        if (!sub.remindable || sub.nextRenewal != date) return
         val price = if (sub.amountKnown) formatMoney(sub.amount) else "This renewal"
         // Marked first: whatever happens next, this is the only repeat.
         repo.setFollowUpSent(key, date)
@@ -279,7 +327,7 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
     }
 
     private fun dismissIntent(key: String, date: LocalDate) = PendingIntent.getBroadcast(
-        applicationContext, key.hashCode() * 4,
+        applicationContext, key.hashCode() * 8,
         Intent(applicationContext, ReminderActionReceiver::class.java).setAction(ReminderActions.DISMISSED)
             .putExtra(ReminderActions.EXTRA_KEY, key).putExtra(ReminderActions.EXTRA_DATE, date.toString()),
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -290,18 +338,25 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
     )
 
+    /** Opens the app on [key]'s Detail screen, for a notification that is about that one subscription. */
+    private fun openDetail(key: String, requestCode: Int) = PendingIntent.getActivity(
+        applicationContext, requestCode,
+        Intent(applicationContext, MainActivity::class.java).putExtra(ReminderActions.EXTRA_OPEN_KEY, key),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
     /** Keep and Snooze are handled in the background; Cancel opens the screen that has the cancel link. */
     private fun actions(key: String, date: LocalDate, today: LocalDate): List<NotificationCompat.Action> {
         val id = key.hashCode()
         fun broadcast(action: String, offset: Int) = PendingIntent.getBroadcast(
-            applicationContext, id * 4 + offset,
+            applicationContext, id * 8 + offset,
             Intent(applicationContext, ReminderActionReceiver::class.java).setAction(action)
                 .putExtra(ReminderActions.EXTRA_KEY, key).putExtra(ReminderActions.EXTRA_DATE, date.toString())
                 .putExtra(ReminderActions.EXTRA_NOTIFICATION_ID, id),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val cancel = PendingIntent.getActivity(
-            applicationContext, id * 4 + 3,
+            applicationContext, id * 8 + 3,
             Intent(applicationContext, MainActivity::class.java)
                 .putExtra(ReminderActions.EXTRA_CANCEL_KEY, key).putExtra(ReminderActions.EXTRA_DATE, date.toString())
                 .putExtra(ReminderActions.EXTRA_NOTIFICATION_ID, id),
@@ -310,8 +365,8 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         return listOfNotNull(
             NotificationCompat.Action(0, "Keep", broadcast(ReminderActions.KEEP, 1)),
             NotificationCompat.Action(0, "Cancel", cancel),
-            // Snoozing past the charge would only hide the warning that matters.
-            NotificationCompat.Action(0, "Tomorrow", broadcast(ReminderActions.SNOOZE, 2)).takeIf { canSnoozeReminder(date, today) },
+            // Android shows three actions at most, so "Tomorrow" lives on the dashboard card only.
+            NotificationCompat.Action(0, "AutoPay off", broadcast(ReminderActions.ALREADY_CANCELLED, 4)),
         )
     }
 

@@ -98,6 +98,9 @@ fun DashboardScreen(
     onKeep: (Subscription) -> Unit,
     onPlanCancel: (Subscription) -> Unit,
     onSnooze: (Subscription) -> Unit,
+    autopayDue: Set<String>,
+    onAutopayCancelled: (Subscription) -> Unit,
+    onAutopayStillActive: (Subscription) -> Unit,
     replacementQuestions: List<ReplacementQuestion>,
     onReplaces: (ReplacementQuestion) -> Unit,
     onDifferentApp: (ReplacementQuestion) -> Unit,
@@ -230,7 +233,13 @@ fun DashboardScreen(
                 }
             }
             if (live.isNotEmpty()) item { SectionHeader("Active") }
-            items(live, key = { it.key }) { SubscriptionRow(it, onClick = { onOpen(it.key) }) }
+            items(live, key = { it.key }) { sub ->
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SubscriptionRow(sub, onClick = { onOpen(sub.key) })
+                    // Only close to a renewal, so the question is not on the dashboard all the time.
+                    if (sub.key in autopayDue) AutopayStrip(sub, onAutopayCancelled, onAutopayStillActive)
+                }
+            }
             if (ended.isNotEmpty()) item { SectionHeader("Ended") }
             items(ended, key = { it.key }) { SubscriptionRow(it, onClick = { onOpen(it.key) }) }
         }
@@ -378,6 +387,7 @@ fun DetailScreen(
     onName: (String) -> Unit,
     onBack: () -> Unit,
     onMarkCancelled: () -> Unit,
+    userCancelled: Boolean,
     onUndoCancel: () -> Unit,
     onHide: () -> Unit,
     onDelete: () -> Unit,
@@ -385,6 +395,9 @@ fun DetailScreen(
     onKeepAfterAll: (plannedFor: LocalDate) -> Unit,
     onPlanLength: (Frequency) -> Unit,
     onStillActive: () -> Unit,
+    autopayAsk: Boolean,
+    onAutopayCancelled: (Subscription) -> Unit,
+    onAutopayStillActive: (Subscription) -> Unit,
 ) {
     val uriHandler = LocalUriHandler.current
     Scaffold(
@@ -416,6 +429,7 @@ fun DetailScreen(
                 Text("Changed on ${formatDate(before.changedOn)} from $was", style = MaterialTheme.typography.bodyMedium)
             }
 
+            if (autopayAsk) AutopayStrip(sub, onAutopayCancelled, onAutopayStillActive)
             if (sub.status == SubscriptionStatus.ENDING && sub.activeUntil == null) {
                 PlanLengthQuestion(sub, onPlanLength)
             }
@@ -537,14 +551,7 @@ fun DetailScreen(
                     Text("Open ${sub.name}'s cancel page")
                 }
             }
-            if (sub.isLive) {
-                OutlinedButton(onClick = onMarkCancelled, Modifier.fillMaxWidth()) { Text("I've cancelled this") }
-                Text(
-                    "Also revoke the AutoPay in your UPI app (PhonePe, GPay, Paytm → AutoPay) so no further debits happen.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            if (sub.status == SubscriptionStatus.CANCELLED) {
+            if (sub.status == SubscriptionStatus.CANCELLED || userCancelled) {
                 OutlinedButton(onClick = onUndoCancel, Modifier.fillMaxWidth()) { Text("Still active? Undo") }
             }
             if (isManual) {
@@ -645,6 +652,23 @@ private fun RevocationCard(sub: Subscription, onYes: (Subscription) -> Unit, onN
     }
 }
 
+/** Nothing in the texts or mail says this subscription's AutoPay ended, so ask: on Detail always, on the dashboard in the last days. */
+@Composable
+private fun AutopayStrip(sub: Subscription, onCancelled: (Subscription) -> Unit, onStillActive: (Subscription) -> Unit) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Text("Have you cancelled the AutoPay?", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = { onCancelled(sub) }) { Text("Yes, cancelled") }
+                OutlinedButton(onClick = { onStillActive(sub) }) { Text("No, still active") }
+            }
+        }
+    }
+}
+
 /** The dashboard's copy of the renewal reminder, so a notification that was ignored is not lost. */
 @Composable
 private fun RenewalQuestionCard(
@@ -716,7 +740,7 @@ private fun CancellationGuide(sub: Subscription, before: LocalDate, onCancelled:
                 ) { Text("Open $label") }
             }
             Text("3. Tell the app", fontWeight = FontWeight.SemiBold)
-            Button(onClick = onCancelled, Modifier.fillMaxWidth()) { Text("I've cancelled it") }
+            Button(onClick = onCancelled, Modifier.fillMaxWidth()) { Text("I've cancelled the AutoPay") }
             TextButton(onClick = onKeep, Modifier.fillMaxWidth()) { Text("Changed my mind — keep it") }
         }
     }

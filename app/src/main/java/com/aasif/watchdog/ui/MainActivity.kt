@@ -52,8 +52,12 @@ class MainActivity : ComponentActivity() {
         handleReminderAction(intent)
     }
 
-    /** The "Cancel it" button on a renewal reminder arrives as extras on the launch intent. */
+    /** The "Cancel it" button and a pointer notification arrive as extras on the launch intent. */
     private fun handleReminderAction(intent: Intent) {
+        intent.getStringExtra(ReminderActions.EXTRA_OPEN_KEY)?.let { key ->
+            intent.removeExtra(ReminderActions.EXTRA_OPEN_KEY)
+            vm.open(Screen.Detail(key))
+        }
         val key = intent.getStringExtra(ReminderActions.EXTRA_CANCEL_KEY) ?: return
         val date = intent.getStringExtra(ReminderActions.EXTRA_DATE)?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
         // Consumed, so rotating the screen or returning to the app does not record it a second time.
@@ -129,6 +133,9 @@ private fun App(vm: MainViewModel = viewModel()) {
             onKeep = vm::keepSubscription,
             onPlanCancel = vm::planCancelOf,
             onSnooze = vm::snoozeSubscription,
+            autopayDue = subscriptions?.let(vm::autopayDue).orEmpty(),
+            onAutopayCancelled = vm::alreadyCancelled,
+            onAutopayStillActive = vm::autopayStillActive,
             replacementQuestions = subscriptions?.let(vm::replacementQuestions).orEmpty(),
             onReplaces = vm::replacesIt,
             onDifferentApp = vm::differentApp,
@@ -155,7 +162,9 @@ private fun App(vm: MainViewModel = viewModel()) {
         )
         is Screen.Detail -> {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }
-            if (sub == null) {
+            if (subscriptions == null) {
+                // Still loading, e.g. opened from a notification into a freshly started app.
+            } else if (sub == null) {
                 // Hidden or deleted while open; the list no longer has it.
                 LaunchedEffect(screen.key) { vm.back() }
             } else {
@@ -169,6 +178,7 @@ private fun App(vm: MainViewModel = viewModel()) {
                     onName = { vm.nameSubscription(sub.key, it) },
                     onBack = { vm.back() },
                     onMarkCancelled = { vm.markCancelled(sub.key) },
+                    userCancelled = vm.userCancelled(sub.key),
                     onUndoCancel = { vm.undoMark(sub.key) },
                     onHide = { vm.hide(sub.key) },
                     onDelete = { vm.deleteManual(sub.key) },
@@ -176,6 +186,9 @@ private fun App(vm: MainViewModel = viewModel()) {
                     onKeepAfterAll = { planned -> vm.keepAfterAll(sub.key, planned) },
                     onPlanLength = { vm.setPlanLength(sub.key, it) },
                     onStillActive = { vm.confirmStillActive(sub) },
+                    autopayAsk = vm.autopayAsk(sub),
+                    onAutopayCancelled = { vm.alreadyCancelled(sub) },
+                    onAutopayStillActive = { vm.autopayStillActive(sub) },
                 )
             }
         }
