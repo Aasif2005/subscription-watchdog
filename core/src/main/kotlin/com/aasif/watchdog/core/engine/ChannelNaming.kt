@@ -34,7 +34,8 @@ fun nameChannelEvents(events: List<SourcedEvent>, channels: Set<String>): List<P
     val mail = events.filter { it.fromMail && it.event.merchantId !in channels }.map { it.event }
     val byTime = if (mail.isEmpty()) events.map { it.event } else nameByTime(events, channels, mail)
     val byMandate = nameByMandate(byTime, channels)
-    return nameNoticesByApp(events.map { it.event }, byMandate, channels)
+    val byNotice = nameNoticesByApp(events.map { it.event }, byMandate, channels)
+    return nameDebitsByApp(events.map { it.event }, byNotice, channels)
 }
 
 /**
@@ -44,26 +45,57 @@ fun nameChannelEvents(events: List<SourcedEvent>, channels: Set<String>): List<P
  * fits none, leave it on the channel: never guessed. [original] and [named] are the same events, before and after naming.
  */
 private fun nameNoticesByApp(original: List<PaymentEvent>, named: List<PaymentEvent>, channels: Set<String>): List<PaymentEvent> {
-    // Bank texts that were filed under an app because they came through a channel: those apps bought through it.
-    val viaChannel = original.indices.filter { original[it].merchantId in channels && named[it].merchantId !in channels }.map { named[it] }
-    val apps = viaChannel.filter { it is PaymentEvent.MandateCreated }.map { it.merchantId }.distinct()
-    if (apps.isEmpty()) return named
+    if (liveChannelApps(original, named, channels).isEmpty()) return named
     return named.mapIndexed { i, e ->
         if (e !is PaymentEvent.PreDebitNotice || e.merchantId !in channels || original[i].merchantId !in channels) return@mapIndexed e
-        val live = apps.mapNotNull { app ->
-            // Every text about this app up to the notice, the mail included: a cancellation mail ends an AutoPay too.
-            val own = named.filter { it.merchantId == app && !it.receivedOn.isAfter(e.receivedOn) }
-            val created = own.filterIsInstance<PaymentEvent.MandateCreated>().filter { it in viaChannel }
-                .maxWithOrNull(compareBy({ it.receivedOn }, { it.receivedAt })) ?: return@mapNotNull null
-            if (endedAfter(created, own.filterIsInstance<PaymentEvent.MandateRevoked>())) return@mapNotNull null
-            val frequency = own.filterIsInstance<PaymentEvent.MandateCreated>().mapNotNull { it.frequency }.lastOrNull { it.hasSchedule }
-            app to Live(created, frequency ?: Frequency.MONTHLY)
-        }
+        val live = liveChannelApps(original, named, channels, e.receivedOn)
         val byAmount = if (e.amount == null) live else live.filter { (_, l) -> l.created.amount?.let { sameWholeAmount(it, e.amount) } == true }
         // Same price (or no price in the text): the app whose own schedule has a charge around the notice's date.
         val fits = if (byAmount.size > 1) byAmount.filter { (_, l) -> l.dueNear(e.debitDate) } else byAmount
         val app = fits.singleOrNull()?.first ?: return@mapIndexed e
-        e.withMerchant(app, viaChannel.first { it.merchantId == app }.merchantName)
+        e.withMerchant(app, appName(original, named, channels, app))
+    }
+}
+
+/**
+ * A bank's debit text names only the channel too ("debited for payee Google Play for Rs. 1999.00"). It belongs to the app whose AutoPay came
+ * through that channel when that app is the only one live at its price, and its own schedule, or a notice already filed under it, expects a
+ * charge on that day (a one-off Play purchase of the same price is not on any schedule). Anything less leaves it on the channel.
+ */
+private fun nameDebitsByApp(original: List<PaymentEvent>, named: List<PaymentEvent>, channels: Set<String>): List<PaymentEvent> {
+    if (liveChannelApps(original, named, channels).isEmpty()) return named
+    return named.mapIndexed { i, e ->
+        if (e !is PaymentEvent.Debit || e.merchantId !in channels || original[i].merchantId !in channels) return@mapIndexed e
+        val live = liveChannelApps(original, named, channels, e.receivedOn)
+            .filter { (_, l) -> l.created.amount?.let { sameWholeAmount(it, e.amount) } == true }
+        val expected = live.filter { (app, l) ->
+            l.dueNear(e.date) || named.any { it is PaymentEvent.PreDebitNotice && it.merchantId == app && it.debitDate == e.date }
+        }
+        val app = expected.singleOrNull()?.first ?: return@mapIndexed e
+        e.withMerchant(app, appName(original, named, channels, app))
+    }
+}
+
+private fun appName(original: List<PaymentEvent>, named: List<PaymentEvent>, channels: Set<String>, app: String): String =
+    named.indices.first { named[it].merchantId == app && original[it].merchantId in channels }.let { named[it].merchantName }
+
+/**
+ * The apps whose AutoPay came through a channel and is still live on [upTo] (default: ever). Bank texts that were filed under an app
+ * because they came through a channel say which apps bought through it; every text about the app up to that day counts, the mail
+ * included, since a cancellation mail ends an AutoPay too.
+ */
+private fun liveChannelApps(
+    original: List<PaymentEvent>, named: List<PaymentEvent>, channels: Set<String>, upTo: LocalDate = LocalDate.MAX,
+): List<Pair<String, Live>> {
+    val viaChannel = original.indices.filter { original[it].merchantId in channels && named[it].merchantId !in channels }.map { named[it] }
+    val apps = viaChannel.filterIsInstance<PaymentEvent.MandateCreated>().map { it.merchantId }.distinct()
+    return apps.mapNotNull { app ->
+        val own = named.filter { it.merchantId == app && !it.receivedOn.isAfter(upTo) }
+        val created = own.filterIsInstance<PaymentEvent.MandateCreated>().filter { it in viaChannel }
+            .maxWithOrNull(compareBy({ it.receivedOn }, { it.receivedAt })) ?: return@mapNotNull null
+        if (endedAfter(created, own.filterIsInstance<PaymentEvent.MandateRevoked>())) return@mapNotNull null
+        val frequency = own.filterIsInstance<PaymentEvent.MandateCreated>().mapNotNull { it.frequency }.lastOrNull { it.hasSchedule }
+        app to Live(created, frequency ?: Frequency.MONTHLY)
     }
 }
 

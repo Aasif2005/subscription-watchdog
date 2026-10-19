@@ -29,7 +29,10 @@ import com.aasif.watchdog.R
 import com.aasif.watchdog.WatchdogApp
 import com.aasif.watchdog.core.engine.EVENING_HOUR
 import com.aasif.watchdog.core.engine.FINAL_STAGE
+import com.aasif.watchdog.core.engine.chargeAlertResolved
 import com.aasif.watchdog.core.engine.chargedDespiteCancelPlan
+import com.aasif.watchdog.core.engine.mandateRevoked
+import com.aasif.watchdog.core.engine.verifyCancelResolved
 import com.aasif.watchdog.core.engine.dueForReminder
 import com.aasif.watchdog.core.engine.heldForMail
 import com.aasif.watchdog.core.engine.reminderKeysToWithdraw
@@ -38,6 +41,7 @@ import com.aasif.watchdog.core.engine.reminderStage
 import com.aasif.watchdog.core.engine.shouldFollowUp
 import com.aasif.watchdog.core.engine.shouldRemind
 import com.aasif.watchdog.core.engine.shouldVerifyCancel
+import com.aasif.watchdog.core.merchant.MerchantNormalizer
 import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.data.GmailSyncOutcome
@@ -56,6 +60,7 @@ object Workers {
     private const val SCAN_DAILY = "scan-daily"
     private const val SCAN_NOW = "scan-now"
     private const val GMAIL_DAILY = "gmail-daily"
+    private const val GMAIL_SOON = "gmail-soon"
     private const val GMAIL_NOW = "gmail-now"
 
     /** The backfill's own continuation, kept off [GMAIL_NOW] so it cannot cancel its own run. */
@@ -67,6 +72,12 @@ object Workers {
 
     /** Gmail's quota is per minute, so after a throttled slice the next one waits a window out. */
     private val slicePause: Duration = Duration.ofSeconds(70)
+
+    /** The backstop for mail the triggered syncs missed (see [gmailSyncSoon]); each run only fetches what is new. */
+    private const val GMAIL_PERIOD_HOURS = 6L
+
+    /** Play's receipt follows the bank's text by about a minute; waiting two lets it be in the inbox. */
+    private val receiptWait: Duration = Duration.ofMinutes(2)
 
     private val online = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
 
@@ -91,7 +102,7 @@ object Workers {
         // Always enqueued; the worker itself returns early unless Gmail import is switched on.
         wm.enqueueUniquePeriodicWork(
             GMAIL_DAILY, ExistingPeriodicWorkPolicy.KEEP,
-            PeriodicWorkRequestBuilder<GmailSyncWorker>(1, TimeUnit.DAYS)
+            PeriodicWorkRequestBuilder<GmailSyncWorker>(GMAIL_PERIOD_HOURS, TimeUnit.HOURS)
                 .setConstraints(online)
                 .setBackoffCriteria(BackoffPolicy.LINEAR, 30, TimeUnit.SECONDS)
                 .build(),
@@ -136,6 +147,28 @@ object Workers {
             .enqueue()
     }
 
+    /**
+     * Reads new mail after [wait] (shortly, by default), then re-checks reminders so the dashboard and the shade settle on what it said. Gmail cannot
+     * push to a phone without a server of our own, so this is the closest to live: called when something happened that mail will
+     * explain. A run already waiting is kept, so a burst of texts costs one sync; an import that is switched off makes the worker a no-op.
+     */
+    fun gmailSyncSoon(context: Context, wait: Duration = receiptWait) {
+        WorkManager.getInstance(context)
+            .beginUniqueWork(GMAIL_SOON, ExistingWorkPolicy.KEEP, gmailSync(wait))
+            .then(OneTimeWorkRequestBuilder<ReminderWorker>().build())
+            .enqueue()
+    }
+
+    /**
+     * Mail names the app behind a billing channel's payment ("Google Play" on a bank text says nothing of which app), so a text that
+     * only names a channel is worth a sync soon; one that names the service itself is not.
+     */
+    fun gmailSyncSoonIfChannel(context: Context, texts: List<String>) {
+        if (texts.any { channelNormalizer.findKnownIn(it)?.sharedBilling == true }) gmailSyncSoon(context)
+    }
+
+    private val channelNormalizer = MerchantNormalizer()
+
     /** Backfill right after the user turns Gmail import on. */
     fun gmailSyncNow(context: Context) {
         val wm = WorkManager.getInstance(context)
@@ -173,6 +206,7 @@ object Workers {
         wm.cancelUniqueWork(GMAIL_NOW)
         wm.cancelUniqueWork(GMAIL_MORE)
         wm.cancelUniqueWork(GMAIL_DAILY)
+        wm.cancelUniqueWork(GMAIL_SOON)
     }
 }
 
@@ -237,8 +271,12 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         val now = LocalDateTime.now()
         val today = now.toLocalDate()
         // A "Google Play" plan the mail import may still name gets no reminder until the import is done.
-        val subscriptions = repo.currentSubscriptions().heldForMail(repo.gmailCatchingUp)
+        val allSubscriptions = repo.currentSubscriptions()
+        val subscriptions = allSubscriptions.heldForMail(repo.gmailCatchingUp)
         ReminderChannel.ensure(applicationContext)
+
+        // Before anything new is posted: an alert about a problem that has since been resolved should not outlive the resolution.
+        withdrawResolvedAlerts(repo, allSubscriptions, today)
 
         // The user said they would cancel, and a charge landed anyway. Worth saying so once.
         // The bank's own texts say the AutoPay was cancelled, and money was still taken. Only
@@ -248,9 +286,10 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             if (charged.isBefore(today.minusDays(CHARGE_ALERT_DAYS)) || repo.wasChargeAlerted(sub.key, charged)) continue
             val price = if (sub.amountKnown) formatMoney(sub.amount) else "A payment"
             notify(
-                sub.key.hashCode() + 2, "${sub.name} charged after the AutoPay was cancelled",
+                sub.key.hashCode() + CHARGED_AFTER_CANCEL, "${sub.name} charged after the AutoPay was cancelled",
                 "$price was taken on ${formatDate(charged)} although its AutoPay had been cancelled. Check the mandate in your UPI app and ask ${sub.name} for a refund.",
-                openApp(sub.key.hashCode() + 2),
+                openApp(sub.key.hashCode() + CHARGED_AFTER_CANCEL),
+                expireAfterMs = ALERT_LIFETIME_MS,
             )
             repo.setChargeAlerted(sub.key, charged)
         }
@@ -262,9 +301,10 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             if (!chargedDespiteCancelPlan(sub, planned) || repo.wasChargeAlerted(key, planned)) continue
             val price = if (sub.amountKnown) formatMoney(sub.amount) else "A payment"
             notify(
-                key.hashCode() + 1, "${sub.name} charged you anyway",
+                key.hashCode() + CHARGED_ANYWAY, "${sub.name} charged you anyway",
                 "$price was charged although you planned to cancel before ${formatDate(planned)}. Open the app to cancel it or check the mandate.",
-                openApp(key.hashCode() + 1),
+                openApp(key.hashCode() + CHARGED_ANYWAY),
+                expireAfterMs = ALERT_LIFETIME_MS,
             )
             repo.setChargeAlerted(key, planned)
         }
@@ -278,9 +318,10 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             repo.reopenCancelClaim(key)
             val price = if (sub.amountKnown) formatMoney(sub.amount) else "A payment"
             notify(
-                key.hashCode() + 3, "${sub.name} may still be active",
+                key.hashCode() + MAY_BE_ACTIVE, "${sub.name} may still be active",
                 "You said it was cancelled, but a charge notice or charge for $price came on ${formatDate(evidence)}. Check the mandate in your UPI app.",
-                openApp(key.hashCode() + 3),
+                openApp(key.hashCode() + MAY_BE_ACTIVE),
+                expireAfterMs = ALERT_LIFETIME_MS,
             )
             repo.setChargeAlerted(key, evidence)
         }
@@ -314,6 +355,30 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
     }
 
     /**
+     * Takes down the alerts whose problem is over: "charged you anyway" and "may still be active" once the plan no longer renews,
+     * "verify that you have cancelled" once the AutoPay is confirmed off or the renewal day has begun. Read from the tray itself, so
+     * nothing has to be remembered about what was posted. [all] is every subscription, held ones included: one that is only
+     * waiting for its name is not gone.
+     */
+    private fun withdrawResolvedAlerts(repo: WatchdogRepository, all: List<Subscription>, today: LocalDate) {
+        val manager = applicationContext.getSystemService(NotificationManager::class.java) ?: return
+        val inTray = manager.activeNotifications.map { it.id }.toSet()
+        if (inTray.isEmpty()) return
+        val renewals = repo.cancelRenewals()
+        val byKey = all.associateBy { it.key }
+        val compat = NotificationManagerCompat.from(applicationContext)
+        for (key in all.map { it.key }) {
+            val id = key.hashCode()
+            val sub = byKey[key]
+            if ((id + CHARGED_ANYWAY in inTray || id + MAY_BE_ACTIVE in inTray) && chargeAlertResolved(sub)) {
+                compat.cancel(id + CHARGED_ANYWAY)
+                compat.cancel(id + MAY_BE_ACTIVE)
+            }
+            if (id + VERIFY_CANCEL in inTray && verifyCancelResolved(sub, renewals[key], today)) compat.cancel(id + VERIFY_CANCEL)
+        }
+    }
+
+    /**
      * The user said the AutoPay is cancelled: the evening before its renewal, nudge them to check the mandate
      * is really off. Nothing to answer; a bank text that already says it was revoked makes it pointless.
      */
@@ -321,15 +386,13 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         for ((key, renewal) in repo.cancelRenewals()) {
             if (!shouldVerifyCancel(now, renewal, repo.wasCancelVerified(key, renewal))) continue
             val sub = subscriptions.firstOrNull { it.key == key } ?: continue
-            val latestMandate = sub.events.filterIsInstance<PaymentEvent.MandateCreated>().maxOfOrNull { it.receivedOn }
-            val revoked = sub.events.filterIsInstance<PaymentEvent.MandateRevoked>()
-                .any { latestMandate == null || !it.receivedOn.isBefore(latestMandate) }
             repo.setCancelVerified(key, renewal)
-            if (revoked) continue
+            if (sub.mandateRevoked()) continue
             notify(
-                key.hashCode() + 4, "Verify that you have cancelled ${sub.name}'s AutoPay",
+                key.hashCode() + VERIFY_CANCEL, "Verify that you have cancelled ${sub.name}'s AutoPay",
                 "It renews tomorrow. Check that the mandate is switched off in your UPI app.",
-                openDetail(key, key.hashCode() + 4),
+                openDetail(key, key.hashCode() + VERIFY_CANCEL),
+                expireAfterMs = ALERT_LIFETIME_MS,
             )
         }
     }
@@ -404,6 +467,7 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
     private fun notify(
         id: Int, title: String, text: String, open: PendingIntent,
         actions: List<NotificationCompat.Action> = emptyList(), onDismiss: PendingIntent? = null,
+        expireAfterMs: Long? = null,
     ) {
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher)
@@ -416,6 +480,8 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setOnlyAlertOnce(true)
+            // Android takes it down itself, even with the app not running.
+            .apply { if (expireAfterMs != null) setTimeoutAfter(expireAfterMs) }
             // On the lock screen the amount stays hidden; the full text shows once unlocked.
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPublicVersion(
@@ -433,6 +499,15 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
     companion object {
         const val FOLLOW_UP_KEY = "follow_up_key"
         private const val CHARGE_ALERT_DAYS = 7L
+
+        // An alert about one subscription: its key's hash plus one of these, apart from the renewal reminder's own id.
+        private const val CHARGED_ANYWAY = 1
+        private const val CHARGED_AFTER_CANCEL = 2
+        private const val MAY_BE_ACTIVE = 3
+        private const val VERIFY_CANCEL = 4
+
+        /** These alerts are about one moment; left unanswered they would sit in the shade for days. */
+        private const val ALERT_LIFETIME_MS = 24L * 60 * 60 * 1000
         const val FOLLOW_UP_DATE = "follow_up_date"
         private const val CHANNEL_ID = ReminderChannel.ID
     }

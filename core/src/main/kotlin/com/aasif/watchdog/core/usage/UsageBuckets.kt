@@ -1,5 +1,6 @@
 package com.aasif.watchdog.core.usage
 
+import com.aasif.watchdog.core.model.Frequency
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -30,3 +31,12 @@ private const val DEFAULT_KEEP_DAYS = 120L
  */
 fun usageKeepDays(periodDays: Collection<Int>): Long =
     periodDays.maxOrNull()?.let { it + KEEP_MARGIN_DAYS } ?: DEFAULT_KEEP_DAYS
+
+/**
+ * How far back to keep usage, for the daily rows and the weekly, monthly and yearly spans alike, so one cannot be deleted while the other
+ * is still needed. It reaches the oldest period start among the tracked subscriptions ([periodAges], days from each start to today: a plan
+ * taken long before its first debit is counted from the day it was taken) as well as their billing lengths ([periodDays]), and is never
+ * under a yearly plan's, because the spans are taken once per app and cannot be read again once deleted.
+ */
+fun usageRetentionDays(periodDays: Collection<Int>, periodAges: Collection<Int>): Long =
+    maxOf(usageKeepDays(periodDays + periodAges), usageKeepDays(listOf(Frequency.YEARLY.approxDays)))

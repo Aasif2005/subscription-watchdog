@@ -30,14 +30,18 @@ import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.core.parser.SmsParser
+import com.aasif.watchdog.core.usage.TrackedApp
 import com.aasif.watchdog.core.usage.TrackedApps
+import com.aasif.watchdog.core.usage.UsageReading
+import com.aasif.watchdog.core.usage.usagePeriodStart
+import com.aasif.watchdog.core.usage.usageSummary
 import com.aasif.watchdog.core.usage.UsageSpan
 import com.aasif.watchdog.core.usage.UsageVerdict
 import com.aasif.watchdog.core.usage.trackedApp
 import com.aasif.watchdog.core.usage.usageDayLabel
 import com.aasif.watchdog.core.usage.usagePackagesToWatch
 import com.aasif.watchdog.core.usage.usageSpan
-import com.aasif.watchdog.core.usage.usageKeepDays
+import com.aasif.watchdog.core.usage.usageRetentionDays
 import com.aasif.watchdog.core.usage.usageVerdict
 import com.aasif.watchdog.data.db.AppUsageDayEntity
 import com.aasif.watchdog.data.db.AppUsageSpanEntity
@@ -64,6 +68,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 
 /** How many notifications an app has posted that the listener looked at, and how many yielded a payment. */
 data class NotificationStat(val packageName: String, val seen: Int, val found: Int, val lastSeenMillis: Long)
@@ -814,7 +819,7 @@ class WatchdogRepository(
         val subs = currentSubscriptions()
         // Only apps of subscriptions that are active: nothing is read or kept for the others, and what was kept for a
         // subscription that is no longer active is deleted (Android still has its recent history if it comes back).
-        val watched = usagePackagesToWatch(subs)
+        val watched = usagePackagesToWatch(subs, playbackSupported = playbackTimeSupported)
         val dropped = TrackedApps.packages.filter { it !in watched }
         if (dropped.isNotEmpty()) {
             dao.clearUsageFor(dropped)
@@ -824,7 +829,7 @@ class WatchdogRepository(
         val installed = usage.installedAt(watched)
         if (installed.isEmpty()) return
         val zone = ZoneId.systemDefault()
-        val histories = usage.history(installed.keys, nowMillis)
+        val histories = usage.history(installed.keys, nowMillis, TrackedApps.playbackPackages)
         // Every finished daily bucket Android still has: a tracked app that is absent from one was not opened that day.
         val days = histories.flatMap { (pkg, history) ->
             val installedOn = Instant.ofEpochMilli(installed.getValue(pkg)).atZone(zone).toLocalDate()
@@ -834,13 +839,16 @@ class WatchdogRepository(
                 .map { (day, millis) -> AppUsageDayEntity(pkg, day.toString(), millis.sum()) }
         }
         if (days.isNotEmpty()) dao.upsertUsage(days)
-        val keepDays = usageKeepDays(
-            subs.filter { it.trackedApp() != null && it.isLive && it.frequency.hasSchedule }
-                .map { it.frequency.approxDays },
+        // One cutoff for the daily rows and the older spans, reaching the oldest period start of any watched subscription (a plan taken
+        // long before its first debit is counted from the day it was taken), so neither is deleted while the other is still needed.
+        val tracked = subs.filter { it.trackedApp() != null && it.isLive && it.frequency.hasSchedule }
+        val keepDays = usageRetentionDays(
+            periodDays = tracked.map { it.frequency.approxDays },
+            periodAges = tracked.mapNotNull { sub -> usagePeriodStart(sub)?.let { ChronoUnit.DAYS.between(it, today).toInt() } },
         )
         // The older weekly, monthly and yearly totals are taken once per app, when its subscription is first seen active,
-        // because their leftovers move as Android drops buckets. Kept as long as the longest plan could need.
-        val keepFrom = today.minusDays(usageKeepDays(listOf(Frequency.YEARLY.approxDays))).atStartOfDay(zone).toInstant().toEpochMilli()
+        // because their leftovers move as Android drops buckets.
+        val keepFrom = today.minusDays(keepDays).atStartOfDay(zone).toInstant().toEpochMilli()
         val firstTime = histories.keys.filter { !prefs.getBoolean(USAGE_BACKFILLED + it, false) }
         if (firstTime.isNotEmpty()) {
             val spans = firstTime.flatMap { pkg ->
@@ -855,25 +863,50 @@ class WatchdogRepository(
     }
 
     /**
-     * What the screen time since the last renewal says about [sub], for its renewal on [renewal]: finished days, plus the
+     * What the use since the last renewal says about [sub], for its renewal on [renewal]: finished days, plus the
      * older stretches taken from Android's weekly and monthly totals. When part of the period was out of Android's reach
      * the verdict covers what was seen and says so.
      */
     suspend fun usageVerdictFor(sub: Subscription, renewal: LocalDate, today: LocalDate = LocalDate.now()): UsageVerdict {
         val app = sub.trackedApp() ?: return UsageVerdict.NoData
-        if (!usageAccessGranted() || !sub.frequency.hasSchedule) return UsageVerdict.NoData
+        val start = usagePeriodStart(sub, renewal) ?: return UsageVerdict.NoData
+        val spans = usageSpansFor(sub, app, start) ?: return UsageVerdict.NoData
+        return usageVerdict(spans, start, today, app.category)
+    }
+
+    /**
+     * The use of [sub]'s app since its current period began (see [usagePeriodStart]), for the dashboard and Detail. The figure is null
+     * until a full day of the period has passed; the period's start is always given so the screen can say where counting began.
+     * Null when the app is not tracked or use cannot be read.
+     */
+    suspend fun usageFor(sub: Subscription, today: LocalDate = LocalDate.now()): UsageReading? {
+        val app = sub.trackedApp() ?: return null
+        val start = usagePeriodStart(sub) ?: return null
+        if (!usageAccessGranted() || (app.measuresPlayback && !playbackTimeSupported)) return null
+        val spans = usageSpansFor(sub, app, start).orEmpty()
+        return UsageReading(
+            start,
+            usageSummary(spans, start, today, app.measuresPlayback),
+            usageVerdict(spans, start, today, app.category),
+        )
+    }
+
+    /** Whether this Android reports how long a playback service ran, which is what a music app's use is read from. */
+    private val playbackTimeSupported: Boolean get() = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
+
+    /** The watched stretches of [app] from [start] on, or null when use cannot be read for it. */
+    private suspend fun usageSpansFor(sub: Subscription, app: TrackedApp, start: LocalDate): List<UsageSpan>? {
+        if (!usageAccessGranted()) return null
+        if (app.measuresPlayback && !playbackTimeSupported) return null
         val zone = ZoneId.systemDefault()
-        val previous = sub.frequency.previous(renewal)
-        val lastRenewal = sub.lastCharged?.let { maxOf(it, previous) } ?: previous
-        val days = dao.usageSince(app.packages, lastRenewal.toString())
+        val days = dao.usageSince(app.packages, start.toString())
             .groupBy { LocalDate.parse(it.day) }
             .map { (day, rows) -> UsageSpan(day, 1, rows.sumOf { it.foregroundMillis }) }
-        // A stretch may begin a day or two before the renewal, so look a little earlier; the verdict filters exactly.
-        val spans = dao.spansSince(app.packages, lastRenewal.minusDays(2).atStartOfDay(zone).toInstant().toEpochMilli())
+        // A stretch may begin a day or two before the period, so look a little earlier; the counting filters exactly.
+        val spans = dao.spansSince(app.packages, start.minusDays(2).atStartOfDay(zone).toInstant().toEpochMilli())
             .groupBy { it.startMillis to it.endMillis }
             .map { (range, rows) -> usageSpan(range.first, range.second, rows.sumOf { it.foregroundMillis }, zone) }
-        if (days.isEmpty() && spans.isEmpty()) return UsageVerdict.NoData
-        return usageVerdict(days + spans, lastRenewal, today, app.category)
+        return (days + spans).takeIf { it.isNotEmpty() }
     }
 
     /** Evidence says the AutoPay lives on after all: undo the user's "cancelled". */
@@ -1093,7 +1126,7 @@ class WatchdogRepository(
         private const val AUTOPAY_CANCELLED = "CANCELLED"
         private const val AUTOPAY_ACTIVE_LEGACY = "ACTIVE"
         private const val AUTOPAY_STILL = "autopay_active:"
-        private const val GMAIL_CLASSIFIER_VERSION = 18
+        private const val GMAIL_CLASSIFIER_VERSION = 19
         private const val AUDIT_PROBE_VERSION = 1
 
         /**

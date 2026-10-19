@@ -90,6 +90,28 @@ fun List<Subscription>.reminderKeysToWithdraw(today: LocalDate, leadDays: Int): 
     return filter { it.key !in due }.map { it.key }
 }
 
+/**
+ * Whether a "charged you anyway" or "may still be active" alert has been dealt with: the subscription is gone, or it no longer
+ * renews (a revocation arrived, the plan ended or lapsed). Until then the alert stays, since the charge it reports still stands.
+ */
+fun chargeAlertResolved(subscription: Subscription?): Boolean = subscription == null || !subscription.isLive
+
+/**
+ * Whether the evening-before "verify that you have cancelled the AutoPay" nudge no longer matters: the plan has ended or the bank's
+ * own text says the mandate is revoked, the user's answer is gone, or the renewal day has begun (a debit from then on is reported by
+ * the other alerts, and a mandate can no longer be saved in time).
+ */
+fun verifyCancelResolved(subscription: Subscription?, renewal: LocalDate?, today: LocalDate): Boolean =
+    chargeAlertResolved(subscription) ||
+        renewal == null || !today.isBefore(renewal) ||
+        subscription!!.mandateRevoked()
+
+/** A bank or mail revocation as new as the newest mandate: the AutoPay the user was asked about is off. */
+fun Subscription.mandateRevoked(): Boolean {
+    val latestMandate = events.filterIsInstance<PaymentEvent.MandateCreated>().maxOfOrNull { it.receivedOn }
+    return events.filterIsInstance<PaymentEvent.MandateRevoked>().any { latestMandate == null || !it.receivedOn.isBefore(latestMandate) }
+}
+
 /** The reminder stage for the day before the renewal. */
 const val DAY_BEFORE_STAGE = 2
 

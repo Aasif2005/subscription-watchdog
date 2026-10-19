@@ -77,10 +77,9 @@ class UsageCoverageTest {
     }
 
     @Test
-    fun `a long span may start one day before the renewal but not two`() {
-        val oneBefore = verdict(listOf(UsageSpan(renewal.minusDays(1), 29, 600_000)))
-        assertIs<UsageVerdict.Low>(oneBefore)
-        assertEquals(10, oneBefore.minutes)
+    fun `a long span counts only when all of it lies inside the period`() {
+        // A stretch that began before the period cannot be split, so none of it is used.
+        assertEquals(UsageVerdict.NoData, verdict(listOf(UsageSpan(renewal.minusDays(1), 29, 600_000))))
         assertEquals(UsageVerdict.NoData, verdict(listOf(UsageSpan(renewal.minusDays(2), 29, 600_000))))
         // And may not run into today.
         assertEquals(UsageVerdict.NoData, verdict(listOf(UsageSpan(renewal, 29, 600_000))))
@@ -125,8 +124,7 @@ class UsageCoverageTest {
             var covered = 0
             var total = 0L
             for (s in spans.sortedBy { it.days }) {
-                val earliest = if (s.days > 1) start.minusDays(1) else start
-                if (s.firstDay.isBefore(earliest) || s.lastDay.isAfter(lastDay)) continue
+                if (s.firstDay.isBefore(start) || s.lastDay.isAfter(lastDay)) continue
                 val ds = (0 until s.days).map { s.firstDay.plusDays(it.toLong()) }
                 if (ds.any { it in taken }) continue
                 taken += ds; covered += s.days; total += s.millis
@@ -163,8 +161,12 @@ class UsageCoverageTest {
         val live = engine.build(listOf(mandate("netflix", "Netflix", LocalDate.of(2026, 9, 20)), mandate("hotstar", "JioHotstar", LocalDate.of(2026, 9, 25))), now)
         assertEquals(setOf("com.netflix.mediaclient", "in.startv.hotstar", "in.startv.hotstar.dplus"), usagePackagesToWatch(live))
         // A service that is not on the tracked list adds nothing.
-        val other = engine.build(listOf(mandate("spotify", "Spotify", LocalDate.of(2026, 9, 20))), now)
+        val other = engine.build(listOf(mandate("zomato", "Zomato", LocalDate.of(2026, 9, 20))), now)
         assertEquals(emptySet(), usagePackagesToWatch(other))
+        // Music is watched through playback time, which only newer Android reports; without it the app would read as never used.
+        val music = engine.build(listOf(mandate("spotify", "Spotify", LocalDate.of(2026, 9, 20))), now)
+        assertEquals(setOf("com.spotify.music"), usagePackagesToWatch(music))
+        assertEquals(emptySet(), usagePackagesToWatch(music, playbackSupported = false))
         // A subscription whose AutoPay was revoked is no longer watched.
         val revoked = MandateRevoked("netflix", "Netflix", LocalDate.of(2026, 10, 1), null, amount = money("199.00"), activeUntil = null)
         val ended = engine.build(listOf(mandate("netflix", "Netflix", LocalDate.of(2026, 9, 20)), revoked), now)

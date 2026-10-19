@@ -57,6 +57,11 @@ import androidx.compose.ui.unit.dp
 import com.aasif.watchdog.core.engine.ReplacementQuestion
 import com.aasif.watchdog.core.engine.canSnoozeReminder
 import com.aasif.watchdog.core.engine.monthlyTotal
+import com.aasif.watchdog.core.usage.ON_THIS_DEVICE
+import com.aasif.watchdog.core.usage.trackedApp
+import com.aasif.watchdog.core.usage.usageLineText
+import com.aasif.watchdog.core.usage.usageTrackingText
+import com.aasif.watchdog.core.usage.usageNoteText
 import com.aasif.watchdog.core.merchant.PlanPrices
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
@@ -96,6 +101,7 @@ fun DashboardScreen(
     onPlanCancel: (Subscription) -> Unit,
     onSnooze: (Subscription) -> Unit,
     usageHints: Map<String, String>,
+    usageFigures: Map<String, UsageFigure>,
     autopayDue: Set<String>,
     onAutopayCancelled: (Subscription) -> Unit,
     onAutopayStillActive: (Subscription) -> Unit,
@@ -198,7 +204,7 @@ fun DashboardScreen(
             if (live.isNotEmpty()) item { SectionHeader("Active") }
             items(live, key = { it.key }) { sub ->
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    SubscriptionRow(sub, onClick = { onOpen(sub.key) })
+                    SubscriptionRow(sub, onClick = { onOpen(sub.key) }, barelyUsed = usageFigures[sub.key]?.barelyUsed == true)
                     // Only close to a renewal, so the question is not on the dashboard all the time.
                     if (sub.key in autopayDue) AutopayStrip(sub, onAutopayCancelled, onAutopayStillActive)
                 }
@@ -318,7 +324,7 @@ private fun SectionHeader(text: String) {
 }
 
 @Composable
-private fun SubscriptionRow(sub: Subscription, onClick: () -> Unit) {
+private fun SubscriptionRow(sub: Subscription, onClick: () -> Unit, barelyUsed: Boolean = false) {
     val renewsSoon = sub.isLive && sub.nextRenewal?.let { ChronoUnit.DAYS.between(LocalDate.now(), it) in 0..3 } == true
     Card(Modifier.fillMaxWidth().clickable(onClick = onClick)) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -330,6 +336,9 @@ private fun SubscriptionRow(sub: Subscription, onClick: () -> Unit) {
                     color = if (renewsSoon || sub.status == SubscriptionStatus.TRIAL) MaterialTheme.colorScheme.error
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (barelyUsed) {
+                    Text("Barely used $ON_THIS_DEVICE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.tertiary)
+                }
             }
             Column(horizontalAlignment = Alignment.End) {
                 Text(if (sub.amountKnown) formatMoney(sub.amount) else "?", style = MaterialTheme.typography.titleMedium)
@@ -361,6 +370,7 @@ fun DetailScreen(
     autopayAsk: Boolean,
     onAutopayCancelled: (Subscription) -> Unit,
     onAutopayStillActive: (Subscription) -> Unit,
+    usageFigure: UsageFigure? = null,
 ) {
     val uriHandler = LocalUriHandler.current
     Scaffold(
@@ -425,6 +435,23 @@ fun DetailScreen(
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Text("Confidence: ${sub.confidence.name.lowercase()}", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+
+            usageFigure?.let { figure ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        val summary = figure.summary
+                        Text(
+                            if (summary != null) usageLineText(summary, ::formatDate) else usageTrackingText(figure.start, ::formatDate),
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            usageNoteText(summary?.playback ?: sub.trackedApp()?.measuresPlayback == true),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
             }
@@ -647,8 +674,8 @@ fun UsageDisclosureDialog(onOpenSettings: () -> Unit, onNotNow: () -> Unit) {
         text = {
             Text(
                 "To spot a subscription you hardly use, Watchdog can read how many minutes each day the app of a subscription you " +
-                    "have was open, if it is one of Netflix, YouTube, Prime Video, JioHotstar, SonyLIV, ZEE5, ChatGPT, Claude or LinkedIn, on " +
-                    "this phone, and the older daily, weekly and monthly totals Android still keeps for them. Nothing else on your phone is read and nothing leaves it. It is only used to say, before a renewal, " +
+                    "have was open (or, for Spotify and Apple Music, how long it was playing), if it is one of Netflix, YouTube, Prime Video, JioHotstar, SonyLIV, ZEE5, ChatGPT, Claude, LinkedIn, Spotify or Apple Music, on " +
+                    "this device only, and the older daily, weekly and monthly totals Android still keeps for them. Nothing else on your phone is read and nothing leaves it. It is only used to say, before a renewal, " +
                     "that you barely used the app. Android calls the switch \"Usage access\": allow it for Watchdog to start, and " +
                     "turn it off there at any time, which also deletes what was saved.",
             )
@@ -665,7 +692,7 @@ private fun UsageAccessLine(onOpenSettings: () -> Unit) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("Low-use hints are off", fontWeight = FontWeight.SemiBold)
             Text(
-                "Allow Usage access for Watchdog to be told when a streaming or AI subscription was barely used before it renews.",
+                "Allow Usage access for Watchdog to see how much a streaming, music or AI subscription is used on this device, and be told when it was barely used before it renews.",
                 style = MaterialTheme.typography.bodyMedium,
             )
         }

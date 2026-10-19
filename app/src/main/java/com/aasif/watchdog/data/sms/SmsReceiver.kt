@@ -28,7 +28,10 @@ class SmsReceiver : BroadcastReceiver() {
         val repository = (context.applicationContext as WatchdogApp).repository
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                if (repository.ingest(messages, EventSource.SMS)) Workers.remindNow(context.applicationContext)
+                if (repository.ingest(messages, EventSource.SMS)) {
+                    Workers.remindNow(context.applicationContext)
+                    Workers.gmailSyncSoonIfChannel(context.applicationContext, messages.map { it.body })
+                }
             } finally {
                 pending.finish()
             }

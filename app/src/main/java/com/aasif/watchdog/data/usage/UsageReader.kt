@@ -1,6 +1,7 @@
 package com.aasif.watchdog.data.usage
 
 import android.app.AppOpsManager
+import android.app.usage.UsageStats
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -47,7 +48,7 @@ class UsageReader(private val context: Context) {
      * other apps are used, never their time. A bucket longer than its level allows is Android answering a finer query
      * with a coarser bucket it no longer has a finer one for, and is not used at that level.
      */
-    fun history(packages: Collection<String>, nowMillis: Long): Map<String, UsageHistory> {
+    fun history(packages: Collection<String>, nowMillis: Long, playback: Set<String> = emptySet()): Map<String, UsageHistory> {
         val manager = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return emptyMap()
         val wanted = packages.toSet()
         val since = nowMillis - LOOKBACK_MILLIS
@@ -57,11 +58,17 @@ class UsageReader(private val context: Context) {
                 .filter { it.lastTimeStamp - it.firstTimeStamp <= level.nominalMillis * LENGTH_SLACK }
             val exist = stats.map { it.firstTimeStamp }.toSortedSet()
             val millis = HashMap<Pair<String, Long>, Long>()
-            for (stat in stats) if (stat.packageName in wanted) millis.merge(stat.packageName to stat.firstTimeStamp, stat.totalTimeInForeground, Long::plus)
+            for (stat in stats) if (stat.packageName in wanted) {
+                millis.merge(stat.packageName to stat.firstTimeStamp, timeOf(stat, stat.packageName in playback), Long::plus)
+            }
             for (pkg in wanted) buckets.getOrPut(pkg) { ArrayList() } += exist.map { UsageBucket(level, it, millis[pkg to it] ?: 0L) }
         }
         return buckets.mapValues { (_, list) -> residualSpans(list, nowMillis) }
     }
+
+    /** Screen time, or for a music app the time its playback service ran (Android 10 and later; 0 before, which callers never ask for). */
+    private fun timeOf(stat: UsageStats, playback: Boolean): Long =
+        if (playback && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) stat.totalTimeForegroundServiceUsed else stat.totalTimeInForeground
 
     private companion object {
 

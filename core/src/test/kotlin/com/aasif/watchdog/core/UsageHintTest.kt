@@ -18,11 +18,11 @@ class UsageHintTest {
     @Test
     fun `a full period keeps the plain wording`() {
         assertEquals(
-            "Since 20 Apr we saw 12 min of Netflix on this phone. Do you want it for next month?",
+            "Since 20 Apr we saw 12 min of Netflix on this device. Do you want it for next month?",
             usageHintText("Netflix", "month", UsageVerdict.Low(12, from, to), ::d),
         )
         assertEquals(
-            "We saw no use of Netflix on this phone from 20 Apr to 15 Oct. Do you want it for next month?",
+            "We saw no use of Netflix on this device from 20 Apr to 15 Oct. Do you want it for next month?",
             usageHintText("Netflix", "month", UsageVerdict.Unused(from, to), ::d),
         )
     }
@@ -31,7 +31,7 @@ class UsageHintTest {
     fun `a partial period names the dates seen and says earlier use was not available`() {
         val low = usageHintText("Netflix", "year", UsageVerdict.Low(95, from, to, partial = true), ::d)!!
         assertEquals(
-            "From 20 Apr to 15 Oct we saw 1 h 35 min of Netflix on this phone. " +
+            "From 20 Apr to 15 Oct we saw 1 h 35 min of Netflix on this device. " +
                 "Use before 20 Apr wasn't available, so this may not reflect the whole year. Do you want it for next year?",
             low,
         )

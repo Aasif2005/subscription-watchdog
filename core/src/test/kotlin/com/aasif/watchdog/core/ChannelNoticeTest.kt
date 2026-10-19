@@ -179,4 +179,58 @@ class ChannelNoticeTest {
         val named = build(SourcedEvent(bankMandate(), false), SourcedEvent(receipt("claude"), true), SourcedEvent(sms.parse(iobNotice)!!, false))
         assertEquals(listOf("claude"), named.heldForMail(catchingUp = true).map { it.merchantId })
     }
+
+    private val iobDebit = Sms(
+        "JX-IOBCHN-S",
+        "Your a/c XXXXX17 debited for payee Google Play for Rs. 1999.00 on 2026-10-19, ref 562864622926.If not you, report to your bank immediately-IOB.",
+        LocalDateTime.of(2026, 10, 19, 0, 46),
+    )
+    private val oct19 = LocalDate.of(2026, 10, 19)
+
+    @Test
+    fun `the bank's debit text moves Claude Pro past the day it was paid and leaves no Google Play plan`() {
+        val subs = build(
+            SourcedEvent(bankMandate(), false), SourcedEvent(receipt("claude"), true),
+            SourcedEvent(sms.parse(iobNotice)!!, false), SourcedEvent(sms.parse(iobDebit)!!, false),
+            today = oct19,
+        )
+        val claude = subs.single()
+        assertEquals("claude", claude.merchantId)
+        assertTrue(claude.nextRenewal!!.isAfter(oct19), claude.nextRenewal.toString())
+        assertTrue(claude.charges.any { it.date == oct19 && it.amount == money("1999.00") }, claude.charges.toString())
+    }
+
+    @Test
+    fun `a debit of another amount stays on the channel`() {
+        val other = iobDebit.copy(body = iobDebit.body.replace("1999.00", "149.00"))
+        val named = nameChannelEvents(
+            listOf(SourcedEvent(bankMandate(), false), SourcedEvent(receipt("claude"), true), SourcedEvent(sms.parse(other)!!, false)),
+            play,
+        )
+        assertEquals("googleplay", named.filterIsInstance<PaymentEvent.Debit>().single().merchantId)
+    }
+
+    @Test
+    fun `a debit of the same price far from the app's schedule is a one-off, not its charge`() {
+        val oneOff = iobDebit.copy(body = iobDebit.body.replace("2026-10-19", "2026-10-07"))
+        val named = nameChannelEvents(
+            listOf(SourcedEvent(bankMandate(), false), SourcedEvent(receipt("claude"), true), SourcedEvent(sms.parse(oneOff)!!, false)),
+            play,
+        )
+        assertEquals("googleplay", named.filterIsInstance<PaymentEvent.Debit>().single().merchantId)
+    }
+
+    @Test
+    fun `two Play apps at one price with no date to tell them apart leave the debit unnamed`() {
+        val oct1 = LocalDate.of(2026, 10, 1)
+        val named = nameChannelEvents(
+            listOf(
+                SourcedEvent(bankMandate(), false), SourcedEvent(receipt("claude"), true),
+                SourcedEvent(bankMandate(on = oct1, ref = "m2"), false), SourcedEvent(receipt("chatgpt", "1999.00", oct1), true),
+                SourcedEvent(sms.parse(iobDebit.copy(body = iobDebit.body.replace("2026-10-19", "2026-10-10")))!!, false),
+            ),
+            play,
+        )
+        assertEquals("googleplay", named.filterIsInstance<PaymentEvent.Debit>().single().merchantId)
+    }
 }

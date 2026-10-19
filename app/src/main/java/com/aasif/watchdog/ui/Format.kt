@@ -8,6 +8,7 @@ import com.aasif.watchdog.core.model.RenewalSource
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import com.aasif.watchdog.core.usage.UsageVerdict
+import com.aasif.watchdog.core.usage.trackedApp
 import com.aasif.watchdog.core.usage.usageHintText
 import java.math.BigDecimal
 import java.text.NumberFormat
@@ -148,4 +149,4 @@ fun Frequency.periodWord(): String = when (this) {
 
 /** What the screen time since the last renewal says, ready to put after a renewal reminder; null when there is nothing to say. See [usageHintText]. */
 fun Subscription.usageHint(verdict: UsageVerdict): String? =
-    usageHintText(name, frequency.periodWord(), verdict, ::formatDate)
+    usageHintText(name, frequency.periodWord(), verdict, ::formatDate, playback = trackedApp()?.measuresPlayback == true)

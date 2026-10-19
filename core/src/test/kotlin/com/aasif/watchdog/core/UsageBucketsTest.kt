@@ -4,6 +4,7 @@ import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.usage.isCompleteBucket
 import com.aasif.watchdog.core.usage.usageDayLabel
 import com.aasif.watchdog.core.usage.usageKeepDays
+import com.aasif.watchdog.core.usage.usageRetentionDays
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -55,5 +56,19 @@ class UsageBucketsTest {
         assertEquals(450, usageKeepDays(listOf(Frequency.MONTHLY.approxDays, Frequency.YEARLY.approxDays)))
         // Nothing tracked yet: a modest default.
         assertEquals(120, usageKeepDays(emptyList()))
+    }
+
+    @Test
+    fun `one retention reaches the oldest period start of any subscription and never drops below the span floor`() {
+        val monthly = Frequency.MONTHLY.approxDays
+        // A monthly plan taken five days ago alone still keeps what the yearly spans need.
+        assertEquals(450, usageRetentionDays(listOf(monthly), listOf(5)))
+        // A second plan taken 349 days ago (ChatGPT Go, first debit a year after the receipt) is covered too: 349 + 85 margin is under the floor.
+        assertEquals(450, usageRetentionDays(listOf(monthly, monthly), listOf(5, 349)))
+        // The oldest start across plans decides once it passes the floor, whichever plan it belongs to.
+        assertEquals(500 + 85, usageRetentionDays(listOf(monthly, monthly), listOf(500, 5)))
+        assertEquals(500 + 85, usageRetentionDays(listOf(monthly, monthly), listOf(5, 500)))
+        // Nothing tracked yet.
+        assertEquals(450, usageRetentionDays(emptyList(), emptyList()))
     }
 }

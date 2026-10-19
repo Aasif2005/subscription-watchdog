@@ -168,4 +168,57 @@ class PlayOrderMailTest {
         val subs = engine.build(named, LocalDate.of(2026, 10, 14))
         assertTrue(subs.none { it.isLive }, subs.toString())
     }
+
+    private fun renewalReceipt(domain: String? = "google.com") = parser.parse(
+        Sms(
+            sender,
+            """
+            Your Google Play Order Receipt from 19 Oct 2026 Thank you
+            Your subscription from Anthropic, PBC on Google Play has renewed. Manage your subscriptions
+            To help keep your subscription active, add a backup payment method.
+            Add backup
+            Order number: GPA.3327-4108-8918-15298..0
+            Order date: 19 Oct 2026 12:47:39 am IST
+            Your account: someone@example.com
+            Item Price
+            Claude Pro Subscription (Claude by Anthropic) ₹1,999.00/month
+            Auto-renewing subscription
+            Total: ₹1,999.00/month
+            (Includes GST of ₹304.93)
+            Payment method: UPI: GPay
+            By subscribing, you authorise us to charge you the subscription cost (as described above) automatically,
+            charged to the payment method provided until cancelled. Learn how to cancel. Keep this for your records.
+            Questions? Visit Anthropic, PBC.
+            """.trimIndent().replace('\n', ' '),
+            LocalDateTime.of(2026, 10, 19, 0, 47),
+            domain,
+            "Your Google Play Order Receipt from 19 Oct 2026",
+        ),
+    )
+
+    @Test
+    fun `a Play renewal receipt is the charge, not a new plan`() {
+        val e = assertIs<PaymentEvent.Debit>(renewalReceipt())
+        assertEquals("claude", e.merchantId)
+        assertEquals(money("1999.00"), e.amount)
+        assertEquals(LocalDate.of(2026, 10, 19), e.date)
+        assertNotNull(e.mandateRef)
+    }
+
+    @Test
+    fun `a renewal receipt that is not signed by Google is ignored`() {
+        assertNull(renewalReceipt(domain = null))
+        assertNull(renewalReceipt(domain = "example.org"))
+    }
+
+    @Test
+    fun `a renewal receipt moves the plan its purchase receipt started past the day it was paid`() {
+        val purchase = PaymentEvent.MandateCreated(
+            "claude", "Claude", LocalDate.of(2026, 9, 18), money("1999.00"), Frequency.MONTHLY, LocalDate.of(2026, 9, 18), null,
+            autoRenews = true, receivedAt = LocalDateTime.of(2026, 9, 18, 11, 30), fromMail = true,
+        )
+        val sub = engine.build(listOfNotNull(purchase, renewalReceipt()), LocalDate.of(2026, 10, 19)).single()
+        assertTrue(sub.nextRenewal!!.isAfter(LocalDate.of(2026, 10, 19)), sub.toString())
+        assertTrue(sub.charges.any { it.date == LocalDate.of(2026, 10, 19) }, sub.charges.toString())
+    }
 }

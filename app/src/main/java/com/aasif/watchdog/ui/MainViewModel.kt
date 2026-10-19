@@ -21,6 +21,8 @@ import com.aasif.watchdog.core.engine.pendingQuestions
 import com.aasif.watchdog.core.engine.replacementQuestions
 import com.aasif.watchdog.core.engine.autopayQuestions
 import com.aasif.watchdog.core.engine.dueForReminder
+import com.aasif.watchdog.core.usage.UsageSummary
+import com.aasif.watchdog.core.usage.UsageVerdict
 import com.aasif.watchdog.core.usage.trackedApp
 import com.aasif.watchdog.core.engine.revocationQuestions
 import com.aasif.watchdog.core.model.Frequency
@@ -173,6 +175,16 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         Workers.gmailSyncNow(app)
     }
 
+    private var lastResumeSync = 0L
+
+    /** Opening the app reads any mail that arrived meanwhile, at most every 15 minutes. */
+    fun syncMailOnOpen() {
+        val now = System.currentTimeMillis()
+        if (!repo.gmailImportEnabled || repo.gmailCatchingUp || now - lastResumeSync < RESUME_SYNC_GAP_MS) return
+        lastResumeSync = now
+        Workers.gmailSyncSoon(app, java.time.Duration.ZERO)
+    }
+
     /** Re-checks state that can only change outside this screen: Settings, or a background sync. */
     fun refreshGmailState() {
         gmailImportEnabled = repo.gmailImportEnabled
@@ -314,6 +326,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var usagePromptDue by mutableStateOf(false)
         private set
 
+    /** Subscription key to what its app's use has been on this device, for the dashboard tag and the Detail line. */
+    var usageFigures: Map<String, UsageFigure> by mutableStateOf(emptyMap())
+        private set
+
     /** Subscription key to the sentence about its low use, for the reminders the dashboard is showing. */
     var usageHints: Map<String, String> by mutableStateOf(emptyMap())
         private set
@@ -333,6 +349,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             usageHints = subs.dueForReminder(today, repo.reminderLeadDays).mapNotNull { sub ->
                 val renewal = sub.nextRenewal ?: return@mapNotNull null
                 sub.usageHint(repo.usageVerdictFor(sub, renewal, today))?.let { sub.key to it }
+            }.toMap()
+            usageFigures = subs.filter { it.isInUse && it.trackedApp() != null }.mapNotNull { sub ->
+                val reading = repo.usageFor(sub, today) ?: return@mapNotNull null
+                sub.key to UsageFigure(reading.start, reading.summary, barelyUsed = reading.verdict is UsageVerdict.Low || reading.verdict is UsageVerdict.Unused)
             }.toMap()
         }
     }
@@ -514,3 +534,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         goToDashboard()
     }
 }
+
+/** Opening the app syncs mail at most this often. */
+private const val RESUME_SYNC_GAP_MS = 15L * 60 * 1000
+
+/** What an app's use has been on this device, and whether that is little enough to tag the subscription. */
+data class UsageFigure(val start: LocalDate, val summary: UsageSummary?, val barelyUsed: Boolean)

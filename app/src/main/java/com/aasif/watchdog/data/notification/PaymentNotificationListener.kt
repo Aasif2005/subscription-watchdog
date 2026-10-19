@@ -61,7 +61,10 @@ class PaymentNotificationListener : NotificationListenerService() {
                     app.repository.recordNotificationFound(message.sender)
                 }
             }
-            if (any) Workers.remindNow(app)
+            if (any) {
+                Workers.remindNow(app)
+                Workers.gmailSyncSoonIfChannel(app, messages.map { it.body })
+            }
         }
     }
 

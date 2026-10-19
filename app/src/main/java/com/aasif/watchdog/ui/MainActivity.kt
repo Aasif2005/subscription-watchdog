@@ -102,7 +102,7 @@ private fun App(vm: MainViewModel = viewModel()) {
             vm.signIn(account) { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
         }
     }
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState(); vm.refreshNotificationStats() }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState(); vm.refreshNotificationStats(); vm.syncMailOnOpen() }
     // Renewal reminders are notifications; asked for on the permission screen, and re-checked when the user comes back from Settings.
     var notificationsAllowed by remember { mutableStateOf(NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { notificationsAllowed = NotificationManagerCompat.from(context).areNotificationsEnabled() }
@@ -203,6 +203,7 @@ private fun App(vm: MainViewModel = viewModel()) {
                 onPlanCancel = vm::planCancelOf,
                 onSnooze = vm::snoozeSubscription,
                 usageHints = vm.usageHints,
+                usageFigures = vm.usageFigures,
                 // The renewal question above already offers Cancel; asking about the AutoPay as well is the same question twice.
                 autopayDue = shown?.let(vm::autopayDue).orEmpty() - questions.map { it.key }.toSet(),
                 onAutopayCancelled = vm::alreadyCancelled,
@@ -270,6 +271,7 @@ private fun App(vm: MainViewModel = viewModel()) {
                     onPlanLength = { vm.setPlanLength(sub.key, it) },
                     onStillActive = { vm.confirmStillActive(sub) },
                     autopayAsk = vm.autopayAsk(sub),
+                    usageFigure = vm.usageFigures[sub.key],
                     onAutopayCancelled = { vm.alreadyCancelled(sub) },
                     onAutopayStillActive = { vm.autopayStillActive(sub) },
                 )

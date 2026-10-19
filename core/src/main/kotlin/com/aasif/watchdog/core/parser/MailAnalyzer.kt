@@ -14,6 +14,12 @@ enum class MailKind {
      */
     PURCHASE,
 
+    /**
+     * A store's receipt for a charge on a plan already running ("Your subscription from Anthropic, PBC on Google Play has renewed.
+     * Total: ₹1,999.00/month"): a payment was taken today, and nothing new was bought.
+     */
+    RENEWED,
+
     /** "Your subscription has been cancelled", "auto-renew is turned off": the AutoPay is off. */
     CANCELLED,
 
@@ -99,6 +105,9 @@ internal object MailAnalyzer {
 
     private val expired = rx("""\b$subscriptionNoun\b[^.]{0,60}?\b(has|have)\s+(now\s+)?(expired|ended)\b|\b$subscriptionNoun\b[^.]{0,30}\bexpired\b""")
 
+    /** Past tense and about the subscription itself: "will renew on" is a notice and "renews" in a footer is nothing. */
+    private val renewed = rx("""\b$subscriptionNoun\b[^.]{0,80}?\bhas\s+(been\s+)?(successfully\s+)?renewed\b""")
+
     private val purchase = rx(
         """\border\s+receipt\b|\bsubscription\s+purchase\b|\byour\s+receipt\s+from\b|\bthank\s+you\s+for\s+your\s+(purchase|order|subscription)\b""" +
             """|\byou('ve|\s+have)\s+(made\s+a\s+)?(subscription\s+)?purchased?\b""",
@@ -124,6 +133,7 @@ internal object MailAnalyzer {
             cancelled.containsMatchIn(text) -> if (marketing.containsMatchIn(body)) MailKind.MARKETING else MailKind.CANCELLED
             expired.containsMatchIn(text) -> if (marketing.containsMatchIn(body)) MailKind.MARKETING else MailKind.EXPIRED
             paymentIssue.containsMatchIn(text) -> MailKind.PAYMENT_ISSUE
+            renewed.containsMatchIn(text) && purchaseTotal.containsMatchIn(body) && purchaseAmount(body) != null -> MailKind.RENEWED
             purchase.containsMatchIn(text) && (Extractors.orderRef(body) != null || purchaseAmount(body) != null) -> MailKind.PURCHASE
             renewal(body, received) != null -> MailKind.RENEWAL_NOTICE
             else -> MailKind.OTHER
@@ -147,7 +157,7 @@ internal object MailAnalyzer {
                 facts += MailFact.NEXT_DATE
                 if (period.containsMatchIn(body)) facts += MailFact.PERIOD
             }
-            MailKind.PURCHASE -> {
+            MailKind.PURCHASE, MailKind.RENEWED -> {
                 if (purchaseAmount(body) != null) facts += MailFact.AMOUNT
                 if (period.containsMatchIn(body)) facts += MailFact.PERIOD
             }

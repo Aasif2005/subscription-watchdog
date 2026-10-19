@@ -55,6 +55,9 @@ class SmsParser(
             // amount and the word "cancelled" would read as a cancellation.
             if (assessment.kind == MailKind.PAYMENT_ISSUE || assessment.kind == MailKind.ACCOUNT_NOTICE) return null
             serviceNotice(sms, body, received, assessment)?.let { return it }
+            if (assessment.kind == MailKind.RENEWED && assessment.verdict == MailVerdict.EVENT) {
+                return renewalReceipt(merchant(sms, body), body, received)
+            }
             if (assessment.kind == MailKind.PURCHASE && assessment.verdict == MailVerdict.EVENT) {
                 val m = merchant(sms, body)
                 (trialReceipt(m, body, received) ?: introReceipt(sms, m, body, received) ?: paidReceipt(sms, m, body, received))?.let { return it }
@@ -180,6 +183,16 @@ class SmsParser(
             fromMail = true,
             planName = Extractors.itemName(body, m.name) { normalizer.findKnownIn(it)?.id == m.id },
         )
+    }
+
+    /**
+     * A store receipt for a renewal ("Your subscription ... has renewed", Total ₹1,999.00/month): the charge itself, dated the day the
+     * receipt came. It starts no plan (that would anchor the schedule on today, leaving "renews today" on the day it was paid), and the
+     * order number it carries is the original purchase's, which is what ties it to that plan.
+     */
+    private fun renewalReceipt(m: ResolvedMerchant, body: String, received: LocalDate): PaymentEvent.Debit? {
+        val amount = MailAnalyzer.purchaseAmount(body) ?: return null
+        return PaymentEvent.Debit(m.id, m.name, received, amount, received, viaMandate = true)
     }
 
     /** A purchase whose first payment is an introductory price: the plan is the price that follows. */

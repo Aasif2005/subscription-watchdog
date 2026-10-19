@@ -4,7 +4,9 @@ import com.aasif.watchdog.core.engine.ReminderAnswer
 import com.aasif.watchdog.core.engine.ReminderState
 import com.aasif.watchdog.core.engine.RenewalDayKind
 import com.aasif.watchdog.core.engine.canSnoozeReminder
+import com.aasif.watchdog.core.engine.chargeAlertResolved
 import com.aasif.watchdog.core.engine.chargedDespiteCancelPlan
+import com.aasif.watchdog.core.engine.verifyCancelResolved
 import com.aasif.watchdog.core.engine.isAwaitingAnswer
 import com.aasif.watchdog.core.engine.pendingQuestions
 import com.aasif.watchdog.core.engine.renewalDayKind
@@ -16,6 +18,7 @@ import com.aasif.watchdog.core.model.Charge
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Money
+import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.RenewalSource
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
@@ -230,5 +233,33 @@ class ReminderDecisionTest {
         assertFalse(shouldRemind(renewal.atTime(6, 59), renewal, ReminderState(lastStage = 2)))
         assertTrue(shouldRemind(renewal.atTime(7, 0), renewal, ReminderState(lastStage = 2)))
         assertTrue(shouldRemind(d("2026-10-17").atTime(9, 0), renewal, ReminderState()))
+    }
+
+    @Test
+    fun `a charge alert stays while the plan still renews and goes once it no longer does`() {
+        assertFalse(chargeAlertResolved(subscription("2026-10-05")))
+        assertTrue(chargeAlertResolved(subscription("2026-10-05", SubscriptionStatus.CANCELLED)))
+        assertTrue(chargeAlertResolved(subscription("2026-10-05", SubscriptionStatus.ENDING)))
+        assertTrue(chargeAlertResolved(null))
+    }
+
+    @Test
+    fun `the verify nudge goes when the renewal day begins, when the mandate is revoked, or when the answer is gone`() {
+        val live = subscription("2026-09-12")
+        val evening = d("2026-10-11")
+        assertFalse(verifyCancelResolved(live, d("2026-10-12"), evening))
+        assertTrue(verifyCancelResolved(live, d("2026-10-12"), d("2026-10-12")))
+        assertTrue(verifyCancelResolved(live, null, evening))
+        assertTrue(verifyCancelResolved(null, d("2026-10-12"), evening))
+        assertTrue(verifyCancelResolved(subscription("2026-09-12", SubscriptionStatus.CANCELLED), d("2026-10-12"), evening))
+        val revoked = live.copy(events = listOf(PaymentEvent.MandateRevoked("netflix", "Netflix", d("2026-10-11"))))
+        assertTrue(verifyCancelResolved(revoked, d("2026-10-12"), evening))
+        val oldRevocation = live.copy(
+            events = listOf(
+                PaymentEvent.MandateRevoked("netflix", "Netflix", d("2026-08-01")),
+                PaymentEvent.MandateCreated("netflix", "Netflix", d("2026-09-12"), Money(BigDecimal(649)), Frequency.MONTHLY, null, null),
+            ),
+        )
+        assertFalse(verifyCancelResolved(oldRevocation, d("2026-10-12"), evening))
     }
 }
