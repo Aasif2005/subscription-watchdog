@@ -109,7 +109,7 @@ fun Subscription.reminderText(date: LocalDate, now: LocalDateTime = LocalDateTim
         RenewalDayKind.EXACT ->
             "$name renews $whenText" to when {
                 dayOf -> "${price?.let { "$name $it" } ?: name} is due to be charged today. To stop it, revoke the AutoPay now, then check your bank for a debit."
-                else -> price?.let { "$it (${frequency.label.lowercase()}) will be charged on $on." } ?: "Renews on $on."
+                else -> (price?.let { "$it (${frequency.label.lowercase()}) will be charged on $on." } ?: "Renews on $on.") + movedNote(date)
             }
         RenewalDayKind.ESTIMATED ->
             "$name renews $whenText" to when {
@@ -118,6 +118,10 @@ fun Subscription.reminderText(date: LocalDate, now: LocalDateTime = LocalDateTim
             }
     }
 }
+
+/** " Your bank moved it from 18 Oct." when the bank's notice shifted the debit from the plan's own date; empty otherwise. */
+fun Subscription.movedNote(date: LocalDate): String =
+    movedFrom?.takeIf { date == nextRenewal }?.let { " Your bank moved it from ${formatDate(it)}." }.orEmpty()
 
 fun RenewalSource.explanation(): String = when (this) {
     RenewalSource.USER_SUPPLIED -> "You told us"

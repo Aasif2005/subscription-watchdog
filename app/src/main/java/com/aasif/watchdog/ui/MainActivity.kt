@@ -17,6 +17,7 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.Composable
+import androidx.core.app.NotificationManagerCompat
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -27,6 +28,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.aasif.watchdog.core.engine.heldForMail
 import com.aasif.watchdog.data.notification.PaymentNotificationListener
 import com.aasif.watchdog.work.ReminderActions
 import com.aasif.watchdog.work.ReminderChannel
@@ -94,11 +96,18 @@ private fun App(vm: MainViewModel = viewModel()) {
         }
     }
     val connectGmail = { chooseGmailAccount.launch(vm.chooseGmailAccountIntent()) }
+    // "Continue with Google" is the same chooser, but the account picked also becomes the signed-in profile.
+    val signInChooser = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        result.data?.getStringExtra(android.accounts.AccountManager.KEY_ACCOUNT_NAME)?.let { account ->
+            vm.signIn(account) { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
+        }
+    }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState(); vm.refreshNotificationStats() }
-    // Renewal reminders are notifications; asked for once on launch.
-    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+    // Renewal reminders are notifications; asked for on the permission screen, and re-checked when the user comes back from Settings.
+    var notificationsAllowed by remember { mutableStateOf(NotificationManagerCompat.from(context).areNotificationsEnabled()) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { notificationsAllowed = NotificationManagerCompat.from(context).areNotificationsEnabled() }
+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        notificationsAllowed = NotificationManagerCompat.from(context).areNotificationsEnabled()
     }
     // SMS is optional: the dashboard offers it, and the user decides.
     var hasSmsAccess by remember { mutableStateOf(vm.hasSmsAccess()) }
@@ -123,40 +132,92 @@ private fun App(vm: MainViewModel = viewModel()) {
     }
     BackHandler(enabled = vm.canGoBack) { vm.back() }
 
-    when (val screen = vm.screen) {
-        Screen.Dashboard -> DashboardScreen(
-            subscriptions = subscriptions,
-            smsSupported = vm.smsSupported,
-            hasSmsAccess = hasSmsAccess,
-            onGrantSms = { askSms.launch(arrayOf(Manifest.permission.READ_SMS, Manifest.permission.RECEIVE_SMS)) },
-            hasNotificationAccess = hasNotificationAccess,
-            onOpen = { vm.open(Screen.Detail(it)) },
-            onAdd = { vm.open(Screen.AddManual) },
-            onRescan = vm::rescan,
-            onGrantNotificationAccess = { openNotificationAccessSettings(context) },
-            gmailImportEnabled = vm.gmailImportEnabled,
-            gmailNeedsConsent = vm.gmailNeedsConsent,
-            gmailBackfillComplete = vm.gmailBackfillComplete,
-            onConnectGmail = connectGmail,
-            onOpenProfile = { vm.refreshNotificationStats(); vm.open(Screen.Profile) },
-            pendingQuestions = subscriptions?.let(vm::pendingQuestions).orEmpty(),
-            onKeep = vm::keepSubscription,
-            onPlanCancel = vm::planCancelOf,
-            onSnooze = vm::snoozeSubscription,
-            usageHints = vm.usageHints,
-            autopayDue = subscriptions?.let(vm::autopayDue).orEmpty(),
-            onAutopayCancelled = vm::alreadyCancelled,
-            onAutopayStillActive = vm::autopayStillActive,
-            replacementQuestions = subscriptions?.let(vm::replacementQuestions).orEmpty(),
-            onReplaces = vm::replacesIt,
-            onDifferentApp = vm::differentApp,
-            revocationQuestions = subscriptions?.let(vm::revocationQuestions).orEmpty(),
-            onRevocationYes = vm::revocationWasThisOne,
-            onRevocationNo = vm::revocationWasNot,
-            onSaveUserFact = vm::setUserFact,
-            onDismissUserFact = vm::dismissUserFact,
-            onHide = vm::hide,
+    // The one list the permission pages, the summary and the dashboard all read.
+    val gmailLinked = vm.gmailAccounts.isNotEmpty() && vm.gmailAccounts.none { it.needsConsent }
+    val permissions = buildList {
+        if (vm.smsSupported) add(
+            PermissionItem(
+                "sms", "Bank texts (SMS)",
+                "Reads payment and AutoPay texts from your bank to find subscriptions and their renewal dates. They stay on this phone.",
+                "Read bank texts for AutoPay dates",
+                hasSmsAccess,
+            ) { askSms.launch(arrayOf(Manifest.permission.READ_SMS, Manifest.permission.RECEIVE_SMS)) },
         )
+        add(
+            PermissionItem(
+                "gmail", "Gmail (read only)",
+                vm.accountEmail?.let { "Finds receipts and renewal mail in $it." }
+                    ?: "Finds receipts and renewal mail in the Google account you choose.",
+                if (vm.gmailNeedsConsent) "Approve Gmail access again" else "Read Gmail receipts",
+                gmailLinked,
+            ) { connectGmail() },
+        )
+        add(
+            PermissionItem(
+                "notification-access", "Payment app alerts",
+                "Reads AutoPay alerts from GPay, PhonePe, Paytm and bank apps. Only payment apps are read.",
+                "Catch AutoPay alerts from UPI apps",
+                hasNotificationAccess,
+            ) { openNotificationAccessSettings(context) },
+        )
+        add(
+            PermissionItem(
+                "notifications", "Reminders",
+                "Lets Watchdog warn you before a subscription renews.",
+                "Get warned before a renewal",
+                notificationsAllowed,
+            ) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+                else openReminderSettings(context)
+            },
+        )
+        if (vm.usageSupported) add(
+            PermissionItem(
+                "usage", "Screen time (Usage access)",
+                "Tells you when you barely used a streaming or AI app before it renews. Only the apps of your own subscriptions are read.",
+                "See low use before a renewal",
+                vm.usageGranted,
+            ) { openUsageAccessSettings(context) },
+        )
+    }
+
+
+    when (val screen = vm.screen) {
+        Screen.Dashboard -> {
+            // A "Google Play" plan waits for the mail import, which may still say which app it is.
+            val shown = subscriptions?.heldForMail(vm.gmailCatchingUp)
+            val questions = shown?.let(vm::pendingQuestions).orEmpty()
+            DashboardScreen(
+                subscriptions = shown,
+                hasSmsAccess = hasSmsAccess,
+                missingPermissions = permissions.filter { !it.allowed },
+                onOpen = { vm.open(Screen.Detail(it)) },
+                onAdd = { vm.open(Screen.AddManual) },
+                onRescan = vm::rescan,
+                gmailImportEnabled = vm.gmailImportEnabled,
+                // Not while the import waits for the user to approve Gmail again: it is not running then.
+                gmailImporting = vm.gmailCatchingUp,
+                onOpenProfile = { vm.refreshNotificationStats(); vm.open(Screen.Profile) },
+                pendingQuestions = questions,
+                onKeep = vm::keepSubscription,
+                onPlanCancel = vm::planCancelOf,
+                onSnooze = vm::snoozeSubscription,
+                usageHints = vm.usageHints,
+                // The renewal question above already offers Cancel; asking about the AutoPay as well is the same question twice.
+                autopayDue = shown?.let(vm::autopayDue).orEmpty() - questions.map { it.key }.toSet(),
+                onAutopayCancelled = vm::alreadyCancelled,
+                onAutopayStillActive = vm::autopayStillActive,
+                replacementQuestions = shown?.let(vm::replacementQuestions).orEmpty(),
+                onReplaces = vm::replacesIt,
+                onDifferentApp = vm::differentApp,
+                revocationQuestions = shown?.let(vm::revocationQuestions).orEmpty(),
+                onRevocationYes = vm::revocationWasThisOne,
+                onRevocationNo = vm::revocationWasNot,
+                onSaveUserFact = vm::setUserFact,
+                onDismissUserFact = vm::dismissUserFact,
+                onHide = vm::hide,
+            )
+        }
         Screen.Profile -> ProfileScreen(
             gmailImportEnabled = vm.gmailImportEnabled,
             gmailAccounts = vm.gmailAccounts,
@@ -173,7 +234,15 @@ private fun App(vm: MainViewModel = viewModel()) {
             usageSupported = vm.usageSupported,
             usageGranted = vm.usageGranted,
             onUsageOpenSettings = { openUsageAccessSettings(context) },
+            accountEmail = vm.accountEmail,
+            onSignOut = vm::signOut,
         )
+        Screen.SignIn -> SignInScreen(
+            onContinueWithGoogle = { signInChooser.launch(vm.chooseGmailAccountIntent()) },
+        )
+        Screen.Permissions -> {
+            PermissionsScreen(accountEmail = vm.accountEmail, items = permissions, onContinue = vm::finishOnboarding)
+        }
         is Screen.Detail -> {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }
             if (subscriptions == null) {

@@ -134,6 +134,8 @@ class SubscriptionEngine(
             val ownSeries = series.filter { bucket(it.latestAmount) == amount }.maxByOrNull { it.debits.last().date }
             val ownNotices = notices.filter { it.amount?.let(::bucket) == amount }
             if (own.isEmpty() && ownSeries == null && ownNotices.isEmpty()) return@mapNotNull null
+            // Notices that state no amount cannot say which of the channel's apps they are for; on their own they are no plan.
+            if (amount == null && own.isEmpty() && ownSeries == null) return@mapNotNull null
             val latest = own.lastOrNull()
             Plan(
                 merchantId, name, ownSeries, latest, ownNotices, own,
@@ -250,7 +252,27 @@ class SubscriptionEngine(
             unplacedRevocationOn = plan.unplaced.takeIf { prediction.status.let { s -> s == SubscriptionStatus.ACTIVE || s == SubscriptionStatus.TRIAL } }
                 ?.filter { revocation -> plan.mandate?.let { revocation.followsMandate(it) } ?: true }
                 ?.maxOfOrNull { it.receivedOn },
+            movedFrom = movedFrom(plan, prediction, frequency, statedFrequency, lastCharge, known, today),
         )
+    }
+
+    /**
+     * The day the plan's own dates gave, when the bank's notice moved the debit a few days from it. Only a small shift counts:
+     * a notice weeks away from the estimate is a different cycle, not a moved one.
+     */
+    private fun movedFrom(
+        plan: Plan,
+        prediction: Prediction,
+        frequency: Frequency,
+        statedFrequency: Frequency?,
+        lastCharge: LocalDate?,
+        known: KnownMerchant?,
+        today: LocalDate,
+    ): LocalDate? {
+        if (prediction.source != RenewalSource.PRE_DEBIT_NOTICE || prediction.next == null) return null
+        val estimate = predict(plan.copy(notices = emptyList()), frequency, statedFrequency, lastCharge, known, today).next ?: return null
+        val shift = kotlin.math.abs(java.time.temporal.ChronoUnit.DAYS.between(estimate, prediction.next))
+        return estimate.takeIf { shift in 1..MAX_MOVE_DAYS }
     }
 
     /**
@@ -543,6 +565,9 @@ class SubscriptionEngine(
 
     companion object {
         private const val UNKNOWN_ID = "u:unknown"
+
+        /** How far a bank's notice may move the debit from the plan's own date and still be the same renewal. */
+        private const val MAX_MOVE_DAYS = 7L
         private const val TRIAL_MIN_DAYS = 5
 
         /**
@@ -655,6 +680,14 @@ private fun Subscription.newestMandateAt(): java.time.LocalDateTime =
 fun List<Subscription>.withoutEndedChannelPlans(): List<Subscription> =
     // A plan whose charge went unseen stays, so the user can say whether it is still active.
     filterNot { it.sharedBilling && !it.isInUse && it.missedChargeOn == null }
+
+/**
+ * While the mail import is still catching up, a plan on a billing channel ("Google Play") may be one a receipt still to be read will
+ * name (Spotify Premium). Showing or reminding about it before then shows a nameless card that turns into the real app minutes later,
+ * so it is held back until the import is done; if no mail names it by then, it appears as the channel.
+ */
+fun List<Subscription>.heldForMail(catchingUp: Boolean): List<Subscription> =
+    if (catchingUp) filterNot { it.sharedBilling } else this
 
 /** Live subscriptions renewing within [leadDays] of [today] (inclusive), soonest first. */
 fun List<Subscription>.dueForReminder(today: LocalDate, leadDays: Int): List<Subscription> =

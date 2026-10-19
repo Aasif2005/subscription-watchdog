@@ -229,6 +229,11 @@ data class Subscription(
      * cannot say whether a new amount is the same app, so nothing is linked there.
      */
     val changedFrom: EarlierPlan? = null,
+    /**
+     * When the bank's pre-debit notice gives a different day from the one the plan's own dates pointed to (Google Play said
+     * 18 Oct, the bank debits on the 19th): that earlier day, so the app can say the date moved instead of showing two dates.
+     */
+    val movedFrom: LocalDate? = null,
 ) {
     val lastCharged: LocalDate? get() = charges.maxOfOrNull { it.date }
     val monthlyCost: Money get() = Money(frequency.monthlyEquivalent(amount.amount), amount.currency)

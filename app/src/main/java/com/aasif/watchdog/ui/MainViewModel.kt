@@ -44,6 +44,8 @@ sealed interface Screen {
     data class Detail(val key: String) : Screen
     data object AddManual : Screen
     data object Profile : Screen
+    data object SignIn : Screen
+    data object Permissions : Screen
 }
 
 class MainViewModel(private val app: Application) : AndroidViewModel(app) {
@@ -53,8 +55,22 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     val subscriptions: StateFlow<List<Subscription>?> =
         repo.subscriptions().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
-    var screen: Screen by mutableStateOf(Screen.Dashboard)
+    /** Nothing past the sign-in screen opens until a Google account has been chosen; then the permission pages once, then the dashboard. */
+    var screen: Screen by mutableStateOf(
+        when {
+            repo.profileEmail == null -> Screen.SignIn
+            !repo.onboardingDone -> Screen.Permissions
+            else -> Screen.Dashboard
+        },
+    )
         private set
+
+    /** The Google account signed in with, shown on the permission and Profile screens. */
+    var profileEmail: String? by mutableStateOf(repo.profileEmail)
+        private set
+
+    /** The signed-in account, or else the first Gmail already linked (skipping sign-in does not unlink an inbox). */
+    val accountEmail: String? get() = profileEmail ?: gmailAccounts.firstOrNull()?.email
 
     /** Whether the dashboard is behind the current screen, so back returns to it instead of leaving. */
     var canGoBack: Boolean by mutableStateOf(false)
@@ -82,6 +98,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     /** See [WatchdogRepository.gmailBackfillComplete] — drives the dashboard's "still importing" card. */
     var gmailBackfillComplete: Boolean by mutableStateOf(repo.gmailBackfillComplete)
         private set
+
+    /** See [WatchdogRepository.gmailCatchingUp]; derived from the states above so it follows every refresh. */
+    val gmailCatchingUp: Boolean get() = gmailImportEnabled && !gmailNeedsConsent && !gmailBackfillComplete
 
     /**
      * A one-off message about the Gmail connection — permission declined, Play Services
@@ -138,11 +157,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         val auth = repo.gmailAuth.fromConsentResult(data) as? GmailAuth.Granted
         if (auth == null) {
             gmailMessage = "Gmail access wasn't granted, so nothing will be imported from that account."
+            afterSignIn()
             return
         }
         viewModelScope.launch {
             if (repo.finishAddAccount(auth, account)) startImport()
             else gmailMessage = "Couldn't tell which Google account was approved. Please try again."
+            afterSignIn()
         }
     }
 
@@ -173,14 +194,48 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             when (val auth = repo.addGmailAccount(accountName)) {
                 // repo.addGmailAccount already recorded the account for this branch.
-                is GmailAuth.Granted -> startImport()
+                is GmailAuth.Granted -> { startImport(); afterSignIn() }
                 is GmailAuth.NeedsConsent -> {
                     pendingAccount = accountName
                     onConsent(auth.pendingIntent)
                 }
-                GmailAuth.Unavailable ->
+                GmailAuth.Unavailable -> {
                     gmailMessage = "Couldn't reach Google Play services to connect Gmail. Check your connection and try again."
+                    afterSignIn()
+                }
             }
+        }
+    }
+
+    /**
+     * "Continue with Google": the account picked in the system chooser becomes the profile and the inbox the mail analyzer reads.
+     * The permission step follows whether or not Gmail access is approved; a declined Gmail card can be allowed again there.
+     */
+    fun signIn(accountName: String, onConsent: (PendingIntent) -> Unit) {
+        repo.setProfileEmail(accountName)
+        profileEmail = accountName
+        addGmailAccount(accountName, onConsent)
+    }
+
+    /** After sign-in (or a declined Gmail approval) the permission screen comes next; any other screen is left where it is. */
+    private fun afterSignIn() {
+        if (screen == Screen.SignIn) screen = Screen.Permissions
+    }
+
+    fun finishOnboarding() {
+        repo.finishOnboarding()
+        goToDashboard()
+    }
+
+    /** Disconnects the linked Gmail, forgets the profile and returns to the sign-in screen. */
+    fun signOut() {
+        viewModelScope.launch {
+            repo.signOutProfile(accountEmail)
+            if (repo.gmailAccounts.isEmpty()) Workers.cancelGmailWork(app)
+            profileEmail = null
+            refreshGmailState()
+            canGoBack = false
+            screen = Screen.SignIn
         }
     }
 
@@ -327,7 +382,11 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.confirmStillActive(sub.key, next) }
     }
 
-    fun keepSubscription(sub: Subscription) = answer(sub) { repo.answerReminder(sub.key, it, ReminderAnswer.KEEP) }
+    /** "Keep" says the AutoPay stays on for this renewal, so the "have you cancelled the AutoPay?" question is answered too. */
+    fun keepSubscription(sub: Subscription) = answer(sub) {
+        repo.answerReminder(sub.key, it, ReminderAnswer.KEEP)
+        repo.setAutopayStillActive(sub.key, it)
+    }
 
     /**
      * "Changed my mind" in the cancellation guide. Answered for the renewal the plan was made for,
@@ -366,6 +425,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
      * because a notification button does not do it by itself.
      */
     fun planCancellation(key: String, date: LocalDate, notificationId: Int) {
+        if (profileEmail == null) return
         repo.answerReminder(key, date, ReminderAnswer.CANCEL_PLANNED)
         NotificationManagerCompat.from(app).cancel(notificationId)
         answersVersion++
@@ -373,6 +433,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun open(target: Screen) {
+        // A notification tap must not get past the sign-in screen.
+        if (profileEmail == null) return
         canGoBack = true
         screen = target
     }
@@ -414,6 +476,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
      * update's automatic one-time reclassification.
      */
     fun forceFullRescan() {
+        gmailMessage = "Re-reading every SMS. Your subscriptions refresh in a few seconds."
         viewModelScope.launch {
             repo.forceFullRescan()
             Workers.scanNow(app)

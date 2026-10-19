@@ -220,4 +220,15 @@ class ReminderDecisionTest {
         assertEquals(RenewalDayKind.PLAN_END, renewalDayKind(RenewalSource.PLAN_EXPIRY, SubscriptionStatus.ACTIVE))
         assertEquals(RenewalDayKind.TRIAL, renewalDayKind(RenewalSource.MANDATE, SubscriptionStatus.TRIAL))
     }
+
+    @Test
+    fun `no reminder goes out in the night, the morning pass sends it`() {
+        val renewal = d("2026-10-19")
+        // A pre-debit text at 00:46 starts a check; the renewal is days away or today, either way it waits.
+        assertFalse(shouldRemind(d("2026-10-17").atTime(0, 46), renewal, ReminderState()))
+        assertFalse(shouldRemind(d("2026-10-18").atTime(23, 30), renewal, ReminderState()))
+        assertFalse(shouldRemind(renewal.atTime(6, 59), renewal, ReminderState(lastStage = 2)))
+        assertTrue(shouldRemind(renewal.atTime(7, 0), renewal, ReminderState(lastStage = 2)))
+        assertTrue(shouldRemind(d("2026-10-17").atTime(9, 0), renewal, ReminderState()))
+    }
 }

@@ -1,7 +1,9 @@
 package com.aasif.watchdog.core.engine
 
+import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
+import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 import kotlin.math.abs
 
@@ -31,8 +33,68 @@ private const val UNKNOWN_MERCHANT = "u:unknown"
 fun nameChannelEvents(events: List<SourcedEvent>, channels: Set<String>): List<PaymentEvent> {
     val mail = events.filter { it.fromMail && it.event.merchantId !in channels }.map { it.event }
     val byTime = if (mail.isEmpty()) events.map { it.event } else nameByTime(events, channels, mail)
-    return nameByMandate(byTime, channels)
+    val byMandate = nameByMandate(byTime, channels)
+    return nameNoticesByApp(events.map { it.event }, byMandate, channels)
 }
+
+/**
+ * A pre-debit notice names only the channel ("1999.00 will be deducted ... for Google Play on 2026-10-19") and carries neither a time a
+ * receipt can be matched to nor a mandate number. It belongs to the app whose AutoPay came through that channel, when there is exactly one
+ * such app still live at the time of the notice; when the notice states an amount it must be that app's. Two candidates, or an amount that
+ * fits none, leave it on the channel: never guessed. [original] and [named] are the same events, before and after naming.
+ */
+private fun nameNoticesByApp(original: List<PaymentEvent>, named: List<PaymentEvent>, channels: Set<String>): List<PaymentEvent> {
+    // Bank texts that were filed under an app because they came through a channel: those apps bought through it.
+    val viaChannel = original.indices.filter { original[it].merchantId in channels && named[it].merchantId !in channels }.map { named[it] }
+    val apps = viaChannel.filter { it is PaymentEvent.MandateCreated }.map { it.merchantId }.distinct()
+    if (apps.isEmpty()) return named
+    return named.mapIndexed { i, e ->
+        if (e !is PaymentEvent.PreDebitNotice || e.merchantId !in channels || original[i].merchantId !in channels) return@mapIndexed e
+        val live = apps.mapNotNull { app ->
+            // Every text about this app up to the notice, the mail included: a cancellation mail ends an AutoPay too.
+            val own = named.filter { it.merchantId == app && !it.receivedOn.isAfter(e.receivedOn) }
+            val created = own.filterIsInstance<PaymentEvent.MandateCreated>().filter { it in viaChannel }
+                .maxWithOrNull(compareBy({ it.receivedOn }, { it.receivedAt })) ?: return@mapNotNull null
+            if (endedAfter(created, own.filterIsInstance<PaymentEvent.MandateRevoked>())) return@mapNotNull null
+            val frequency = own.filterIsInstance<PaymentEvent.MandateCreated>().mapNotNull { it.frequency }.lastOrNull { it.hasSchedule }
+            app to Live(created, frequency ?: Frequency.MONTHLY)
+        }
+        val byAmount = if (e.amount == null) live else live.filter { (_, l) -> l.created.amount?.let { sameWholeAmount(it, e.amount) } == true }
+        // Same price (or no price in the text): the app whose own schedule has a charge around the notice's date.
+        val fits = if (byAmount.size > 1) byAmount.filter { (_, l) -> l.dueNear(e.debitDate) } else byAmount
+        val app = fits.singleOrNull()?.first ?: return@mapIndexed e
+        e.withMerchant(app, viaChannel.first { it.merchantId == app }.merchantName)
+    }
+}
+
+/** An app's live AutoPay that came through a channel, and how often it charges. */
+private class Live(val created: PaymentEvent.MandateCreated, val frequency: Frequency) {
+    /** The mandate's schedule has a charge within [DATE_TIE_DAYS] of [date]. */
+    fun dueNear(date: LocalDate): Boolean {
+        val anchor = created.startDate ?: created.receivedOn
+        val charge = frequency.nextOnOrAfter(anchor, date.minusDays(DATE_TIE_DAYS))
+        return abs(ChronoUnit.DAYS.between(charge, date)) <= DATE_TIE_DAYS
+    }
+}
+
+/** A bank may move a charge a day or two off the app's own date (Play said 18 Oct, the bank debited on 19 Oct). */
+private const val DATE_TIE_DAYS = 3L
+
+/**
+ * Whether a revocation came after [created]: on a later day, or the same day at a later time. A same-day pair with no times is read as the
+ * mandate replacing the old one (a retried setup sends "revoked" and "created" within minutes), as the engine does.
+ */
+private fun endedAfter(created: PaymentEvent.MandateCreated, revocations: List<PaymentEvent.MandateRevoked>): Boolean =
+    revocations.any { r ->
+        when {
+            r.receivedOn.isAfter(created.receivedOn) -> true
+            r.receivedOn.isBefore(created.receivedOn) -> false
+            else -> r.receivedAt != null && created.receivedAt != null && r.receivedAt.isAfter(created.receivedAt)
+        }
+    }
+
+private fun sameWholeAmount(a: Money, b: Money) =
+    a.currency == b.currency && a.amount.setScale(0, java.math.RoundingMode.HALF_UP) == b.amount.setScale(0, java.math.RoundingMode.HALF_UP)
 
 /** Files a bank event under the app a mail names for the same moment, see [nameChannelEvents]. */
 private fun nameByTime(events: List<SourcedEvent>, channels: Set<String>, mail: List<PaymentEvent>): List<PaymentEvent> {

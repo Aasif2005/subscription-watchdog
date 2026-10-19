@@ -31,6 +31,7 @@ import com.aasif.watchdog.core.engine.EVENING_HOUR
 import com.aasif.watchdog.core.engine.FINAL_STAGE
 import com.aasif.watchdog.core.engine.chargedDespiteCancelPlan
 import com.aasif.watchdog.core.engine.dueForReminder
+import com.aasif.watchdog.core.engine.heldForMail
 import com.aasif.watchdog.core.engine.reminderKeysToWithdraw
 import com.aasif.watchdog.core.engine.evidenceAfterCancelClaim
 import com.aasif.watchdog.core.engine.reminderStage
@@ -235,7 +236,8 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         if (!canNotify()) return Result.success()
         val now = LocalDateTime.now()
         val today = now.toLocalDate()
-        val subscriptions = repo.currentSubscriptions()
+        // A "Google Play" plan the mail import may still name gets no reminder until the import is done.
+        val subscriptions = repo.currentSubscriptions().heldForMail(repo.gmailCatchingUp)
         ReminderChannel.ensure(applicationContext)
 
         // The user said they would cancel, and a charge landed anyway. Worth saying so once.

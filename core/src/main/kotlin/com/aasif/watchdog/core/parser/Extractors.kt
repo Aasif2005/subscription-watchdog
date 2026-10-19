@@ -68,6 +68,18 @@ internal object Extractors {
 
     fun amount(body: String): Money? = amounts(body).firstOrNull()
 
+    private val bareBeforeDebit = Regex(
+        """(?<![\d.,])(\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\s+will\s+be\s+(?:debited|deducted|charged)""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * An amount printed with no currency right before "will be deducted", as in IOB's "UPI AutoPay Alert: 1999.00 will be
+     * deducted from IOB account ...". Only for a pre-debit notice, where that wording leaves no doubt the number is the amount.
+     */
+    fun bareAmountBeforeDebit(body: String): Money? =
+        bareBeforeDebit.find(body)?.groupValues?.get(1)?.replace(",", "")?.toBigDecimalOrNull()?.let { Money(it, Money.INR) }
+
     /**
      * Amounts that the text says were actually paid, charged or billed — and that are not
      * advertised prices. This is the filter that separates a receipt from a promotion.

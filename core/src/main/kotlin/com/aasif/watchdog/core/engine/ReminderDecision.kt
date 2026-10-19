@@ -42,6 +42,14 @@ fun reminderStage(renewal: LocalDate, today: LocalDate): Int = when {
 /** The day-before reminder is held until this hour, so it lands in the evening, with the whole night left to act. */
 const val EVENING_HOUR = 19
 
+/** Reminders wait from this hour of the night... */
+const val QUIET_START_HOUR = 23
+
+/** ...until this hour of the morning. */
+const val QUIET_END_HOUR = 7
+
+private fun isQuietHour(time: LocalTime) = time >= LocalTime.of(QUIET_START_HOUR, 0) || time < LocalTime.of(QUIET_END_HOUR, 0)
+
 /**
  * Whether to show the renewal reminder now: not once the user has answered it, not while it is
  * snoozed, and once per stage otherwise. A pass that was missed (phone off) still shows the
@@ -49,10 +57,14 @@ const val EVENING_HOUR = 19
  *
  * The day-before stage waits for [EVENING_HOUR]: UPI AutoPay often debits early in the morning,
  * so a 9:00 reminder on the day before leaves less time to act than one the evening before.
+ *
+ * Nothing goes out between [QUIET_START_HOUR] and [QUIET_END_HOUR]: a bank text arriving at 00:46 starts a reminder check, and a
+ * renewal warning at that hour is noise. The 9:00 pass sends whatever was held back.
  */
 fun shouldRemind(now: LocalDateTime, renewal: LocalDate, state: ReminderState): Boolean {
     val today = now.toLocalDate()
     val stage = reminderStage(renewal, today)
+    if (isQuietHour(now.toLocalTime())) return false
     if (stage == DAY_BEFORE_STAGE && now.toLocalTime() < LocalTime.of(EVENING_HOUR, 0)) return false
     return state.answer == null &&
         (state.snoozedUntil == null || !today.isBefore(state.snoozedUntil)) &&

@@ -155,6 +155,10 @@ class WatchdogRepository(
     val gmailBackfillComplete: Boolean
         get() = gmailAccounts.all { backfillDone(it) }
 
+    /** Mail is still being read for the first time, so a bank text naming only "Google Play" may yet be linked to its app. */
+    val gmailCatchingUp: Boolean
+        get() = gmailImportEnabled && !gmailNeedsConsent && !gmailBackfillComplete
+
     private fun backfillDone(account: String) = prefs.getLong(key(KEY_GMAIL_BACKFILL, account), -1L) == BACKFILL_DONE
 
     /** One row of the profile page: an account and what the import is doing for it. */
@@ -452,9 +456,16 @@ class WatchdogRepository(
         if (first != GmailFetch.AuthRevoked) return first to token
         gmailAuth.clearToken(token)
         val fresh = (gmailAuth.authorize(gmailAuth.account(account)) as? GmailAuth.Granted)?.accessToken
-            ?: return GmailFetch.AuthRevoked to token
+        if (fresh == null) {
+            // Rejected and no new token: only the user can approve again. Flagged here, or the import would look like it is
+            // still running forever (and hold back the Google Play plans waiting for it) instead of asking.
+            setNeedsConsent(account, true)
+            return GmailFetch.AuthRevoked to token
+        }
         if (BuildConfig.DEBUG) Log.i("GmailSync", "401 for $account, retrying with a fresh token")
-        return gmailApi.fetch(fresh, query, max) to fresh
+        val second = gmailApi.fetch(fresh, query, max)
+        if (second == GmailFetch.AuthRevoked) setNeedsConsent(account, true)
+        return second to fresh
     }
 
     private fun logOutcome(account: String, outcome: GmailSyncOutcome): GmailSyncOutcome {
@@ -502,9 +513,33 @@ class WatchdogRepository(
      * app remembers), and forgets that account's cursors and mail-sourced events. The other
      * accounts and notification events are untouched; removing the last one turns the import off.
      */
+    /** The Google account the user signed in with: only its address is kept, never a token. Null when they skipped. */
+    val profileEmail: String? get() = prefs.getString(KEY_PROFILE_EMAIL, null)
+
+    /** True once the sign-in and permission screens have been gone through (or skipped) on this install. */
+    val onboardingDone: Boolean get() = prefs.getBoolean(KEY_ONBOARDING_DONE, false)
+
+    fun setProfileEmail(email: String) = prefs.edit(commit = true) { putString(KEY_PROFILE_EMAIL, email) }
+
+    fun finishOnboarding() = prefs.edit(commit = true) { putBoolean(KEY_ONBOARDING_DONE, true) }
+
+    /**
+     * Signing out disconnects the Gmail inbox that sign-in linked and forgets the profile; subscriptions already found stay on the
+     * phone. The next launch shows the sign-in screen again.
+     */
+    suspend fun signOutProfile(account: String? = profileEmail) {
+        account?.let { if (it in gmailAccounts) removeGmailAccount(it) }
+        prefs.edit(commit = true) { remove(KEY_PROFILE_EMAIL).putBoolean(KEY_ONBOARDING_DONE, false) }
+    }
+
     suspend fun removeGmailAccount(email: String) {
         val token = (gmailAuth.authorize(gmailAuth.account(email)) as? GmailAuth.Granted)?.accessToken
-        if (token != null) gmailApi.revoke(token)
+        if (token != null) {
+            gmailApi.revoke(token)
+            // Play Services would otherwise keep handing out the revoked token, so signing in again skipped Google's consent
+            // screen and every read then failed with "Invalid Credentials".
+            gmailAuth.clearToken(token)
+        }
         val remaining = gmailAccounts - email
         prefs.edit(commit = true) {
             putStringSet(KEY_GMAIL_ACCOUNTS, remaining.toSet())
@@ -1017,6 +1052,8 @@ class WatchdogRepository(
         private const val KEY_GMAIL_WELCOME = "gmail_welcome_sync_millis"
         private const val KEY_GMAIL_ENABLED = "gmail_import_enabled"
         private const val KEY_GMAIL_ACCOUNT = "gmail_account_email"
+        private const val KEY_PROFILE_EMAIL = "profile_email"
+        private const val KEY_ONBOARDING_DONE = "onboarding_done"
         private const val KEY_GMAIL_ACCOUNTS = "gmail_accounts"
         private const val KEY_GMAIL_CONSENT = "gmail_consent_accounts"
         private const val KEY_LAST_SCAN = "last_scan_millis"

@@ -264,7 +264,7 @@ class SmsParser(
             .map { it.date }
             .firstOrNull { !it.isBefore(received) }
             ?: if (body.contains("tomorrow", ignoreCase = true)) received.plusDays(1) else return null
-        val amount = if (fromEmail) Extractors.paidAmount(body) else Extractors.amount(body)
+        val amount = if (fromEmail) Extractors.paidAmount(body) else Extractors.amount(body) ?: Extractors.bareAmountBeforeDebit(body)
         return PaymentEvent.PreDebitNotice(m.id, m.name, received, amount, debitDate)
     }
 

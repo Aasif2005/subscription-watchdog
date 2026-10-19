@@ -52,6 +52,7 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.aasif.watchdog.core.engine.ReplacementQuestion
 import com.aasif.watchdog.core.engine.canSnoozeReminder
@@ -79,18 +80,13 @@ import java.time.temporal.ChronoUnit
 @Composable
 fun DashboardScreen(
     subscriptions: List<Subscription>?,
-    smsSupported: Boolean,
     hasSmsAccess: Boolean,
-    onGrantSms: () -> Unit,
-    hasNotificationAccess: Boolean,
+    missingPermissions: List<PermissionItem>,
     onOpen: (String) -> Unit,
     onAdd: () -> Unit,
     onRescan: () -> Unit,
-    onGrantNotificationAccess: () -> Unit,
     gmailImportEnabled: Boolean,
-    gmailNeedsConsent: Boolean,
-    gmailBackfillComplete: Boolean,
-    onConnectGmail: () -> Unit,
+    gmailImporting: Boolean,
     onOpenProfile: () -> Unit,
     onSaveUserFact: (key: String, frequency: Frequency?, nextRenewal: LocalDate?, amount: BigDecimal?, currency: String?) -> Unit,
     onDismissUserFact: (key: String) -> Unit,
@@ -145,68 +141,33 @@ fun DashboardScreen(
             items(replacementQuestions, key = { "replace:${it.older.key}|${it.newer.key}" }) { q -> ReplacementCard(q, onReplaces, onDifferentApp) }
             items(revocationQuestions, key = { "revoked:${it.key}" }) { sub -> RevocationCard(sub, onRevocationYes, onRevocationNo) }
             item { SummaryCard(subscriptions) }
-            if (smsSupported && !hasSmsAccess) {
+            if (missingPermissions.isNotEmpty()) {
                 item {
-                    Card(Modifier.fillMaxWidth().clickable(onClick = onGrantSms)) {
-                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Read bank SMS for AutoPay", fontWeight = FontWeight.SemiBold)
-                            Text(
-                                "Banks text you when an AutoPay mandate is set up, cancelled, or about to be charged " +
-                                    "— the exact renewal date lives there. Messages are read on this phone only; only " +
-                                    "merchant, amount and dates are kept. Optional.",
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(vertical = 8.dp)) {
+                            Text("Turned off", Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                            missingPermissions.forEach { p ->
+                                Text(
+                                    p.short,
+                                    Modifier.fillMaxWidth().clickable(onClick = p.onAllow).padding(horizontal = 16.dp, vertical = 10.dp),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
                         }
                     }
                 }
             }
-            if (!hasNotificationAccess) {
-                item {
-                    Card(Modifier.fillMaxWidth().clickable(onClick = onGrantNotificationAccess)) {
-                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Catch AutoPay alerts from UPI apps", fontWeight = FontWeight.SemiBold)
-                            Text(
-                                "AutoPay renewal notices from GPay, PhonePe, Paytm and your bank app show up here. " +
-                                    "Allow notification access so those are caught too. Only payment apps are read, on this phone.",
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                    }
-                }
-            }
-            if (!gmailImportEnabled || gmailNeedsConsent) {
-                item {
-                    Card(Modifier.fillMaxWidth().clickable(onClick = onConnectGmail)) {
-                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text(
-                                if (gmailNeedsConsent) "Gmail access needs to be approved again" else "Import subscriptions from Gmail",
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                            Text(
-                                if (gmailNeedsConsent) {
-                                    "Google asked us to confirm access again. Tap to continue — nothing you've already found is lost."
-                                } else {
-                                    "Card and app-store subscriptions often send only an email receipt. " +
-                                        "This is the one feature that uses the internet: Google is asked for read-only " +
-                                        "access to your mail, and receipts are read on this phone. You can turn it down."
-                                },
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                    }
-                }
-            } else if (!gmailBackfillComplete) {
-                // Once connected, the card above stops showing so it doesn't get stuck telling a
-                // connected user to connect. Nothing replaced it, so a backfill that genuinely
-                // takes several minutes looked identical to a stuck one — there was no way to tell
-                // from inside the app. This says so.
+            if (gmailImporting) {
+                // A backfill that genuinely takes several minutes would look identical to a stuck one; this says so.
                 item {
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text("Importing your Gmail history", fontWeight = FontWeight.SemiBold)
                             Text(
                                 "This can take a few minutes on a large mailbox. Subscriptions found so far " +
-                                    "are already shown below.",
+                                    "are already shown below. Google Play payments appear once your mail shows which app they are for.",
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                         }
@@ -459,7 +420,10 @@ fun DetailScreen(
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(sub.renewalLine(), style = MaterialTheme.typography.titleMedium)
                     if (sub.isLive && sub.nextRenewal != null) {
-                        Text(sub.renewalSource.explanation(), style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            sub.renewalSource.explanation() + (sub.movedFrom?.let { " (moved from ${formatDate(it)})" } ?: ""),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                         Text("Confidence: ${sub.confidence.name.lowercase()}", style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -809,6 +773,8 @@ fun ProfileScreen(
     usageSupported: Boolean,
     usageGranted: Boolean,
     onUsageOpenSettings: () -> Unit,
+    accountEmail: String?,
+    onSignOut: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -822,6 +788,12 @@ fun ProfileScreen(
             Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            Text("Account", style = MaterialTheme.typography.titleMedium)
+            // Only a signed-in account reaches this screen.
+            if (accountEmail != null) {
+                AccountPill(accountEmail)
+                TextButton(onClick = onSignOut) { Text("Sign out") }
+            }
             if (usageSupported && !usageGranted) UsageAccessLine(onUsageOpenSettings)
             Text("Gmail", style = MaterialTheme.typography.titleMedium)
             Card(Modifier.fillMaxWidth()) {
@@ -956,6 +928,8 @@ fun AddManualScreen(
             OutlinedTextField(
                 amount, { amount = it.filter { c -> c.isDigit() || c == '.' } }, Modifier.fillMaxWidth(),
                 label = { Text("Amount (₹)") }, singleLine = true,
+                isError = amount.isNotEmpty() && parsedAmount == null,
+                supportingText = if (amount.isNotEmpty() && parsedAmount == null) ({ Text("Enter an amount like 199 or 199.50") }) else null,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             )
             Text("How often", style = MaterialTheme.typography.labelLarge)
