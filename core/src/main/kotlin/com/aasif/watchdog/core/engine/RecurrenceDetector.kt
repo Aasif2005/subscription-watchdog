@@ -2,6 +2,7 @@ package com.aasif.watchdog.core.engine
 
 import com.aasif.watchdog.core.model.Confidence
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent.Debit
 import java.math.BigDecimal
 
@@ -11,7 +12,7 @@ data class RecurringSeries(
     val frequency: Frequency,
     val confidence: Confidence,
 ) {
-    val latestAmount: BigDecimal get() = debits.last().amount
+    val latestAmount: Money get() = debits.last().amount
 }
 
 /**
@@ -26,19 +27,29 @@ object RecurrenceDetector {
     private const val MIN_REGULARITY = 0.6
 
     /**
-     * @param debits all debits for a single merchant.
+     * @param debits all debits for a single merchant that are eligible for pattern matching at
+     *   all — [SubscriptionEngine.patternEligible] has already dropped merchants where amount and
+     *   timing alone are not evidence (a movie chain, a prepaid recharge; see [NonSubscriptionCatalog]
+     *   and [KnownMerchant.autopayOnly]), so this only ever sees debits it makes sense to judge.
      * @param knownMerchant true for catalog services; a regular charge there is almost certainly a
      *   subscription, whereas for an unknown shop it could be a habit (weekly groceries).
      */
     fun detect(debits: List<Debit>, knownMerchant: Boolean): List<RecurringSeries> =
-        clusterByAmount(debits.distinctBy { it.date to it.amount })
+        // A payee that is someone's phone number is a person, not a subscription, no matter how
+        // regularly money goes to them.
+        clusterByAmount(debits.filterNot { it.peerToPeer }.distinctBy { it.date to it.amount })
             .mapNotNull { series(it.sortedBy(Debit::date), knownMerchant) }
 
     private fun clusterByAmount(debits: List<Debit>): List<List<Debit>> {
         val clusters = mutableListOf<MutableList<Debit>>()
-        for (d in debits.sortedBy { it.amount }) {
+        // Different currencies are different plans by definition, so cluster within currency first.
+        for (d in debits.sortedWith(compareBy({ it.amount.currency }, { it.amount.amount }))) {
             val base = clusters.lastOrNull()?.first()?.amount
-            if (base != null && isSimilar(base, d.amount)) clusters.last() += d else clusters += mutableListOf(d)
+            if (base != null && base.currency == d.amount.currency && isSimilar(base.amount, d.amount.amount)) {
+                clusters.last() += d
+            } else {
+                clusters += mutableListOf(d)
+            }
         }
         // A price change (Netflix 499 -> 649) splits one plan into two clusters that don't overlap
         // in time; join those back together.

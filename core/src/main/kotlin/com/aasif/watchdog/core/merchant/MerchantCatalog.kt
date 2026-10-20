@@ -14,6 +14,35 @@ data class KnownMerchant(
     /** Typical free-trial length, used when a trial mandate does not state its first debit date. */
     val trialDays: Int? = null,
     val cancelUrl: String? = null,
+    /**
+     * True for a billing channel that charges on behalf of many different apps (Google Play, the
+     * App Store). A bank text can only name the channel, never the app behind it, so what the user
+     * is paying for has to come from mail or from the user.
+     */
+    val sharedBilling: Boolean = false,
+    /**
+     * True for a merchant whose typical India purchase is a one-off top-up (a prepaid mobile
+     * recharge), not a plan — most Jio/Airtel/Vi customers are prepaid, and a recharge repeats on
+     * a schedule as a matter of habit, not because it auto-renews. Being in this catalog is still
+     * useful for naming the merchant correctly, but [engine.RecurrenceDetector]'s amount+timing
+     * pattern match must not trust that alone the way it trusts an OTT or cloud plan; only an
+     * explicit mandate/AutoPay signal on the debit ([model.PaymentEvent.Debit.viaMandate]) or an
+     * actual mandate-registration SMS (a [model.PaymentEvent.MandateCreated] event) proves it.
+     */
+    val autopayOnly: Boolean = false,
+    /**
+     * True for a catalog entry whose payment descriptor is shared with a non-subscription sibling
+     * product under the same umbrella brand or legal entity — a Swiggy Instamart grocery order is
+     * billed by the same "Bundl Technologies" descriptor as a Swiggy One membership charge; a
+     * one-off Kindle book or device purchase shares the bare word "kindle" with Kindle Unlimited.
+     * Amount and timing are all a bank SMS ever carries, and that is not enough to tell these
+     * apart, so [engine.SubscriptionEngine] does not let a bare pattern match promote one of these
+     * straight to a confident subscription — it is surfaced as "Needs your input" instead, same as
+     * an amount or frequency the app never saw stated. An explicit mandate/AutoPay signal
+     * ([model.PaymentEvent.Debit.viaMandate] or an actual [model.PaymentEvent.MandateCreated]) is
+     * still trusted, since that is real evidence the text does contain.
+     */
+    val membershipConfusable: Boolean = false,
 )
 
 /** Subscriptions commonly paid by UPI AutoPay or card e-mandate in India. */
@@ -33,7 +62,7 @@ object MerchantCatalog {
     val all: List<KnownMerchant> = listOf(
         // Video streaming
         KnownMerchant("netflix", "Netflix", OTT, listOf("netflix"), cancelUrl = "https://www.netflix.com/cancelplan"),
-        KnownMerchant("prime", "Amazon Prime", OTT, listOf("amazonprime", "primevideo", "primemembership", "amznprime"), trialDays = 30, cancelUrl = "https://www.amazon.in/mc"),
+        KnownMerchant("prime", "Amazon Prime", OTT, listOf("amazonprime", "primevideo", "primemembership", "amznprime"), trialDays = 30, cancelUrl = "https://www.amazon.in/mc", membershipConfusable = true),
         KnownMerchant("hotstar", "JioHotstar", OTT, listOf("jiohotstar", "hotstar", "disneyplus", "novidigital"), cancelUrl = "https://www.hotstar.com/in/mygst"),
         KnownMerchant("sonyliv", "SonyLIV", OTT, listOf("sonyliv", "culvermax"), cancelUrl = "https://www.sonyliv.com/myaccount"),
         KnownMerchant("zee5", "ZEE5", OTT, listOf("zee5"), cancelUrl = "https://www.zee5.com/myaccount/subscription"),
@@ -60,37 +89,42 @@ object MerchantCatalog {
         KnownMerchant("kukufm", "Kuku FM", MUSIC, listOf("kukufm")),
 
         // Cloud & software
-        KnownMerchant("apple", "Apple (App Store / iCloud)", CLOUD, listOf("applecombill", "itunes", "appleservices", "applemedia", "icloud"), cancelUrl = "https://support.apple.com/en-in/118428"),
+        KnownMerchant("apple", "Apple (App Store / iCloud)", CLOUD, listOf("applecombill", "itunes", "appleservices", "applemedia", "icloud"), cancelUrl = "https://support.apple.com/en-in/118428", sharedBilling = true),
         KnownMerchant("googleone", "Google One", CLOUD, listOf("googleone", "googlestorage"), cancelUrl = "https://one.google.com/settings"),
-        KnownMerchant("googleplay", "Google Play subscription", CLOUD, listOf("googleplay", "playstore", "googleservices"), cancelUrl = "https://play.google.com/store/account/subscriptions"),
+        KnownMerchant("googleplay", "Google Play subscription", CLOUD, listOf("googleplay", "playstore", "googleservices"), cancelUrl = "https://play.google.com/store/account/subscriptions", sharedBilling = true),
         KnownMerchant("microsoft", "Microsoft 365", CLOUD, listOf("microsoft", "msbill", "office365", "xboxgamepass"), trialDays = 30),
         KnownMerchant("adobe", "Adobe", CLOUD, listOf("adobe"), trialDays = 7),
         KnownMerchant("canva", "Canva Pro", CLOUD, listOf("canva"), trialDays = 30),
-        KnownMerchant("chatgpt", "ChatGPT Plus", CLOUD, listOf("openai", "chatgpt")),
+        KnownMerchant("chatgpt", "ChatGPT", CLOUD, listOf("openai", "chatgpt")),
         KnownMerchant("claude", "Claude", CLOUD, listOf("anthropic", "claudeai")),
         KnownMerchant("linkedin", "LinkedIn Premium", CLOUD, listOf("linkedin"), trialDays = 30),
         KnownMerchant("dropbox", "Dropbox", CLOUD, listOf("dropbox")),
         KnownMerchant("notion", "Notion", CLOUD, listOf("notionlabs", "notionso")),
 
-        // Food & delivery
-        KnownMerchant("swiggyone", "Swiggy One", FOOD, listOf("swiggyone"), cancelUrl = "https://www.swiggy.com/one"),
-        KnownMerchant("zomatogold", "Zomato Gold", FOOD, listOf("zomatogold")),
+        // Food & delivery. Swiggy One's charge and a plain Swiggy/Instamart order are both billed
+        // by the same umbrella descriptor ("Bundl Technologies"); see [KnownMerchant.membershipConfusable].
+        KnownMerchant("swiggyone", "Swiggy One", FOOD, listOf("swiggyone"), cancelUrl = "https://www.swiggy.com/one", membershipConfusable = true),
+        KnownMerchant("zomatogold", "Zomato Gold", FOOD, listOf("zomatogold"), membershipConfusable = true),
         KnownMerchant("blinkit", "Blinkit", FOOD, listOf("blinkitplus")),
 
         // Shopping memberships
-        KnownMerchant("flipkartplus", "Flipkart Plus / VIP", SHOPPING, listOf("flipkartvip", "flipkartplus")),
+        KnownMerchant("flipkartplus", "Flipkart Plus / VIP", SHOPPING, listOf("flipkartvip", "flipkartplus"), membershipConfusable = true),
         KnownMerchant("myntrainsider", "Myntra Insider", SHOPPING, listOf("myntrainsider")),
 
-        // Telecom & internet
-        KnownMerchant("jio", "Jio", TELECOM, listOf("reliancejio", "jiofiber", "jioairfiber", "jiopostpaid", "myjio")),
-        KnownMerchant("airtel", "Airtel", TELECOM, listOf("airtelxstream", "airtelpostpaid", "airtelbroadband", "airtelblack", "bhartiairtel")),
-        KnownMerchant("vi", "Vi (Vodafone Idea)", TELECOM, listOf("vodafoneidea", "vodaidea", "myvi")),
+        // Telecom & internet. Mobile plans are overwhelmingly prepaid in India, so a recharge here
+        // proves nothing about autopay on its own — see [KnownMerchant.autopayOnly]. Fixed
+        // broadband (ACT Fibernet) is ordinarily a postpaid monthly bill, so it keeps the default.
+        KnownMerchant("jio", "Jio", TELECOM, listOf("reliancejio", "jiofiber", "jioairfiber", "jiopostpaid", "myjio"), autopayOnly = true),
+        KnownMerchant("airtel", "Airtel", TELECOM, listOf("airtelxstream", "airtelpostpaid", "airtelbroadband", "airtelblack", "bhartiairtel"), autopayOnly = true),
+        KnownMerchant("vi", "Vi (Vodafone Idea)", TELECOM, listOf("vodafoneidea", "vodaidea", "myvi"), autopayOnly = true),
         KnownMerchant("actfibernet", "ACT Fibernet", TELECOM, listOf("actfibernet", "atriaconvergence")),
 
         // News & reading
         KnownMerchant("toiplus", "TOI+", NEWS, listOf("toiplus", "timesprime", "timesinternet")),
         KnownMerchant("thehindu", "The Hindu", NEWS, listOf("thehindu")),
-        KnownMerchant("kindle", "Kindle Unlimited", NEWS, listOf("kindleunlimited", "kindle"), trialDays = 30),
+        // "kindle" is a direct alias (not just a fuzzy typo match), so a one-off Kindle purchase
+        // hits it exactly; see [KnownMerchant.membershipConfusable].
+        KnownMerchant("kindle", "Kindle Unlimited", NEWS, listOf("kindleunlimited", "kindle"), trialDays = 30, membershipConfusable = true),
 
         // Health & fitness
         KnownMerchant("cultfit", "cult.fit", FITNESS, listOf("cultfit", "curefit")),

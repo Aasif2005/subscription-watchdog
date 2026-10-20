@@ -1,6 +1,7 @@
 package com.aasif.watchdog.core
 
 import com.aasif.watchdog.core.model.Frequency
+import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.Sms
 import com.aasif.watchdog.core.parser.SmsParser
@@ -31,7 +32,7 @@ class SmsParserTest {
                 "Frequency: Monthly, Start date: 05/09/26. Validity till: 05/09/31 -HDFC Bank"
         ))
         assertEquals("netflix", e.merchantId)
-        assertEquals(BigDecimal("649.00"), e.amount)
+        assertEquals(Money(BigDecimal("649.00")), e.amount)
         assertEquals(Frequency.MONTHLY, e.frequency)
         assertEquals(date(2026, 9, 5), e.startDate)
         assertEquals(date(2031, 9, 5), e.validTill)
@@ -45,7 +46,7 @@ class SmsParserTest {
             sender = "AX-SBIINB",
         ))
         assertEquals("spotify", e.merchantId)
-        assertEquals(BigDecimal("199"), e.amount)
+        assertEquals(Money(BigDecimal("199")), e.amount)
         assertEquals(date(2026, 9, 12), e.startDate)
         assertNull(e.validTill)
     }
@@ -57,7 +58,7 @@ class SmsParserTest {
                 "Recurring payment of Rs 149 will start from 20-10-2026. Frequency: Monthly -Axis Bank"
         ))
         assertEquals("youtube", e.merchantId)
-        assertEquals(BigDecimal("149"), e.amount)
+        assertEquals(Money(BigDecimal("149")), e.amount)
         assertEquals(date(2026, 10, 20), e.startDate)
     }
 
@@ -85,7 +86,7 @@ class SmsParserTest {
         ))
         assertEquals("spotify", e.merchantId)
         assertEquals(date(2026, 10, 12), e.debitDate)
-        assertEquals(BigDecimal("199.00"), e.amount)
+        assertEquals(Money(BigDecimal("199.00")), e.amount)
     }
 
     @Test
@@ -114,7 +115,7 @@ class SmsParserTest {
                 "Not You?\nCall 18002586161/SMS BLOCK UPI to 7308080808"
         ))
         assertEquals("spotify", e.merchantId)
-        assertEquals(BigDecimal("199.00"), e.amount)
+        assertEquals(Money(BigDecimal("199.00")), e.amount)
         assertEquals(date(2026, 9, 5), e.date)
     }
 
@@ -126,7 +127,7 @@ class SmsParserTest {
             sender = "BP-AXISBK",
         ))
         assertEquals("netflix", e.merchantId)
-        assertEquals(BigDecimal("649.00"), e.amount)
+        assertEquals(Money(BigDecimal("649.00")), e.amount)
         assertEquals(date(2026, 9, 5), e.date)
     }
 
@@ -183,10 +184,68 @@ class SmsParserTest {
     }
 
     @Test
+    fun `a revocation keeps the mandate's amount, so it can be matched to the right mandate`() {
+        // Bank-style wording; Google Play is the payee for many apps, so the amount is what tells them apart.
+        val e = assertIs<PaymentEvent.MandateRevoked>(parse(
+            "Your UPI AutoPay mandate of Rs.1,999.00 towards Google Play has been revoked successfully. -IOB",
+            sender = "VA-IOBCHN-S",
+        ))
+        assertEquals("googleplay", e.merchantId)
+        assertEquals(Money(BigDecimal("1999.00")), e.amount)
+        assertNull(e.activeUntil)
+    }
+
+    @Test
+    fun `a revocation without an amount still parses, with no amount`() {
+        val e = assertIs<PaymentEvent.MandateRevoked>(parse("Your UPI AutoPay mandate for Netflix has been revoked successfully. -Paytm Payments Bank"))
+        assertNull(e.amount)
+    }
+
+    @Test
+    fun `a cancellation that says when access ends keeps that date`() {
+        // Synthetic wording in the shape services describe; no real cancellation mail was seen.
+        val e = assertIs<PaymentEvent.MandateRevoked>(parse(
+            "Your Spotify Premium subscription has been cancelled. You can keep using Premium until 12 Nov 2026.",
+        ))
+        assertEquals(date(2026, 11, 12), e.activeUntil)
+    }
+
+    @Test
     fun `ignores OTPs, failures, credits and personal numbers`() {
         assertNull(parse("123456 is your OTP for mandate registration of Rs 649 towards Netflix. Do not share."))
         assertNull(parse("Your AutoPay payment of Rs 649 to Netflix failed due to insufficient balance."))
         assertNull(parse("Rs 5000 credited to your A/c XX1234 by NEFT from RAHUL. -HDFC"))
         assertNull(parse("Rs 649 debited to Netflix on 05-09-26", sender = "+919876543210"))
+    }
+
+    // ---- AutoPay recognition ---------------------------------------------------------------------
+
+    /**
+     * The signal that was entirely missing: a bank's debit SMS carries the mandate's UMN even when
+     * it never spells out "AutoPay" anywhere, which is why 0 of 731 stored debits had
+     * `viaMandate = true` before this.
+     */
+    @Test
+    fun `a debit carrying a UMN is recognised as AutoPay even without the word`() {
+        val e = assertIs<PaymentEvent.Debit>(parse(
+            "Rs 149.00 debited from A/c XX1234 on 05-09-26 to NETFLIX. UMN: abc123456@okhdfcbank Ref 998877."
+        ))
+        assertTrue(e.viaMandate)
+    }
+
+    @Test
+    fun `a razorpay-wrapped VPA resolves to the merchant it gateways for`() {
+        val e = assertIs<PaymentEvent.Debit>(parse(
+            "Rs 649.00 debited from A/c XX1234 on 05-09-26 to razorpay.netflix@icici. Ref 1234"
+        ))
+        assertEquals("netflix", e.merchantId)
+    }
+
+    @Test
+    fun `money sent to a phone-number VPA is flagged as peer-to-peer`() {
+        val e = assertIs<PaymentEvent.Debit>(parse(
+            "Rs 500.00 debited from A/c XX1234 on 05-09-26 to 9876543210@ybl. Ref 1234"
+        ))
+        assertTrue(e.peerToPeer)
     }
 }

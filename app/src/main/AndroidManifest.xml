@@ -1,13 +1,88 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-feature android:name="android.hardware.telephony" android:required="false" />
-
-    <!-- Read past bank SMS once to find existing subscriptions; everything stays on the device. -->
-    <uses-permission android:name="android.permission.READ_SMS" />
-    <!-- Pick up new payment SMS as they arrive. -->
-    <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+      Gmail import only, and only once the user turns it on. SMS and notification scanning never touches
+      the network; no other feature in the app makes a request.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Lets the cancellation guide offer to open the UPI apps that are installed, nothing else. -->
+    <queries>
+        <package android:name="com.google.android.apps.nbu.paisa.user" />
+        <package android:name="com.phonepe.app" />
+        <package android:name="net.one97.paytm" />
+        <package android:name="in.org.npci.upiapp" />
+        <package android:name="com.dreamplug.androidapp" />
+        <package android:name="com.mobikwik_new" />
+        <package android:name="com.naviapp" />
+        <package android:name="com.sbi.lotusintouch" />
+        <package android:name="com.csam.icici.bank.imobile" />
+        <package android:name="com.snapwork.hdfc" />
+        <package android:name="com.axis.mobile" />
+        <package android:name="com.msf.kbank.mobile" />
+        <!-- Subscription apps, for their own icons (core BrandApps); kept in step by BrandAppsTest. -->
+        <package android:name="com.netflix.mediaclient" />
+        <package android:name="com.amazon.avod.thirdpartyclient" />
+        <package android:name="in.startv.hotstar" />
+        <package android:name="com.sonyliv" />
+        <package android:name="com.graymatrix.did" />
+        <package android:name="com.google.android.youtube" />
+        <package android:name="com.apple.atve.androidtv.appletv" />
+        <package android:name="ahaflix.tv" />
+        <package android:name="com.suntv.sunnxt" />
+        <package android:name="com.mxtech.videoplayer.ad" />
+        <package android:name="com.viewlift.hoichoi" />
+        <package android:name="com.discovery.discoveryplus.mobile" />
+        <package android:name="com.lionsgateplay.videoapp" />
+        <package android:name="com.ryzmedia.tatasky" />
+        <package android:name="com.crunchyroll.crunchyroid" />
+        <package android:name="com.spotify.music" />
+        <package android:name="com.jio.media.jiobeats" />
+        <package android:name="com.gaana" />
+        <package android:name="com.bsbportal.music" />
+        <package android:name="com.apple.android.music" />
+        <package android:name="com.audible.application" />
+        <package android:name="com.radio.pocketfm" />
+        <package android:name="com.vlv.aravali" />
+        <package android:name="com.google.android.apps.subscriptions.red" />
+        <package android:name="com.microsoft.office.officehubrow" />
+        <package android:name="com.adobe.reader" />
+        <package android:name="com.canva.editor" />
+        <package android:name="com.openai.chatgpt" />
+        <package android:name="com.anthropic.claude" />
+        <package android:name="com.linkedin.android" />
+        <package android:name="com.dropbox.android" />
+        <package android:name="notion.id" />
+        <package android:name="in.swiggy.android" />
+        <package android:name="com.application.zomato" />
+        <package android:name="com.grofers.customerapp" />
+        <package android:name="com.flipkart.android" />
+        <package android:name="com.myntra.android" />
+        <package android:name="com.jio.myjio" />
+        <package android:name="com.myairtelapp" />
+        <package android:name="com.mventus.selfcare.activity" />
+        <package android:name="com.act.mobile.apps" />
+        <package android:name="com.toi.reader.activities" />
+        <package android:name="com.mobstac.thehindu" />
+        <package android:name="com.amazon.kindle" />
+        <package android:name="fit.cure.android" />
+        <package android:name="com.healthifyme.basic" />
+        <package android:name="com.practo.fabric" />
+        <package android:name="com.duolingo" />
+        <package android:name="org.coursera.android" />
+        <package android:name="com.unacademyapp" />
+        <package android:name="com.byjus.thelearningapp" />
+        <package android:name="com.tinder" />
+        <package android:name="com.bumble.app" />
+        <!-- Any launchable app, so a service outside the catalog can still wear its installed app's icon. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:name=".WatchdogApp"
@@ -17,11 +92,16 @@
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@style/Theme.Watchdog">
 
+        <!--
+          singleTop: a reminder's "Cancel" button opens this activity, and without it a second copy
+          was stacked on top of the running one instead of reaching onNewIntent.
+        -->
         <activity
             android:name=".ui.MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -29,13 +109,8 @@
         </activity>
 
         <receiver
-            android:name=".data.sms.SmsReceiver"
-            android:exported="true"
-            android:permission="android.permission.BROADCAST_SMS">
-            <intent-filter>
-                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
-            </intent-filter>
-        </receiver>
+            android:name=".work.ReminderActionReceiver"
+            android:exported="false" />
 
         <service
             android:name=".data.notification.PaymentNotificationListener"
