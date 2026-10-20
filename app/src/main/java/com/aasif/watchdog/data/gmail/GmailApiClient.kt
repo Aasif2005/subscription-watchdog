@@ -25,6 +25,10 @@ sealed interface GmailFetch {
         val exhausted: Boolean,
         /** Gmail started throttling partway through, so this run stopped short of the cap. */
         val throttled: Boolean = false,
+        /** Messages read in full this run, parsed or not: what the import progress counts. */
+        val scanned: Int = 0,
+        /** Gmail's own rough count of messages matching the query, from its first page; null if it gave none. */
+        val estimate: Int? = null,
     ) : GmailFetch
 
     /** The token was rejected. Only the user can fix this, so the caller should stop quietly. */
@@ -47,6 +51,7 @@ class GmailApiClient {
             val startedAt = SystemClock.elapsedRealtime()
             val ids = mutableListOf<String>()
             var pageToken: String? = null
+            var estimate: Int? = null
             do {
                 coroutineContext.ensureActive()
                 val url = buildString {
@@ -56,6 +61,7 @@ class GmailApiClient {
                 }
                 when (val page = get(url, accessToken)) {
                     is Response.Ok -> {
+                        if (estimate == null) estimate = page.body.optInt("resultSizeEstimate", -1).takeIf { it >= 0 }
                         val listed = page.body.optJSONArray("messages")
                         for (i in 0 until (listed?.length() ?: 0)) {
                             if (ids.size >= maxMessages) break
@@ -73,6 +79,7 @@ class GmailApiClient {
             val messages = mutableListOf<Sms>()
             var oldestScanned: Long? = null
             var throttled = false
+            var scanned = 0
             // A few messages in flight at once: one at a time is dominated by round-trip latency,
             // and Gmail allows far more concurrency than this per mailbox.
             for (chunk in ids.chunked(CONCURRENCY)) {
@@ -91,6 +98,7 @@ class GmailApiClient {
                             message.body.optString("internalDate").toLongOrNull()?.let {
                                 oldestScanned = minOf(oldestScanned ?: it, it)
                             }
+                            scanned++
                             GmailMessageMapper.toSms(message.body)?.let(messages::add)
                         }
                         Response.Auth -> return@withContext GmailFetch.AuthRevoked
@@ -122,6 +130,8 @@ class GmailApiClient {
                 // A throttled run stopped early, so it cannot claim the window is covered.
                 exhausted = !throttled && pageToken == null && ids.size < maxMessages,
                 throttled = throttled,
+                scanned = scanned,
+                estimate = estimate,
             )
         }
 

@@ -1,10 +1,14 @@
 package com.aasif.watchdog.ui
 
+import com.aasif.watchdog.ui.components.BrandIcons
 import android.Manifest
 import android.app.Application
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -28,9 +32,10 @@ import com.aasif.watchdog.core.engine.revocationQuestions
 import com.aasif.watchdog.core.model.Frequency
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.data.ChargeSource
+import com.aasif.watchdog.data.DayUsage
 import com.aasif.watchdog.data.EvidenceItem
 import com.aasif.watchdog.data.GmailAccountStatus
-import com.aasif.watchdog.data.NotificationStat
+import com.aasif.watchdog.data.GmailImportProgress
 import com.aasif.watchdog.data.gmail.GmailAuth
 import com.aasif.watchdog.data.notification.PaymentNotificationListener
 import com.aasif.watchdog.work.Workers
@@ -40,6 +45,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+
+/** Why connecting Gmail during sign-in did not finish; shown inline on the sign-in screen instead of as a Toast. */
+enum class ConsentIssue { Declined, Unavailable, Unidentified }
 
 sealed interface Screen {
     data object Dashboard : Screen
@@ -85,12 +93,34 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var gmailNeedsConsent: Boolean by mutableStateOf(repo.gmailNeedsConsent)
         private set
 
-    /** Per-app counts from the notification listener, for the profile page. */
-    var notificationStats: List<NotificationStat> by mutableStateOf(repo.notificationStats())
+    /** The appearance chosen in Profile; System follows the phone. */
+    var themeMode: ThemeMode by mutableStateOf(ThemeMode.entries.firstOrNull { it.name == repo.themeMode } ?: ThemeMode.SYSTEM)
         private set
 
-    fun refreshNotificationStats() {
-        notificationStats = repo.notificationStats()
+    fun chooseThemeMode(mode: ThemeMode) {
+        repo.themeMode = mode.name
+        themeMode = mode
+    }
+
+    /** Whether logos of unrecognised services may be looked up online; off by default. */
+    var onlineLogos: Boolean by mutableStateOf(repo.onlineLogos)
+        private set
+
+    fun chooseOnlineLogos(on: Boolean) {
+        repo.onlineLogos = on
+        onlineLogos = on
+        if (!on) BrandIcons.clearOnline(getApplication())
+    }
+
+    /** How many days before a renewal the first reminder comes (3-7). */
+    var reminderLeadDays: Int by mutableIntStateOf(repo.reminderLeadDays)
+        private set
+
+    fun chooseReminderLeadDays(days: Int) {
+        repo.reminderLeadDays = days
+        reminderLeadDays = repo.reminderLeadDays
+        // The dashboard's renewal questions follow the lead, so make them re-read it.
+        answersVersion++
     }
 
     /** Every connected account with its own import status, for the profile page. */
@@ -104,6 +134,41 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     /** See [WatchdogRepository.gmailCatchingUp]; derived from the states above so it follows every refresh. */
     val gmailCatchingUp: Boolean get() = gmailImportEnabled && !gmailNeedsConsent && !gmailBackfillComplete
 
+    /** How far the first import has got, for the dashboard strip; null once it is done or while it waits for approval. */
+    var gmailProgress: GmailImportProgress? by mutableStateOf(repo.gmailImportProgress().takeIf { repo.gmailCatchingUp })
+        private set
+
+    /** A scan or Gmail read is queued or running, so Rescan can show it is working instead of looking dead. */
+    var rescanning: Boolean by mutableStateOf(false)
+        private set
+
+    init {
+        viewModelScope.launch { Workers.refreshing(app).collect { rescanning = it } }
+    }
+
+    private val connectivity = app.getSystemService(ConnectivityManager::class.java)
+
+    /** False while the phone has no internet, so the dashboard can say why Gmail is not updating. */
+    var online: Boolean by mutableStateOf(hasInternet())
+        private set
+
+    private fun hasInternet(): Boolean = connectivity.activeNetwork
+        ?.let { connectivity.getNetworkCapabilities(it)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) } == true
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            online = true
+        }
+
+        override fun onLost(network: Network) {
+            online = hasInternet()
+        }
+    }
+
+    init {
+        connectivity.registerDefaultNetworkCallback(networkCallback)
+    }
+
     /**
      * A one-off message about the Gmail connection — permission declined, Play Services
      * unreachable — so a tap on "Connect Gmail" is never answered with silence.
@@ -113,6 +178,27 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun gmailMessageShown() {
         gmailMessage = null
+    }
+
+    /** Set when Gmail could not be connected while signing in; the sign-in screen offers Try again or Continue without Gmail. */
+    var consentIssue: ConsentIssue? by mutableStateOf(null)
+        private set
+
+    /** During sign-in a failure is shown inline; anywhere else (Profile, Dashboard) it stays a one-off message. */
+    private fun gmailFailed(issue: ConsentIssue, message: String) {
+        if (screen == Screen.SignIn) consentIssue = issue else {
+            gmailMessage = message
+            afterSignIn()
+        }
+    }
+
+    fun retryGmailConsent() {
+        consentIssue = null
+    }
+
+    fun continueWithoutGmail() {
+        consentIssue = null
+        afterSignIn()
     }
 
     /** Source and arrival time per charge on the open detail screen, keyed by charge. */
@@ -158,14 +244,16 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         pendingAccount = null
         val auth = repo.gmailAuth.fromConsentResult(data) as? GmailAuth.Granted
         if (auth == null) {
-            gmailMessage = "Gmail access wasn't granted, so nothing will be imported from that account."
-            afterSignIn()
+            gmailFailed(ConsentIssue.Declined, "Gmail access wasn't granted, so nothing will be imported from that account.")
             return
         }
         viewModelScope.launch {
-            if (repo.finishAddAccount(auth, account)) startImport()
-            else gmailMessage = "Couldn't tell which Google account was approved. Please try again."
-            afterSignIn()
+            if (repo.finishAddAccount(auth, account)) {
+                startImport()
+                afterSignIn()
+            } else {
+                gmailFailed(ConsentIssue.Unidentified, "Couldn't tell which Google account was approved. Please try again.")
+            }
         }
     }
 
@@ -191,6 +279,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         gmailNeedsConsent = repo.gmailNeedsConsent
         gmailAccounts = repo.gmailAccountStatuses()
         gmailBackfillComplete = repo.gmailBackfillComplete
+        gmailProgress = repo.gmailImportProgress().takeIf { gmailCatchingUp }
     }
 
     /** Only Google's own "choose an account" screen can offer a different Google account. */
@@ -211,10 +300,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     pendingAccount = accountName
                     onConsent(auth.pendingIntent)
                 }
-                GmailAuth.Unavailable -> {
-                    gmailMessage = "Couldn't reach Google Play services to connect Gmail. Check your connection and try again."
-                    afterSignIn()
-                }
+                GmailAuth.Unavailable ->
+                    gmailFailed(ConsentIssue.Unavailable, "Couldn't reach Google Play services to connect Gmail. Check your connection and try again.")
             }
         }
     }
@@ -269,6 +356,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     private val stopWatchingAnswers = repo.watchReminderAnswers { answersVersion++ }
 
     override fun onCleared() {
+        connectivity.unregisterNetworkCallback(networkCallback)
         stopWatchingAnswers()
         super.onCleared()
     }
@@ -459,12 +547,30 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         screen = target
     }
 
+    /** True while [loadChargeSources] is reading the open screen's payments and proof, so Detail can show a skeleton for them. */
+    var detailLoading: Boolean by mutableStateOf(false)
+        private set
+    private var detailLoads = 0
+
+    /** The open screen's last 30 days of use, for its chart; empty when the app is not tracked. */
+    var usageDays: List<DayUsage> by mutableStateOf(emptyList())
+        private set
+
     fun loadChargeSources(sub: Subscription) {
         chargeSources = emptyMap()
         evidence = emptyList()
+        usageDays = emptyList()
+        detailLoading = true
+        val load = ++detailLoads
         viewModelScope.launch {
-            chargeSources = repo.chargeSources(sub)
-            evidence = repo.evidence(sub)
+            try {
+                chargeSources = repo.chargeSources(sub)
+                evidence = repo.evidence(sub)
+                usageDays = repo.usageDays(sub)
+            } finally {
+                // Only the newest load clears the flag, so an earlier one finishing late cannot hide a skeleton still needed.
+                if (load == detailLoads) detailLoading = false
+            }
         }
     }
 
@@ -488,19 +594,6 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun onSmsPermissionResult(granted: Boolean) {
         if (granted) Workers.scanNow(app)
-    }
-
-    /**
-     * The Profile page's "Force full rescan": clears every SMS-derived event and re-reads the inbox
-     * from scratch, so a classification fix can be confirmed without waiting for the next app
-     * update's automatic one-time reclassification.
-     */
-    fun forceFullRescan() {
-        gmailMessage = "Re-reading every SMS. Your subscriptions refresh in a few seconds."
-        viewModelScope.launch {
-            repo.forceFullRescan()
-            Workers.scanNow(app)
-        }
     }
 
     fun markCancelled(key: String) = launchAndGoBack { repo.markCancelled(key) }

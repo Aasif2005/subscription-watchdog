@@ -171,6 +171,9 @@ enum class SubscriptionStatus {
 
 data class Charge(val date: LocalDate, val amount: Money)
 
+/** A charge at a new amount: what the one before it was, what this one is, and the day it was taken. */
+data class PriceChange(val from: Money, val to: Money, val on: LocalDate)
+
 /** The AutoPay a service's plan had before the newest one: what a plan change moved away from. */
 data class EarlierPlan(val amount: Money, val frequency: Frequency?, val changedOn: LocalDate)
 
@@ -234,6 +237,8 @@ data class Subscription(
      * 18 Oct, the bank debits on the 19th): that earlier day, so the app can say the date moved instead of showing two dates.
      */
     val movedFrom: LocalDate? = null,
+    /** The newest charge was at another amount than the one before it: the service raised (or lowered) its price. */
+    val priceChange: PriceChange? = null,
 ) {
     val lastCharged: LocalDate? get() = charges.maxOfOrNull { it.date }
     val monthlyCost: Money get() = Money(frequency.monthlyEquivalent(amount.amount), amount.currency)

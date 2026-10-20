@@ -5,6 +5,9 @@ import android.content.SharedPreferences
 import android.util.Log
 import androidx.core.content.edit
 import com.aasif.watchdog.BuildConfig
+import com.aasif.watchdog.core.engine.BACKFILL_NOT_STARTED
+import com.aasif.watchdog.core.engine.DEFAULT_LEAD_DAYS
+import com.aasif.watchdog.core.engine.MAX_LEAD_DAYS
 import com.aasif.watchdog.core.engine.ReminderAnswer
 import com.aasif.watchdog.core.engine.ReminderState
 import com.aasif.watchdog.core.engine.SourcedEvent
@@ -13,6 +16,8 @@ import com.aasif.watchdog.core.engine.SubscriptionEngine
 import com.aasif.watchdog.core.engine.isDuplicateOfAny
 import com.aasif.watchdog.core.engine.nameChannelEvents
 import com.aasif.watchdog.core.engine.channelRekeyTarget
+import com.aasif.watchdog.core.engine.backfillFraction
+import com.aasif.watchdog.core.engine.combinedBackfillFraction
 import com.aasif.watchdog.core.engine.stoppedRenewing
 import com.aasif.watchdog.core.engine.withoutEndedChannelPlans
 import com.aasif.watchdog.core.engine.worthKeepingFromSms
@@ -89,6 +94,12 @@ enum class GmailSyncOutcome {
 /** What the profile page shows for one connected Google account. */
 data class GmailAccountStatus(val email: String, val needsConsent: Boolean, val importing: Boolean)
 
+/**
+ * How far the first Gmail import has got, summed over the connected accounts. [fraction] is the share of the look-back window
+ * read; [scanned] counts messages read, and [estimate] is Gmail's own rough count of matching messages, null until it gave one.
+ */
+data class GmailImportProgress(val scanned: Int, val estimate: Int?, val fraction: Float)
+
 /** One thing the app saw that supports a subscription existing: what it was, where, and when. */
 data class EvidenceItem(
     val kind: String,
@@ -100,6 +111,9 @@ data class EvidenceItem(
 
 /** Where a charge was spotted, and when the alert arrived. */
 data class ChargeSource(val label: String, val atMillis: Long)
+
+/** One day of use for the Detail chart: whole minutes, or null when nothing was recorded that day. */
+data class DayUsage(val date: LocalDate, val minutes: Long?)
 
 class WatchdogRepository(
     private val dao: WatchdogDao,
@@ -116,9 +130,20 @@ class WatchdogRepository(
     private val mailParser = SmsParser(fromEmail = true)
     private val engine = SubscriptionEngine()
 
+    /** Days before a renewal the first reminder comes: 3 (the standing one) up to 7; see reminderStage for the follow-ups. */
     var reminderLeadDays: Int
-        get() = prefs.getInt(KEY_LEAD_DAYS, 3)
-        set(value) = prefs.edit { putInt(KEY_LEAD_DAYS, value) }
+        get() = prefs.getInt(KEY_LEAD_DAYS, DEFAULT_LEAD_DAYS).coerceIn(DEFAULT_LEAD_DAYS, MAX_LEAD_DAYS)
+        set(value) = prefs.edit { putInt(KEY_LEAD_DAYS, value.coerceIn(DEFAULT_LEAD_DAYS, MAX_LEAD_DAYS)) }
+
+    /** "SYSTEM", "LIGHT" or "DARK": the appearance chosen in Profile. */
+    var themeMode: String
+        get() = prefs.getString(KEY_THEME, "SYSTEM") ?: "SYSTEM"
+        set(value) = prefs.edit { putString(KEY_THEME, value) }
+
+    /** Off until the user turns it on: looks up logos of services the catalog doesn't know, by name, on Google Play. */
+    var onlineLogos: Boolean
+        get() = prefs.getBoolean(KEY_ONLINE_LOGOS, false)
+        set(value) = prefs.edit { putBoolean(KEY_ONLINE_LOGOS, value) }
 
     /** Off until the user asks for it: this is the one feature that uses the network. */
     var gmailImportEnabled: Boolean
@@ -170,6 +195,21 @@ class WatchdogRepository(
     fun gmailAccountStatuses(): List<GmailAccountStatus> {
         val needing = prefs.getStringSet(KEY_GMAIL_CONSENT, null).orEmpty()
         return gmailAccounts.map { GmailAccountStatus(it, needsConsent = it in needing, importing = !backfillDone(it)) }
+    }
+
+    /** Progress of the first import for the dashboard strip, or null with no account connected. */
+    fun gmailImportProgress(now: Long = System.currentTimeMillis()): GmailImportProgress? {
+        val accounts = gmailAccounts
+        if (accounts.isEmpty()) return null
+        val fractions = accounts.map {
+            backfillFraction(now, prefs.getLong(key(KEY_GMAIL_BACKFILL, it), BACKFILL_NOT_STARTED), FIRST_SCAN_DAYS)
+        }
+        val estimates = accounts.map { prefs.getInt(key(KEY_GMAIL_ESTIMATE, it), -1) }
+        return GmailImportProgress(
+            scanned = accounts.sumOf { prefs.getInt(key(KEY_GMAIL_SCANNED, it), 0) },
+            estimate = if (estimates.all { it >= 0 }) estimates.sum() else null,
+            fraction = combinedBackfillFraction(fractions),
+        )
     }
 
     /** True when the mail rules changed since the last import, so the next sync starts over. */
@@ -431,7 +471,14 @@ class WatchdogRepository(
                 // up a slice, and counting attempts instead of progress let a spell of throttling
                 // burn the whole budget and declare the backfill finished having imported nothing.
                 // commit(), not apply() — see the sync cursor comment above.
-                prefs.edit(commit = true) { putInt(slicesKey, slice + 1) }
+                // Progress is counted on the same successful read, so a retried window is not counted twice.
+                val scannedKey = key(KEY_GMAIL_SCANNED, account)
+                prefs.edit(commit = true) {
+                    putInt(slicesKey, slice + 1)
+                    putInt(scannedKey, prefs.getInt(scannedKey, 0) + fetched.scanned)
+                    // Gmail's rough total for the whole window, taken once from the first slice.
+                    if (slice == 0) fetched.estimate?.let { putInt(key(KEY_GMAIL_ESTIMATE, account), it) }
+                }
                 val stored = ingest(fetched.messages, EventSource.GMAIL, account)
                 if (BuildConfig.DEBUG) {
                     Log.i("GmailSync", "backfill $account slice=$slice stored=$stored msgs=${fetched.messages.size} exhausted=${fetched.exhausted} throttled=${fetched.throttled}")
@@ -562,6 +609,8 @@ class WatchdogRepository(
         remove(key(KEY_GMAIL_SYNC, account))
         remove(key(KEY_GMAIL_BACKFILL, account))
         remove(key(KEY_GMAIL_SLICES, account))
+        remove(key(KEY_GMAIL_SCANNED, account))
+        remove(key(KEY_GMAIL_ESTIMATE, account))
         remove(key(KEY_GMAIL_CATCHUP_BEFORE, account))
         remove(key(KEY_GMAIL_CATCHUP_TARGET, account))
         remove(key(KEY_GMAIL_WELCOME, account))
@@ -891,6 +940,21 @@ class WatchdogRepository(
         )
     }
 
+    /**
+     * Minutes per day for the last [days] days of the app behind [sub], oldest first, for the Detail chart. A day with no
+     * stored row is null (not read), not zero; empty when the app is not tracked or use cannot be read.
+     */
+    suspend fun usageDays(sub: Subscription, days: Int = 30, today: LocalDate = LocalDate.now()): List<DayUsage> {
+        val app = sub.trackedApp() ?: return emptyList()
+        if (!usageAccessGranted() || (app.measuresPlayback && !playbackTimeSupported)) return emptyList()
+        val from = today.minusDays(days - 1L)
+        val byDay = dao.usageSince(app.packages, from.toString()).groupBy { it.day }.mapValues { (_, rows) -> rows.sumOf { it.foregroundMillis } }
+        return (0 until days).map { k ->
+            val day = from.plusDays(k.toLong())
+            DayUsage(day, byDay[day.toString()]?.let { it / 60_000 })
+        }
+    }
+
     /** Whether this Android reports how long a playback service ran, which is what a music app's use is read from. */
     private val playbackTimeSupported: Boolean get() = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
 
@@ -1057,6 +1121,10 @@ class WatchdogRepository(
     fun wasChargeAlerted(key: String, date: LocalDate) = prefs.getBoolean("charge_alerted:$key:$date", false)
     fun setChargeAlerted(key: String, date: LocalDate) = prefs.edit(commit = true) { putBoolean("charge_alerted:$key:$date", true) }
 
+    /** The price-change alert for the charge on [date] was posted; kept apart from the charge alerts, which share a different meaning. */
+    fun wasPriceAlerted(key: String, date: LocalDate) = prefs.getBoolean("price_alerted:$key:$date", false)
+    fun setPriceAlerted(key: String, date: LocalDate) = prefs.edit(commit = true) { putBoolean("price_alerted:$key:$date", true) }
+
     /** Remembers which reminders were sent so each renewal is announced once. */
     /**
      * The latest stage a reminder was shown for, per renewal. Older builds stored a plain
@@ -1080,6 +1148,8 @@ class WatchdogRepository(
         private const val KEY_GMAIL_SYNC = "last_gmail_sync_millis"
         private const val KEY_GMAIL_BACKFILL = "gmail_backfill_before_millis"
         private const val KEY_GMAIL_SLICES = "gmail_backfill_slices"
+        private const val KEY_GMAIL_SCANNED = "gmail_backfill_scanned"
+        private const val KEY_GMAIL_ESTIMATE = "gmail_backfill_estimate"
         private const val KEY_GMAIL_CATCHUP_BEFORE = "gmail_catchup_before_millis"
         private const val KEY_GMAIL_CATCHUP_TARGET = "gmail_catchup_target_millis"
         private const val KEY_GMAIL_WELCOME = "gmail_welcome_sync_millis"
@@ -1146,6 +1216,8 @@ class WatchdogRepository(
         /** 120 slices of [BACKFILL_SLICE] is far more payment mail than a year can hold. */
         private const val MAX_BACKFILL_SLICES = 120
         private const val KEY_LEAD_DAYS = "reminder_lead_days"
+        private const val KEY_THEME = "theme_mode"
+        private const val KEY_ONLINE_LOGOS = "online_logos"
         private const val FIRST_SCAN_DAYS = 400L // just over a year of mail, enough to see yearly plans renew once
         private const val MANUAL_PREFIX = "manual:"
 

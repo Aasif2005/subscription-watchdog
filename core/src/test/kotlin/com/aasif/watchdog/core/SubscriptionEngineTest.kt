@@ -55,7 +55,7 @@ class SubscriptionEngineTest {
     }
 
     @Test
-    fun `mandate schedule beats history`() {
+    fun `mandate schedule is followed, from the debit when it landed a day off`() {
         val s = engine.build(
             listOf(
                 mandate("netflix", 649, "2026-01-10", "2026-01-10"),
@@ -63,8 +63,41 @@ class SubscriptionEngineTest {
             ),
             today = d("2026-08-15"),
         ).single()
-        assertEquals(d("2026-09-10"), s.nextRenewal)
+        // Debited on the 11th, a day after the mandate's 10th: the next one follows the real debit.
+        assertEquals(d("2026-09-11"), s.nextRenewal)
         assertEquals(RenewalSource.MANDATE, s.renewalSource)
+    }
+
+    @Test
+    fun `a charge far from the mandate schedule does not move it`() {
+        val s = engine.build(
+            listOf(mandate("netflix", 649, "2026-01-10", "2026-01-10"), debit("netflix", 649, "2026-08-30")),
+            today = d("2026-09-01"),
+        ).single()
+        assertEquals(d("2026-09-10"), s.nextRenewal)
+    }
+
+    @Test
+    fun `a new amount on the newest charge is a price change, an extra one-off charge is not`() {
+        val raised = engine.build(
+            listOf(debit("netflix", 499, "2026-07-11", true), debit("netflix", 499, "2026-08-11", true), debit("netflix", 649, "2026-09-11", true)),
+            today = d("2026-09-12"),
+        ).single()
+        val change = raised.priceChange!!
+        assertEquals(d("2026-09-11"), change.on)
+        assertEquals(BigDecimal("499"), change.from.amount.setScale(0))
+        assertEquals(BigDecimal("649"), change.to.amount.setScale(0))
+        val steady = engine.build(
+            listOf(debit("netflix", 649, "2026-07-11", true), debit("netflix", 649, "2026-08-11", true), debit("netflix", 649, "2026-09-11", true)),
+            today = d("2026-09-12"),
+        ).single()
+        assertNull(steady.priceChange)
+        // A second, different charge two days after the last one is not a new price.
+        val extra = engine.build(
+            listOf(debit("netflix", 649, "2026-07-11", true), debit("netflix", 649, "2026-08-11", true), debit("netflix", 649, "2026-09-11", true), debit("netflix", 99, "2026-09-13", true)),
+            today = d("2026-09-14"),
+        ).firstOrNull()
+        assertNull(extra?.priceChange)
     }
 
     @Test

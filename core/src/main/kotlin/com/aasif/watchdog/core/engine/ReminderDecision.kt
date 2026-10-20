@@ -29,15 +29,29 @@ data class ReminderState(
 )
 
 /**
- * How urgent the reminder is: 1 while the renewal is still two or more days away, 2 the day
- * before, 3 on the day. A swiped notification is not an answer, so the reminder comes back at each
- * later stage until the user answers it.
+ * How urgent the reminder is: 0 while the renewal is more than three days away (only reached when the user chose to be
+ * warned earlier), 1 at two or three days, 2 the day before, 3 on the day. Each stage is shown once, so a 7-day lead warns
+ * on day 7, then again on day 3 as with the default lead, the evening before and on the day. A swiped notification is not
+ * an answer, so the reminder comes back at each later stage until the user answers it.
  */
-fun reminderStage(renewal: LocalDate, today: LocalDate): Int = when {
-    ChronoUnit.DAYS.between(today, renewal) <= 0 -> FINAL_STAGE
-    ChronoUnit.DAYS.between(today, renewal) == 1L -> DAY_BEFORE_STAGE
-    else -> 1
+fun reminderStage(renewal: LocalDate, today: LocalDate): Int {
+    val days = ChronoUnit.DAYS.between(today, renewal)
+    return when {
+        days <= 0 -> FINAL_STAGE
+        days == 1L -> DAY_BEFORE_STAGE
+        days <= DEFAULT_LEAD_DAYS -> 1
+        else -> EARLY_STAGE
+    }
 }
+
+/** The reminder for a lead the user set longer than [DEFAULT_LEAD_DAYS]. */
+const val EARLY_STAGE = 0
+
+/** The standing reminder lead, and the shortest one a user can choose. */
+const val DEFAULT_LEAD_DAYS = 3
+
+/** The longest reminder lead a user can choose. */
+const val MAX_LEAD_DAYS = 7
 
 /** The day-before reminder is held until this hour, so it lands in the evening, with the whole night left to act. */
 const val EVENING_HOUR = 19

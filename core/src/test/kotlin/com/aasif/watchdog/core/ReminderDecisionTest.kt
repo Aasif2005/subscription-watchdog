@@ -262,4 +262,31 @@ class ReminderDecisionTest {
         )
         assertFalse(verifyCancelResolved(oldRevocation, d("2026-10-12"), evening))
     }
+
+    /** Days, counted back from [renewal], on which a lead of [lead] days sends a reminder at 9:00 or in the evening. */
+    private fun reminderDays(lead: Int): List<Long> {
+        var state = ReminderState()
+        val sent = mutableListOf<Long>()
+        for (daysLeft in lead.toLong() downTo 0L) {
+            val day = renewal.minusDays(daysLeft)
+            for (hour in listOf(9, 19)) {
+                if (shouldRemind(day.atTime(hour, 0), renewal, state)) {
+                    sent += daysLeft
+                    state = state.copy(lastStage = reminderStage(renewal, day))
+                }
+            }
+        }
+        return sent
+    }
+
+    @Test
+    fun `the default lead warns three days before, the evening before and on the day`() {
+        assertEquals(listOf(3L, 1L, 0L), reminderDays(3))
+    }
+
+    @Test
+    fun `a longer lead adds one early warning and then falls back to the usual ones`() {
+        assertEquals(listOf(5L, 3L, 1L, 0L), reminderDays(5))
+        assertEquals(listOf(7L, 3L, 1L, 0L), reminderDays(7))
+    }
 }

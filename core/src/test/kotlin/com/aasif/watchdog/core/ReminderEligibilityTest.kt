@@ -12,6 +12,8 @@ import com.aasif.watchdog.core.model.Money
 import com.aasif.watchdog.core.model.PaymentEvent
 import com.aasif.watchdog.core.model.PaymentEvent.MandateCreated
 import com.aasif.watchdog.core.model.PaymentEvent.MandateRevoked
+import com.aasif.watchdog.core.model.PaymentEvent.PreDebitNotice
+import com.aasif.watchdog.core.engine.autopayConfirmed
 import com.aasif.watchdog.core.model.SubscriptionStatus
 import java.math.BigDecimal
 import java.time.LocalDate
@@ -150,6 +152,18 @@ class ReminderEligibilityTest {
         assertTrue(engine.build(listOf(fresh), d(2026, 10, 15)).autopayQuestions(d(2026, 10, 15)) { false }.isEmpty())
         val revoked = MandateRevoked("chatgpt", "ChatGPT", d(2026, 10, 20), null, amount = money("399.00"), activeUntil = null)
         assertTrue(engine.build(listOf(goMandate, revoked), d(2026, 11, 3)).autopayQuestions(d(2026, 11, 3)) { false }.isEmpty())
+    }
+
+    @Test
+    fun `a bank notice of a coming debit answers the AutoPay question, a past one does not`() {
+        val notice = PreDebitNotice("chatgpt", "ChatGPT", d(2026, 11, 4), money("399.00"), d(2026, 11, 5))
+        val subs = engine.build(listOf(goMandate, notice), d(2026, 11, 4))
+        assertTrue(subs.single().autopayConfirmed(d(2026, 11, 4)))
+        assertTrue(subs.autopayQuestions(d(2026, 11, 4)) { false }.isEmpty())
+        // Once the day it named is behind us it proves nothing about what happened after.
+        assertFalse(subs.single().autopayConfirmed(d(2026, 11, 6)))
+        // Without a notice the question is still asked.
+        assertEquals(1, engine.build(listOf(goMandate), d(2026, 11, 4)).autopayQuestions(d(2026, 11, 4)) { false }.size)
     }
 
     @Test

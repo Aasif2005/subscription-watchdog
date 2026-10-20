@@ -37,7 +37,14 @@ class PaymentNotificationListener : NotificationListenerService() {
     override fun onListenerConnected() {
         // Alerts already in the shade when access was granted. Not counted as "seen": the same
         // ones would be counted again on every reconnect.
-        val existing = activeNotifications?.mapNotNull { toMessage(it, count = false) }.orEmpty()
+        // Android can refuse this call ("Disallowed call from unknown notification listener") when it reconnects the
+        // listener while the previous connection's token is being replaced, e.g. right after the process was killed and
+        // restarted. That used to crash the app. Skipping the look-back once is harmless: alerts posted from now on still arrive.
+        val existing = try {
+            activeNotifications?.mapNotNull { toMessage(it, count = false) }.orEmpty()
+        } catch (_: SecurityException) {
+            return
+        }
         if (existing.isNotEmpty()) ingest(existing)
     }
 

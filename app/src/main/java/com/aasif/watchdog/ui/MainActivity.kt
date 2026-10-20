@@ -1,5 +1,7 @@
 package com.aasif.watchdog.ui
 
+import com.aasif.watchdog.ui.components.LocalOnlineLogos
+import androidx.compose.runtime.CompositionLocalProvider
 import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
@@ -7,16 +9,28 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.aasif.watchdog.ui.components.WatchdogSnackbarHost
+import kotlinx.coroutines.launch
 import androidx.core.app.NotificationManagerCompat
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -29,6 +43,7 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.aasif.watchdog.core.engine.heldForMail
+import com.aasif.watchdog.core.engine.yearlySavings
 import com.aasif.watchdog.data.notification.PaymentNotificationListener
 import com.aasif.watchdog.work.ReminderActions
 import com.aasif.watchdog.work.ReminderChannel
@@ -42,7 +57,15 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            WatchdogTheme { App() }
+            val dark = vm.themeMode.isDark()
+            // The bar icons follow the app's own theme, which may differ from the phone's.
+            LaunchedEffect(dark) {
+                val style = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT) { dark }
+                enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+            }
+            WatchdogTheme(dark) {
+                CompositionLocalProvider(LocalOnlineLogos provides vm.onlineLogos) { App() }
+            }
         }
         // Only on a fresh start: after process death Android re-creates the activity with the
         // original intent, extras included, and the plan would be recorded a second time.
@@ -80,7 +103,7 @@ private fun App(vm: MainViewModel = viewModel()) {
     }
     LaunchedEffect(subscriptions) { vm.refreshUsage(subscriptions) }
     if (vm.usagePromptDue) {
-        UsageDisclosureDialog(
+        UsageDisclosureSheet(
             onOpenSettings = { vm.dismissUsagePrompt(); openUsageAccessSettings(context) },
             onNotNow = vm::dismissUsagePrompt,
         )
@@ -102,7 +125,7 @@ private fun App(vm: MainViewModel = viewModel()) {
             vm.signIn(account) { consent -> gmailConsent.launch(IntentSenderRequest.Builder(consent).build()) }
         }
     }
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState(); vm.refreshNotificationStats(); vm.syncMailOnOpen() }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshGmailState(); vm.syncMailOnOpen() }
     // Renewal reminders are notifications; asked for on the permission screen, and re-checked when the user comes back from Settings.
     var notificationsAllowed by remember { mutableStateOf(NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { notificationsAllowed = NotificationManagerCompat.from(context).areNotificationsEnabled() }
@@ -116,10 +139,14 @@ private fun App(vm: MainViewModel = viewModel()) {
         hasSmsAccess = vm.hasSmsAccess()
         vm.onSmsPermissionResult(result[Manifest.permission.READ_SMS] == true)
     }
-    vm.gmailMessage?.let { message ->
-        LaunchedEffect(message) {
-            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+    // One-off messages (a Gmail connection that failed, a rescan that started) are snackbars now. The message is cleared before it is
+    // shown, from a scope of its own, so clearing it cannot cancel the snackbar it just started.
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(vm.gmailMessage) {
+        vm.gmailMessage?.let { message ->
             vm.gmailMessageShown()
+            scope.launch { snackbar.showSnackbar(message, duration = SnackbarDuration.Long) }
         }
     }
     // The import runs in the background; without this the "still importing" card only cleared
@@ -182,6 +209,7 @@ private fun App(vm: MainViewModel = viewModel()) {
     }
 
 
+    Box(Modifier.fillMaxSize()) {
     when (val screen = vm.screen) {
         Screen.Dashboard -> {
             // A "Google Play" plan waits for the mail import, which may still say which app it is.
@@ -197,7 +225,7 @@ private fun App(vm: MainViewModel = viewModel()) {
                 gmailImportEnabled = vm.gmailImportEnabled,
                 // Not while the import waits for the user to approve Gmail again: it is not running then.
                 gmailImporting = vm.gmailCatchingUp,
-                onOpenProfile = { vm.refreshNotificationStats(); vm.open(Screen.Profile) },
+                onOpenProfile = { vm.open(Screen.Profile) },
                 pendingQuestions = questions,
                 onKeep = vm::keepSubscription,
                 onPlanCancel = vm::planCancelOf,
@@ -217,29 +245,36 @@ private fun App(vm: MainViewModel = viewModel()) {
                 onSaveUserFact = vm::setUserFact,
                 onDismissUserFact = vm::dismissUserFact,
                 onHide = vm::hide,
+                accountEmail = vm.accountEmail,
+                gmailProgress = vm.gmailProgress,
+                rescanning = vm.rescanning,
+                online = vm.online,
             )
         }
         Screen.Profile -> ProfileScreen(
+            accountEmail = vm.accountEmail,
+            onBack = { vm.back() },
+            themeMode = vm.themeMode,
+            onThemeMode = vm::chooseThemeMode,
+            reminderLeadDays = vm.reminderLeadDays,
+            onReminderLeadDays = vm::chooseReminderLeadDays,
+            onlineLogos = vm.onlineLogos,
+            onOnlineLogos = vm::chooseOnlineLogos,
             gmailImportEnabled = vm.gmailImportEnabled,
             gmailAccounts = vm.gmailAccounts,
-            onBack = { vm.back() },
             onConnectGmail = connectGmail,
             onAddAccount = connectGmail,
             onRemoveAccount = vm::removeGmailAccount,
-            smsSupported = vm.smsSupported,
-            onForceFullRescan = vm::forceFullRescan,
-            hasNotificationAccess = hasNotificationAccess,
-            notificationStats = vm.notificationStats,
-            onGrantNotificationAccess = { openNotificationAccessSettings(context) },
-            onOpenReminderSettings = { openReminderSettings(context) },
-            usageSupported = vm.usageSupported,
-            usageGranted = vm.usageGranted,
-            onUsageOpenSettings = { openUsageAccessSettings(context) },
-            accountEmail = vm.accountEmail,
+            yearlySavings = subscriptions?.yearlySavings() ?: java.math.BigDecimal.ZERO,
+            appVersion = com.aasif.watchdog.BuildConfig.VERSION_NAME,
+            onOpenAppSettings = { openAppSettings(context) },
             onSignOut = vm::signOut,
         )
         Screen.SignIn -> SignInScreen(
+            issue = vm.consentIssue,
             onContinueWithGoogle = { signInChooser.launch(vm.chooseGmailAccountIntent()) },
+            onTryAgain = { vm.retryGmailConsent(); signInChooser.launch(vm.chooseGmailAccountIntent()) },
+            onContinueWithoutGmail = vm::continueWithoutGmail,
         )
         Screen.Permissions -> {
             PermissionsScreen(accountEmail = vm.accountEmail, items = permissions, onContinue = vm::finishOnboarding)
@@ -248,6 +283,7 @@ private fun App(vm: MainViewModel = viewModel()) {
             val sub = subscriptions?.firstOrNull { it.key == screen.key }
             if (subscriptions == null) {
                 // Still loading, e.g. opened from a notification into a freshly started app.
+                DetailSkeleton(onBack = { vm.back() })
             } else if (sub == null) {
                 // Hidden or deleted while open; the list no longer has it.
                 LaunchedEffect(screen.key) { vm.back() }
@@ -274,11 +310,24 @@ private fun App(vm: MainViewModel = viewModel()) {
                     usageFigure = vm.usageFigures[sub.key],
                     onAutopayCancelled = { vm.alreadyCancelled(sub) },
                     onAutopayStillActive = { vm.autopayStillActive(sub) },
+                    loading = vm.detailLoading,
+                    usageDays = vm.usageDays,
                 )
             }
         }
         Screen.AddManual -> AddManualScreen(onBack = { vm.back() }, onSave = vm::addManual)
     }
+    // Above the dashboard's Add button, which would otherwise sit on top of it.
+    WatchdogSnackbarHost(
+        snackbar,
+        Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = if (vm.screen == Screen.Dashboard) 72.dp else 0.dp),
+    )
+    }
+}
+
+/** Android's own page for this app, where every permission can be reviewed or turned off. */
+private fun openAppSettings(context: Context) {
+    context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.fromParts("package", context.packageName, null)))
 }
 
 /** Usage access is granted on its own Settings page, not by a dialog. */

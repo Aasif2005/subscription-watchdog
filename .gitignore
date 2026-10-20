@@ -8,3 +8,5 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

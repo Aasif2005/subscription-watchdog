@@ -218,7 +218,7 @@ class PlayOrderMailTest {
             autoRenews = true, receivedAt = LocalDateTime.of(2026, 9, 18, 11, 30), fromMail = true,
         )
         val sub = engine.build(listOfNotNull(purchase, renewalReceipt()), LocalDate.of(2026, 10, 19)).single()
-        assertTrue(sub.nextRenewal!!.isAfter(LocalDate.of(2026, 10, 19)), sub.toString())
+        assertEquals(LocalDate.of(2026, 11, 19), sub.nextRenewal)
         assertTrue(sub.charges.any { it.date == LocalDate.of(2026, 10, 19) }, sub.charges.toString())
     }
 }

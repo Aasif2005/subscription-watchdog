@@ -1,29 +1,37 @@
 package com.aasif.watchdog.ui
 
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.CompositionLocalProvider
+import com.aasif.watchdog.ui.theme.DarkScheme
+import com.aasif.watchdog.ui.theme.DarkWatchdogColors
+import com.aasif.watchdog.ui.theme.LightScheme
+import com.aasif.watchdog.ui.theme.LightWatchdogColors
+import com.aasif.watchdog.ui.theme.LocalWatchdogColors
+import com.aasif.watchdog.ui.theme.WatchdogShapes
+import com.aasif.watchdog.ui.theme.WatchdogTypography
 
-private val Green = Color(0xFF1B5E20)
-private val LightGreen = Color(0xFF81C784)
+/** What Profile's Appearance switch chose: follow the phone, or always light or dark. */
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
 
+/** Whether [mode] means dark right now. */
 @Composable
-fun WatchdogTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
-    val colors = when {
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-        dark -> darkColorScheme(primary = LightGreen)
-        else -> lightColorScheme(primary = Green)
+fun ThemeMode.isDark(): Boolean = when (this) {
+    ThemeMode.SYSTEM -> isSystemInDarkTheme()
+    ThemeMode.LIGHT -> false
+    ThemeMode.DARK -> true
+}
+
+/** A fixed brand palette (no dynamic colour), light or dark as [dark] says; by default it follows the phone. */
+@Composable
+fun WatchdogTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalWatchdogColors provides if (dark) DarkWatchdogColors else LightWatchdogColors) {
+        MaterialTheme(
+            colorScheme = if (dark) DarkScheme else LightScheme,
+            typography = WatchdogTypography,
+            shapes = WatchdogShapes,
+            content = content,
+        )
     }
-    MaterialTheme(colorScheme = colors, content = content)
 }

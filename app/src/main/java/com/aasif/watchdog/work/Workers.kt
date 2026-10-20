@@ -55,6 +55,8 @@ import java.time.Duration
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 
 object Workers {
     private const val SCAN_DAILY = "scan-daily"
@@ -87,6 +89,14 @@ object Workers {
         .setInitialDelay(delay)
         .setBackoffCriteria(BackoffPolicy.LINEAR, 30, TimeUnit.SECONDS)
         .build()
+
+    /** True while a rescan or a Gmail read (including the pause between import slices) is queued or running. */
+    fun refreshing(context: Context): Flow<Boolean> {
+        val wm = WorkManager.getInstance(context)
+        return combine(listOf(SCAN_NOW, GMAIL_NOW, GMAIL_MORE).map { wm.getWorkInfosForUniqueWorkFlow(it) }) { lists ->
+            lists.any { infos -> infos.any { !it.state.isFinished } }
+        }
+    }
 
     fun schedulePeriodic(context: Context) {
         val wm = WorkManager.getInstance(context)
@@ -294,6 +304,20 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             repo.setChargeAlerted(sub.key, charged)
         }
 
+        // The service charged a different amount than last time. Told once, and only while it is recent news.
+        for (sub in subscriptions) {
+            val change = sub.priceChange ?: continue
+            if (!sub.isLive || change.on.isBefore(today.minusDays(CHARGE_ALERT_DAYS)) || repo.wasPriceAlerted(sub.key, change.on)) continue
+            val direction = if (change.to.amount > change.from.amount) "went up" else "came down"
+            notify(
+                sub.key.hashCode() + PRICE_CHANGED, "${sub.name} price $direction",
+                "It was ${formatMoney(change.from)} and ${formatMoney(change.to)} was taken on ${formatDate(change.on)}.",
+                openDetail(sub.key, sub.key.hashCode() + PRICE_CHANGED),
+                expireAfterMs = ALERT_LIFETIME_MS,
+            )
+            repo.setPriceAlerted(sub.key, change.on)
+        }
+
         for ((key, planned) in repo.plannedCancellations()) {
             val sub = subscriptions.firstOrNull { it.key == key } ?: continue
             // Already reported above, from the bank's own revocation.
@@ -374,6 +398,7 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 compat.cancel(id + CHARGED_ANYWAY)
                 compat.cancel(id + MAY_BE_ACTIVE)
             }
+            if (id + PRICE_CHANGED in inTray && sub?.isLive != true) compat.cancel(id + PRICE_CHANGED)
             if (id + VERIFY_CANCEL in inTray && verifyCancelResolved(sub, renewals[key], today)) compat.cancel(id + VERIFY_CANCEL)
         }
     }
@@ -471,6 +496,7 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
     ) {
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher)
+            .setColor(BRAND_COLOR)
             .setContentTitle(title)
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
@@ -487,6 +513,7 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             .setPublicVersion(
                 NotificationCompat.Builder(applicationContext, CHANNEL_ID)
                     .setSmallIcon(R.drawable.ic_launcher)
+                    .setColor(BRAND_COLOR)
                     .setContentTitle("Subscription reminder")
                     .setContentText("Unlock to see which renewal is coming up.")
                     .build(),
@@ -505,11 +532,15 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         private const val CHARGED_AFTER_CANCEL = 2
         private const val MAY_BE_ACTIVE = 3
         private const val VERIFY_CANCEL = 4
+        private const val PRICE_CHANGED = 5
 
         /** These alerts are about one moment; left unanswered they would sit in the shade for days. */
         private const val ALERT_LIFETIME_MS = 24L * 60 * 60 * 1000
         const val FOLLOW_UP_DATE = "follow_up_date"
         private const val CHANNEL_ID = ReminderChannel.ID
+
+        /** Mercury Indigo: the accent a notification tints its small icon and action text with. */
+        private const val BRAND_COLOR = 0xFF5266EB.toInt()
     }
 }
 

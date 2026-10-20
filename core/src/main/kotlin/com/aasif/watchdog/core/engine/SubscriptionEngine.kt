@@ -13,6 +13,7 @@ import com.aasif.watchdog.core.model.PaymentEvent.Debit
 import com.aasif.watchdog.core.model.PaymentEvent.MandateCreated
 import com.aasif.watchdog.core.model.PaymentEvent.MandateRevoked
 import com.aasif.watchdog.core.model.PaymentEvent.PreDebitNotice
+import com.aasif.watchdog.core.model.PriceChange
 import com.aasif.watchdog.core.model.RenewalSource
 import com.aasif.watchdog.core.model.Subscription
 import com.aasif.watchdog.core.model.SubscriptionStatus
@@ -253,7 +254,24 @@ class SubscriptionEngine(
                 ?.filter { revocation -> plan.mandate?.let { revocation.followsMandate(it) } ?: true }
                 ?.maxOfOrNull { it.receivedOn },
             movedFrom = movedFrom(plan, prediction, frequency, statedFrequency, lastCharge, known, today),
+            priceChange = priceChange(charges, frequency, known),
         )
+    }
+
+    /**
+     * The newest charge at another amount than the one before it. Only for an ordinary service: on a billing channel another amount is
+     * another plan. The two charges must be a fair part of a period apart, so an extra one-off charge is not read as a new price.
+     */
+    private fun priceChange(charges: List<Charge>, frequency: Frequency, known: KnownMerchant?): PriceChange? {
+        if (known?.sharedBilling == true) return null
+        val sorted = charges.sortedBy { it.date }
+        if (sorted.size < 2) return null
+        val last = sorted.last()
+        val before = sorted[sorted.size - 2]
+        if (bucket(last.amount) == bucket(before.amount) || last.amount.currency != before.amount.currency) return null
+        val apart = java.time.temporal.ChronoUnit.DAYS.between(before.date, last.date)
+        if (apart < (if (frequency.hasSchedule) frequency.approxDays / 2 else MIN_PRICE_CHANGE_GAP_DAYS)) return null
+        return PriceChange(before.amount, last.amount, last.date)
     }
 
     /**
@@ -425,7 +443,7 @@ class SubscriptionEngine(
             // not licence to assume it repeats forever. Step 4 (PLAN_EXPIRY) handles that case.
             val assumesRenewal = mandate.validTill == null || mandate.autoRenews
             if (frequency.hasSchedule && mandate.frequency?.hasSchedule == true && assumesRenewal) {
-                return Prediction(frequency.nextOnOrAfter(start, from), RenewalSource.MANDATE, Confidence.HIGH, SubscriptionStatus.ACTIVE)
+                return Prediction(frequency.nextOnOrAfter(anchoredOnCharge(frequency, start, lastCharge), from), RenewalSource.MANDATE, Confidence.HIGH, SubscriptionStatus.ACTIVE)
             }
         }
 
@@ -458,13 +476,29 @@ class SubscriptionEngine(
                 }
             }
             if (frequency.hasSchedule && mandate.frequency?.hasSchedule == true) {
-                val next = frequency.nextOnOrAfter(mandate.receivedOn, from)
+                val next = frequency.nextOnOrAfter(anchoredOnCharge(frequency, mandate.receivedOn, lastCharge), from)
                 return Prediction(next, RenewalSource.MANDATE, Confidence.LOW, SubscriptionStatus.ACTIVE)
             }
             return Prediction(null, RenewalSource.MANDATE, Confidence.LOW, SubscriptionStatus.ACTIVE)
         }
 
         return Prediction(null, RenewalSource.PAYMENT_HISTORY, Confidence.LOW, SubscriptionStatus.ACTIVE)
+    }
+
+    /**
+     * Where a schedule stated by a mandate is counted from: the latest real charge when it fell within [MAX_MOVE_DAYS] of a day the
+     * schedule gives (the bank or the store debited a day off the stated date, and the next one follows that), else the stated [start].
+     * A charge far from the schedule is another plan or a one-off, and does not move it.
+     */
+    private fun anchoredOnCharge(frequency: Frequency, start: LocalDate, lastCharge: LocalDate?): LocalDate {
+        if (lastCharge == null || lastCharge.isBefore(start)) return start
+        val after = frequency.nextOnOrAfter(start, lastCharge)
+        val before = frequency.previous(after)
+        val gap = minOf(
+            java.time.temporal.ChronoUnit.DAYS.between(lastCharge, after),
+            java.time.temporal.ChronoUnit.DAYS.between(before, lastCharge),
+        )
+        return if (gap <= MAX_MOVE_DAYS) lastCharge else start
     }
 
     /**
@@ -568,6 +602,9 @@ class SubscriptionEngine(
 
         /** How far a bank's notice may move the debit from the plan's own date and still be the same renewal. */
         private const val MAX_MOVE_DAYS = 7L
+
+        /** Fewest days between two charges for the newer one's amount to be called a new price, when no period is known. */
+        private const val MIN_PRICE_CHANGE_GAP_DAYS = 7
         private const val TRIAL_MIN_DAYS = 5
 
         /**
@@ -614,9 +651,21 @@ private const val STOPPED_UNKNOWN_PERIOD_DAYS = 31L
  */
 fun List<Subscription>.autopayQuestions(today: LocalDate, isAnswered: (Subscription) -> Boolean): List<Subscription> =
     filter { sub ->
-        sub.isLive && !isAnswered(sub) && sub.unplacedRevocationOn == null &&
+        sub.isLive && !isAnswered(sub) && sub.unplacedRevocationOn == null && !sub.autopayConfirmed(today) &&
             sub.events.filterIsInstance<PaymentEvent.MandateCreated>().maxOfOrNull { it.receivedOn }?.isBefore(today) != false
     }
+
+/**
+ * The bank has announced a debit that is still to come, so the AutoPay is alive and there is nothing to ask. Only a pre-debit notice
+ * received after the newest mandate and dated today or later counts; a past debit does not (it may have been cancelled since), and
+ * neither does a revoke text on a live plan (it can mean a charge landed after the cancel, which has its own alert).
+ */
+fun Subscription.autopayConfirmed(today: LocalDate): Boolean {
+    val newestMandate = events.filterIsInstance<PaymentEvent.MandateCreated>().maxOfOrNull { it.receivedOn }
+    return events.filterIsInstance<PaymentEvent.PreDebitNotice>().any {
+        !it.debitDate.isBefore(today) && (newestMandate == null || !it.receivedOn.isBefore(newestMandate))
+    }
+}
 
 /**
  * Where a name or mark the user saved under a bare channel key ("googleplay") belongs, now that a

@@ -196,7 +196,7 @@ class ChannelNoticeTest {
         )
         val claude = subs.single()
         assertEquals("claude", claude.merchantId)
-        assertTrue(claude.nextRenewal!!.isAfter(oct19), claude.nextRenewal.toString())
+        assertEquals(LocalDate.of(2026, 11, 19), claude.nextRenewal)
         assertTrue(claude.charges.any { it.date == oct19 && it.amount == money("1999.00") }, claude.charges.toString())
     }
 

@@ -50,9 +50,12 @@ enum class Frequency(
     /** First occurrence of the schedule anchored at [anchor] that falls on or after [from]. */
     fun nextOnOrAfter(anchor: LocalDate, from: LocalDate): LocalDate {
         if (!anchor.isBefore(from)) return anchor
-        val gap = ChronoUnit.DAYS.between(anchor, from)
-        // Jump close to the target, then walk forward; month lengths make the estimate inexact.
-        var n = maxOf(0L, gap / approxDays - 1)
+        require(hasSchedule) { "$this has no schedule" }
+        // Count whole periods exactly, in calendar months for month-based plans. An estimate from an average month length
+        // overshot by months once the anchor was years back (a 1980 monthly plan came out in 2027), and walking only forward
+        // never corrected it.
+        var n = if (months > 0) ChronoUnit.MONTHS.between(anchor, from) / months else ChronoUnit.DAYS.between(anchor, from) / days
+        while (n > 0 && !occurrence(anchor, n - 1).isBefore(from)) n--
         var date = occurrence(anchor, n)
         while (date.isBefore(from)) date = occurrence(anchor, ++n)
         return date

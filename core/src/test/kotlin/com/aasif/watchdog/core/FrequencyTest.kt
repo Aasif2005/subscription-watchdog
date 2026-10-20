@@ -27,6 +27,24 @@ class FrequencyTest {
     }
 
     @Test
+    fun `an anchor decades back lands on the right next date`() {
+        val anchor = d("1980-10-20")
+        val today = d("2026-10-20")
+        assertEquals(today, Frequency.MONTHLY.nextOnOrAfter(anchor, today))
+        assertEquals(today, Frequency.BIMONTHLY.nextOnOrAfter(anchor, today))
+        assertEquals(d("2026-12-20"), Frequency.BIMONTHLY.nextOnOrAfter(anchor, d("2026-10-21")))
+        assertEquals(today, Frequency.QUARTERLY.nextOnOrAfter(anchor, today))
+        assertEquals(today, Frequency.YEARLY.nextOnOrAfter(anchor, today))
+        assertEquals(d("2026-11-20"), Frequency.MONTHLY.nextOnOrAfter(anchor, d("2026-10-21")))
+    }
+
+    @Test
+    fun `a month-end anchor a century back keeps its day`() {
+        assertEquals(d("2026-02-28"), Frequency.MONTHLY.nextOnOrAfter(d("1926-01-31"), d("2026-02-01")))
+        assertEquals(d("2026-03-31"), Frequency.MONTHLY.nextOnOrAfter(d("1926-01-31"), d("2026-03-01")))
+    }
+
+    @Test
     fun `gap matching`() {
         assertEquals(Frequency.MONTHLY, Frequency.fromGap(28))
         assertEquals(Frequency.MONTHLY, Frequency.fromGap(31))
